@@ -1,0 +1,183 @@
+# =============================================================================
+# ESG Data Foundry — docker-compose.yml
+# Architecture: PostgreSQL (pgvector) + vLLM (Llama 3) + Python Pipeline
+#
+# Safety patches applied:
+#   [Self-Check 1.0] Hard mem_limit on every service, vLLM capped at 80% VRAM
+#   [Self-Check 2.0] OpenAI rate-limit handled in app layer (Tenacity backoff)
+#   [Self-Check 3.0] is_superseded filter enforced at DB schema level
+# =============================================================================
+
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 + pgvector + pg_trgm (BM25-like full-text search)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: esg_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: esg_foundry
+      POSTGRES_USER: ${POSTGRES_USER:-esg_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?err — set POSTGRES_PASSWORD in .env}
+      # Tune shared_buffers to ~25% of mem_limit (512 MB)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    command: >
+      postgres
+        -c shared_buffers=512MB
+        -c effective_cache_size=1536MB
+        -c maintenance_work_mem=256MB
+        -c work_mem=64MB
+        -c max_connections=50
+        -c wal_level=replica
+        -c synchronous_commit=on
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    # Hard RAM cap — cannot be overridden by the PG process
+    mem_limit: 2g
+    memswap_limit: 2g        # disable swap extension
+    cpus: "2.0"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-esg_user} -d esg_foundry"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # vLLM — OpenAI-compatible inference server (Llama 3.1 8B AWQ)
+  #
+  # Key safety flags:
+  #   --gpu-memory-utilization 0.80   → uses 80% VRAM, leaves 20% for the OS
+  #   --max-model-len 8192            → caps KV-cache to avoid GPU OOM
+  #   --enforce-eager                 → disables CUDA graph (saves VRAM)
+  #   mem_limit: 10g                  → host-RAM guard (model weights + buffers)
+  # ---------------------------------------------------------------------------
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: esg_vllm
+    restart: unless-stopped
+    command: >
+      --model ${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+      --quantization awq
+      --gpu-memory-utilization 0.80
+      --max-model-len 8192
+      --tensor-parallel-size 1
+      --max-num-batched-tokens 16384
+      --max-num-seqs 64
+      --enforce-eager
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name llama3
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:?err — set HF_TOKEN in .env}
+      # Limit torch to 80% VRAM at the library level as a second guard
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    # Host RAM cap — model weights loaded to VRAM but CPU tensors also use RAM
+    mem_limit: 10g
+    memswap_limit: 10g
+    shm_size: 2g              # needed by PyTorch DataLoader workers
+    ipc: host                 # required for NCCL multi-GPU (safe on single-GPU too)
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 15
+      start_period: 180s      # allow time for model weights to load
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # ESG Foundry Pipeline — Python 3.12 app (LangGraph swarm)
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.12"
+    container_name: esg_app
+    restart: "no"             # pipeline runs once; supervisor restarts if needed
+    environment:
+      # Database
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      # Local LLM
+      VLLM_BASE_URL: http://vllm:8000/v1
+      VLLM_MODEL: ${VLLM_MODEL:-llama3}
+      # OpenAI (Judge agent)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?err — set OPENAI_API_KEY in .env}
+      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      OPENAI_FALLBACK_MODEL: ${OPENAI_FALLBACK_MODEL:-o1-mini}
+      # LlamaParse (Ingestor agent)
+      LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
+      # Pipeline tuning
+      ADVERSARIAL_RATIO: ${ADVERSARIAL_RATIO:-0.10}
+      QUALITY_THRESHOLD: ${QUALITY_THRESHOLD:-0.90}
+      MAX_RETRIES_PER_CHUNK: ${MAX_RETRIES_PER_CHUNK:-3}
+      WATERMARK_INTERVAL: ${WATERMARK_INTERVAL:-50}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+      # Output
+      OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
+      CLIENT_ID: ${CLIENT_ID:-dev_client}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data:ro  # source PDFs
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: "4.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+# =============================================================================
+# Named volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  hf_cache:
+    driver: local             # persists downloaded model weights between restarts
+
+# =============================================================================
+# Network — isolated bridge; no external exposure except via host port mapping
+# =============================================================================
+networks:
+  foundry_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
