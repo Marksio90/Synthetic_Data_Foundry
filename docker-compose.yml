@@ -8,7 +8,6 @@
 #   [Self-Check 3.0] is_superseded filter enforced at DB schema level
 # =============================================================================
 
-version: "3.9"
 
 x-logging: &default-logging
   driver: "json-file"
