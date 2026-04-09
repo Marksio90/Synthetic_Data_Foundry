@@ -72,7 +72,7 @@ services:
     restart: unless-stopped
     command: >
       --model ${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
-      --quantization awq
+      --dtype half
       --gpu-memory-utilization 0.80
       --max-model-len 8192
       --tensor-parallel-size 1
