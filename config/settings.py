@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     openai_api_key: str = Field(..., description="OpenAI secret key")
     openai_primary_model: str = Field("gpt-4o-mini")
-    openai_fallback_model: str = Field("o1-mini")
+    openai_fallback_model: str = Field("gpt-4o")
     openai_embedding_model: str = Field("text-embedding-3-small")
     openai_embedding_dims: int = Field(1536)
 
