@@ -154,6 +154,22 @@ services:
       OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
       CLIENT_ID: ${CLIENT_ID:-dev_client}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Pipeline run parameters
+      BATCH_ID: ${BATCH_ID:-batch-default}
+      CHUNK_LIMIT: ${CHUNK_LIMIT:-0}
+    command:
+      - --pdf
+      - /app/data/csddd.pdf
+      - --pdf
+      - /app/data/csrd.pdf
+      - --pdf
+      - /app/data/sfdr.pdf
+      - --pdf
+      - /app/data/taksonomia.pdf
+      - --batch-id
+      - ${BATCH_ID:-batch-default}
+      - --chunk-limit
+      - "${CHUNK_LIMIT:-0}"
     volumes:
       - ./output:/app/output
       - ./data:/app/data:ro  # source PDFs
