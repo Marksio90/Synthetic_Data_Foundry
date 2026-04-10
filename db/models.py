@@ -28,7 +28,8 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 class Base(DeclarativeBase):
-    pass
+    # Allow legacy Column()-style annotations (no Mapped[] wrapper required)
+    __allow_unmapped__ = True
 
 
 class SourceDocument(Base):

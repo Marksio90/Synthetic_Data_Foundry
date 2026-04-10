@@ -58,7 +58,11 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # vLLM — OpenAI-compatible inference server (Llama 3.1 8B AWQ)
+  # vLLM — OpenAI-compatible inference server (Llama 3.1 8B)
+  #
+  # REQUIRES GPU with CUDA capability >= 7.0 (Volta or newer).
+  # Start only when GPU is available:
+  #   docker compose --profile gpu up -d vllm
   #
   # Key safety flags:
   #   --gpu-memory-utilization 0.80   → uses 80% VRAM, leaves 20% for the OS
@@ -67,6 +71,7 @@ services:
   #   mem_limit: 10g                  → host-RAM guard (model weights + buffers)
   # ---------------------------------------------------------------------------
   vllm:
+    profiles: [gpu]           # ← only started with: docker compose --profile gpu up
     image: vllm/vllm-openai:latest
     container_name: esg_vllm
     restart: unless-stopped
@@ -83,16 +88,14 @@ services:
       --port 8000
       --served-model-name llama3
     environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:?err — set HF_TOKEN in .env}
-      # Limit torch to 80% VRAM at the library level as a second guard
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
     volumes:
       - hf_cache:/root/.cache/huggingface
-    # Host RAM cap — model weights loaded to VRAM but CPU tensors also use RAM
     mem_limit: 10g
     memswap_limit: 10g
-    shm_size: 2g              # needed by PyTorch DataLoader workers
-    ipc: host                 # required for NCCL multi-GPU (safe on single-GPU too)
+    shm_size: 2g
+    ipc: host
     ulimits:
       memlock:
         soft: -1
@@ -109,7 +112,7 @@ services:
       interval: 30s
       timeout: 15s
       retries: 15
-      start_period: 180s      # allow time for model weights to load
+      start_period: 180s
     networks:
       - foundry_net
     logging: *default-logging
@@ -129,9 +132,12 @@ services:
       # Database
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
       ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
-      # Local LLM
-      VLLM_BASE_URL: http://vllm:8000/v1
-      VLLM_MODEL: ${VLLM_MODEL:-llama3}
+      # Question-generation LLM — routed through OpenAI (no local GPU required)
+      # To use local vLLM instead: docker compose --profile gpu up vllm
+      # and change these two lines to: http://vllm:8000/v1 / llama3
+      VLLM_BASE_URL: https://api.openai.com/v1
+      VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      VLLM_API_KEY: ${OPENAI_API_KEY}
       # OpenAI (Judge agent)
       OPENAI_API_KEY: ${OPENAI_API_KEY:?err — set OPENAI_API_KEY in .env}
       OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
@@ -156,8 +162,6 @@ services:
     cpus: "4.0"
     depends_on:
       postgres:
-        condition: service_healthy
-      vllm:
         condition: service_healthy
     networks:
       - foundry_net
