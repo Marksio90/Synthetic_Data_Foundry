@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     vllm_base_url: str = Field("http://vllm:8000/v1")
     vllm_model: str = Field("llama3")
+    vllm_api_key: str = Field("not-needed", description="'not-needed' for local vLLM; set to openai_api_key when routing through OpenAI")
     vllm_temperature: float = Field(0.7)
     vllm_max_tokens: int = Field(1024)
 

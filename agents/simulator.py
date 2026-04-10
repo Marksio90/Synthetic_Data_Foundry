@@ -42,7 +42,7 @@ _ADVERSARIAL_SYSTEM = (
 def _call_vllm(system_prompt: str, user_text: str) -> str:
     """Direct call to local vLLM (Llama 3) via OpenAI-compatible API."""
     client = openai.OpenAI(
-        api_key="not-needed",  # vLLM doesn't require auth
+        api_key=settings.vllm_api_key,
         base_url=settings.vllm_base_url,
     )
     response = client.chat.completions.create(
