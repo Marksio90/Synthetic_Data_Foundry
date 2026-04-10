@@ -24,7 +24,7 @@ import openai
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -70,10 +70,19 @@ Oceń powyższą parę zgodnie z instrukcją systemową."""
 # Retry decorator (Self-Check 2.0)
 # ---------------------------------------------------------------------------
 
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry only on 429 (rate limit) and 5xx (server errors). Never on 4xx."""
+    if isinstance(exc, openai.RateLimitError):
+        return True
+    if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
+        return True
+    return False
+
+
 def _retry_openai(func):
     return retry(
         reraise=True,
-        retry=retry_if_exception_type((openai.RateLimitError, openai.APIStatusError)),
+        retry=retry_if_exception(_is_retryable),
         wait=wait_exponential(
             multiplier=1,
             min=settings.tenacity_initial_wait,
