@@ -161,53 +161,63 @@ def main() -> None:
         pending = get_pending_chunks(session, limit=limit)
         logger.info("Found %d pending chunks", len(pending))
 
+        perspectives = ["cfo", "prawnik", "audytor"]
+
         for chunk in pending:
-            initial_state: FoundryState = {
-                "chunk": {
-                    "id": str(chunk.id),
-                    "content": chunk.content,
-                    "content_md": chunk.content_md or chunk.content,
-                    "source_document": (
-                        chunk.source_doc.filename if chunk.source_doc else "unknown"
-                    ),
-                    "chunk_index": chunk.chunk_index,
-                    "section_heading": chunk.section_heading or "",
-                    "valid_from_date": (
-                        chunk.valid_from_date.isoformat() if chunk.valid_from_date else ""
-                    ),
-                },
-                "question": "",
-                "is_adversarial": False,
-                "retrieved_context": [],
-                "retrieved_ids": [],
-                "answer": "",
-                "quality_score": 0.0,
-                "judge_model": "",
-                "judge_reasoning": "",
-                "retry_count": 0,
-                "status": "in_progress",
-                "error_message": None,
-                "sample_id": None,
-                "batch_id": args.batch_id,
-                "record_index": writer.record_count,
+            chunk_meta = {
+                "id": str(chunk.id),
+                "content": chunk.content,
+                "content_md": chunk.content_md or chunk.content,
+                "source_document": (
+                    chunk.source_doc.filename if chunk.source_doc else "unknown"
+                ),
+                "chunk_index": chunk.chunk_index,
+                "section_heading": chunk.section_heading or "",
+                "valid_from_date": (
+                    chunk.valid_from_date.isoformat() if chunk.valid_from_date else ""
+                ),
             }
 
-            try:
-                final_state = graph.invoke(initial_state)
-                final_status = final_state.get("status", "unknown")
-            except Exception as exc:
-                logger.error("Graph invocation failed for chunk %s: %s", chunk.id, exc)
-                final_status = "error"
+            # Run pipeline once per perspective (CFO / prawnik / audytor)
+            chunk_ready = False
+            for perspective in perspectives:
+                initial_state: FoundryState = {
+                    "chunk": chunk_meta,
+                    "perspective": perspective,
+                    "question": "",
+                    "is_adversarial": False,
+                    "retrieved_context": [],
+                    "retrieved_ids": [],
+                    "answer": "",
+                    "quality_score": 0.0,
+                    "judge_model": "",
+                    "judge_reasoning": "",
+                    "retry_count": 0,
+                    "status": "in_progress",
+                    "error_message": None,
+                    "sample_id": None,
+                    "batch_id": args.batch_id,
+                    "record_index": writer.record_count,
+                }
+
+                try:
+                    final_state = graph.invoke(initial_state)
+                    final_status = final_state.get("status", "unknown")
+                    if final_status == "ready":
+                        chunk_ready = True
+                        total_ready += 1
+                except Exception as exc:
+                    logger.error(
+                        "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
+                    )
 
             total_processed += 1
-            if final_status == "ready":
-                total_ready += 1
-            elif final_status == "unresolvable":
+            if not chunk_ready:
                 total_unresolvable += 1
 
             if total_processed % 10 == 0:
                 logger.info(
-                    "Progress: %d processed | %d ready | %d unresolvable | %d records written",
+                    "Progress: %d chunks | %d ready | %d unresolvable | %d records written",
                     total_processed, total_ready, total_unresolvable, writer.record_count,
                 )
 
