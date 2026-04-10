@@ -22,21 +22,48 @@ from pipeline.state import FoundryState
 
 logger = logging.getLogger(__name__)
 
-# System prompts
-_NORMAL_SYSTEM = (
-    "Jesteś konsultantem ESG. Przeczytaj poniższy fragment dyrektywy UE i zadaj "
-    "jedno konkretne, realistyczne pytanie biznesowe, które mógłby zadać CFO lub "
-    "dyrektor ds. zrównoważonego rozwoju. Pytanie musi dotyczyć wyłącznie treści "
-    "tego fragmentu. Odpowiedz tylko pytaniem — bez wstępu ani komentarza."
-)
+# System prompts — trzy perspektywy + adversarial dla każdej
+_NORMAL_PROMPTS: dict[str, str] = {
+    "cfo": (
+        "Jesteś CFO dużej spółki notowanej na giełdzie. Przeczytaj poniższy fragment "
+        "dyrektywy UE i zadaj jedno konkretne pytanie dotyczące wpływu finansowego, "
+        "kosztów compliance lub obowiązków raportowania finansowego. "
+        "Pytanie musi dotyczyć wyłącznie treści tego fragmentu. "
+        "Odpowiedz tylko pytaniem — bez wstępu ani komentarza."
+    ),
+    "prawnik": (
+        "Jesteś radcą prawnym specjalizującym się w prawie korporacyjnym UE. "
+        "Przeczytaj poniższy fragment dyrektywy i zadaj jedno konkretne pytanie "
+        "dotyczące interpretacji prawnej, zakresu obowiązku, sankcji lub terminów. "
+        "Pytanie musi dotyczyć wyłącznie treści tego fragmentu. "
+        "Odpowiedz tylko pytaniem — bez wstępu ani komentarza."
+    ),
+    "audytor": (
+        "Jesteś biegłym rewidentem przeprowadzającym audit ESG. Przeczytaj poniższy "
+        "fragment dyrektywy UE i zadaj jedno konkretne pytanie dotyczące weryfikacji, "
+        "dowodów, metodologii pomiaru lub wymagań dokumentacyjnych. "
+        "Pytanie musi dotyczyć wyłącznie treści tego fragmentu. "
+        "Odpowiedz tylko pytaniem — bez wstępu ani komentarza."
+    ),
+}
 
-_ADVERSARIAL_SYSTEM = (
-    "Jesteś konsultantem ESG próbującym wychwycić luki w systemie AI. "
-    "Przeczytaj poniższy fragment dyrektywy UE i zadaj pytanie, na które NIE MA "
-    "odpowiedzi w tym fragmencie — pytaj o coś, co wykracza poza jego zakres. "
-    "Pytanie powinno brzmieć realistycznie i profesjonalnie. "
-    "Odpowiedz tylko pytaniem — bez wstępu ani komentarza."
-)
+_ADVERSARIAL_PROMPTS: dict[str, str] = {
+    "cfo": (
+        "Jesteś CFO testującym system AI. Przeczytaj fragment dyrektywy i zadaj pytanie "
+        "o koszty lub obowiązki finansowe, których NIE MA w tym fragmencie. "
+        "Pytanie powinno brzmieć realistycznie. Odpowiedz tylko pytaniem."
+    ),
+    "prawnik": (
+        "Jesteś prawnikiem testującym system AI. Przeczytaj fragment dyrektywy i zadaj "
+        "pytanie prawne o przepis lub wyjątek, który NIE ISTNIEJE w tym fragmencie. "
+        "Pytanie powinno brzmieć profesjonalnie. Odpowiedz tylko pytaniem."
+    ),
+    "audytor": (
+        "Jesteś audytorem testującym system AI. Przeczytaj fragment dyrektywy i zadaj "
+        "pytanie o metodę weryfikacji lub dokument, który NIE JEST wymagany w tym fragmencie. "
+        "Pytanie powinno brzmieć technicznie. Odpowiedz tylko pytaniem."
+    ),
+}
 
 
 def _call_vllm(system_prompt: str, user_text: str) -> str:
@@ -58,15 +85,22 @@ def _call_vllm(system_prompt: str, user_text: str) -> str:
     return response.choices[0].message.content.strip()
 
 
+_PERSPECTIVES = ["cfo", "prawnik", "audytor"]
+
+
 def simulate_question(state: FoundryState) -> dict:
     """
     LangGraph node.
-    Reads state["chunk"] → returns {"question": ..., "is_adversarial": ...}
+    Reads state["chunk"] + state["perspective"] →
+    returns {"question": ..., "is_adversarial": ...}
     """
     chunk = state["chunk"]
+    perspective = state.get("perspective", "cfo")
     is_adversarial = random.random() < settings.adversarial_ratio
 
-    system = _ADVERSARIAL_SYSTEM if is_adversarial else _NORMAL_SYSTEM
+    prompts = _ADVERSARIAL_PROMPTS if is_adversarial else _NORMAL_PROMPTS
+    system = prompts.get(perspective, prompts["cfo"])
+
     prompt = (
         f"Fragment dyrektywy:\n\n{chunk['content']}\n\n"
         f"Sekcja: {chunk.get('section_heading', 'N/A')}"
@@ -76,11 +110,11 @@ def simulate_question(state: FoundryState) -> dict:
         question = _call_vllm(system, prompt)
     except Exception as exc:
         logger.error("Simulator vLLM call failed: %s", exc)
-        # Generate a safe fallback question so the pipeline doesn't stall
-        question = f"Jakie są główne wymogi określone w tej sekcji dyrektywy?"
+        question = "Jakie są główne wymogi określone w tej sekcji dyrektywy?"
         is_adversarial = False
 
     logger.debug(
-        "Simulator → %s question: %s", "ADVERSARIAL" if is_adversarial else "NORMAL", question[:80]
+        "Simulator [%s] → %s: %s",
+        perspective, "ADVERSARIAL" if is_adversarial else "NORMAL", question[:80]
     )
     return {"question": question, "is_adversarial": is_adversarial}

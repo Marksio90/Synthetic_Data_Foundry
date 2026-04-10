@@ -31,6 +31,7 @@ class FoundryState(TypedDict):
     # ── Simulator output ───────────────────────────────────────────────────
     question: str
     is_adversarial: bool     # True → question asks about something NOT in text
+    perspective: str         # "cfo" | "prawnik" | "audytor"
 
     # ── Expert RAG phase ───────────────────────────────────────────────────
     retrieved_context: list[str]   # list of relevant chunk snippets
