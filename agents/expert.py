@@ -40,7 +40,7 @@ ZASADY ODPOWIEDZI:
 
 def _call_vllm(system: str, user: str) -> str:
     client = openai.OpenAI(
-        api_key="not-needed",
+        api_key=settings.vllm_api_key or settings.openai_api_key,
         base_url=settings.vllm_base_url,
     )
     response = client.chat.completions.create(
