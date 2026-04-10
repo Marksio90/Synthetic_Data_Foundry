@@ -183,10 +183,29 @@ def mark_sample_written(
 # =============================================================================
 
 def register_watermark(session: Session, **kwargs) -> WatermarkRegistry:
-    wm = WatermarkRegistry(**kwargs)
-    session.add(wm)
+    """Upsert watermark — same batch_id fires multiple times (every N records).
+    On conflict: append new record_indices and update total_records + watermark_hash.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    stmt = pg_insert(WatermarkRegistry).values(**kwargs)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["batch_id"],
+        set_={
+            # Append new positions to existing array (|| operator in PG)
+            "record_indices": text(
+                "watermark_registry.record_indices || EXCLUDED.record_indices"
+            ),
+            "total_records": stmt.excluded.total_records,
+            "watermark_hash": stmt.excluded.watermark_hash,
+        },
+    )
+    session.execute(stmt)
     session.flush()
-    return wm
+    # Return the (now upserted) row
+    return session.scalar(
+        select(WatermarkRegistry).where(WatermarkRegistry.batch_id == kwargs["batch_id"])
+    )
 
 
 # =============================================================================
