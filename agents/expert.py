@@ -39,9 +39,11 @@ ZASADY ODPOWIEDZI:
 
 
 def _call_vllm(system: str, user: str) -> str:
+    """Call answer-generation LLM — local vLLM or OpenAI depending on VLLM_BASE_URL."""
+    is_openai = "openai.com" in settings.vllm_base_url
     client = openai.OpenAI(
-        api_key=settings.vllm_api_key or settings.openai_api_key,
-        base_url=settings.vllm_base_url,
+        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
+        base_url=None if is_openai else settings.vllm_base_url,
     )
     response = client.chat.completions.create(
         model=settings.vllm_model,
@@ -49,7 +51,7 @@ def _call_vllm(system: str, user: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.2,  # low temperature → factual, grounded
+        temperature=0.2,
         max_tokens=settings.vllm_max_tokens,
     )
     return response.choices[0].message.content.strip()
