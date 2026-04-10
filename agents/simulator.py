@@ -40,10 +40,11 @@ _ADVERSARIAL_SYSTEM = (
 
 
 def _call_vllm(system_prompt: str, user_text: str) -> str:
-    """Direct call to local vLLM (Llama 3) via OpenAI-compatible API."""
+    """Call question-generation LLM — local vLLM or OpenAI depending on VLLM_BASE_URL."""
+    is_openai = "openai.com" in settings.vllm_base_url
     client = openai.OpenAI(
-        api_key=settings.vllm_api_key or settings.openai_api_key,
-        base_url=settings.vllm_base_url,
+        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
+        base_url=None if is_openai else settings.vllm_base_url,
     )
     response = client.chat.completions.create(
         model=settings.vllm_model,
