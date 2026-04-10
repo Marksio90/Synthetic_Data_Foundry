@@ -30,6 +30,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
         curl \
+        poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built wheels from builder
