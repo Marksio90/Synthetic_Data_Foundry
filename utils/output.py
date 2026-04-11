@@ -139,6 +139,63 @@ class JSONLWriter:
                 self._refusal_count += 1
             return idx, watermark_hash
 
+    def write_conversation(self, messages: list[dict]) -> tuple[int, Optional[str]]:
+        """
+        Write a multi-turn conversation as a single JSONL record.
+        messages includes system + user/assistant turns.
+        Returns (record_index, watermark_hash).
+        Returns (-1, None) when skipped due to refusal cap.
+        """
+        with self._lock:
+            # Check refusal cap: count assistant turns that are pure refusals
+            assistant_turns = [m for m in messages if m["role"] == "assistant"]
+            refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
+            is_all_refusals = len(assistant_turns) > 0 and refusal_turns == len(assistant_turns)
+
+            if is_all_refusals and self._record_count > 0:
+                current_ratio = self._refusal_count / self._record_count
+                if current_ratio >= self.max_refusal_ratio:
+                    logger.debug("Refusal cap reached — skipping multi-turn record")
+                    return -1, None
+
+            idx = self._record_count
+            watermark_hash: Optional[str] = None
+
+            # Apply watermark to last assistant turn every N records
+            if self.watermark_interval > 0 and idx % self.watermark_interval == 0 and idx > 0:
+                technique = idx // self.watermark_interval
+                # Find last assistant message and inject watermark
+                messages = list(messages)  # copy to avoid mutating caller's list
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i]["role"] == "assistant":
+                        messages[i] = {
+                            **messages[i],
+                            "content": inject_watermark(messages[i]["content"], technique),
+                        }
+                        break
+                watermark_hash = compute_watermark_hash(self.client_id, self.batch_id, idx)
+                self._watermark_positions.append(idx)
+                logger.debug(
+                    "Watermark injected at record %d (technique=%s, hash=%s)",
+                    idx,
+                    build_watermark_description(technique),
+                    watermark_hash[:8] + "...",
+                )
+
+            record = {"messages": messages}
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            # Validate round-trip before appending (no truncated JSON)
+            json.loads(line)
+
+            with self.output_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+
+            self._record_count += 1
+            if is_all_refusals:
+                self._refusal_count += 1
+            return idx, watermark_hash
+
     @property
     def watermark_positions(self) -> list[int]:
         return list(self._watermark_positions)

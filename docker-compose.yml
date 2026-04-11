@@ -138,6 +138,10 @@ services:
       VLLM_BASE_URL: https://api.openai.com/v1
       VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
       VLLM_API_KEY: ${OPENAI_API_KEY}
+      # Groq (Llama 3.3 70B — primary question/answer generator when key is set)
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
       # OpenAI (Judge agent)
       OPENAI_API_KEY: ${OPENAI_API_KEY:?err — set OPENAI_API_KEY in .env}
       OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
@@ -148,6 +152,8 @@ services:
       ADVERSARIAL_RATIO: ${ADVERSARIAL_RATIO:-0.10}
       QUALITY_THRESHOLD: ${QUALITY_THRESHOLD:-0.90}
       MAX_RETRIES_PER_CHUNK: ${MAX_RETRIES_PER_CHUNK:-3}
+      MAX_TURNS: ${MAX_TURNS:-3}
+      MAX_REFUSAL_RATIO: ${MAX_REFUSAL_RATIO:-0.10}
       WATERMARK_INTERVAL: ${WATERMARK_INTERVAL:-50}
       BATCH_SIZE: ${BATCH_SIZE:-10}
       # Output

@@ -1,30 +1,36 @@
 """
 pipeline/graph.py — LangGraph swarm definition.
 
-Graph topology (per chunk):
+Graph topology (per chunk, multi-turn):
 
   START
     │
     ▼
-  [simulate_question]        ← Llama 3 generates question (10% adversarial)
+  [simulate_question]      ← Groq/Llama generates initial question (10% adversarial)
     │
     ▼
-  [retrieve_context]         ← pgvector + BM25 hybrid search
+  [retrieve_context]       ← pgvector + BM25 hybrid search
     │
     ▼
-  [generate_answer]          ← Llama 3 generates grounded answer
+  [generate_answer]        ← Groq/Llama grounded answer (uses conversation history)
     │
     ▼
-  [judge_answer]             ← gpt-4o-mini (cascade → o1-mini if confidence < 90%)
+  [judge_answer]           ← gpt-4o-mini (cascade → gpt-4o if confidence < threshold)
     │
-    ├── score >= threshold ──► [write_output]  ──► END (status=ready)
+    ├── score >= threshold ──► [append_turn]
+    │                              │
+    │                              ├── turn < MAX_TURNS ──► [simulate_followup]
+    │                              │                              │
+    │                              │                          (loops back to retrieve_context)
+    │                              │
+    │                              └── turn >= MAX_TURNS ──► [write_output] ──► END
     │
-    └── score < threshold ───► retry_count < MAX_RETRIES?
-                                  │ yes → back to [simulate_question]
+    └── score < threshold ───► (turn==0) retry_count < MAX_RETRIES?
+                                  │ yes → [increment_retry] → [simulate_question]
                                   │ no  → [mark_unresolvable] → END
+                               (turn>0) → [write_output] (write partial conversation) → END
 
-All DB mutations happen inside the write_output and mark_unresolvable nodes
-using explicit SQLAlchemy transactions (ACID idempotency, Self-Check patch).
+All DB mutations happen inside write_output and mark_unresolvable nodes.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ from sqlalchemy.orm import Session
 
 from agents.expert import generate_answer, retrieve_context
 from agents.judge import judge_answer
-from agents.simulator import simulate_question
+from agents.simulator import simulate_followup, simulate_question
 from config.settings import settings
 from db import repository as repo
 from pipeline.state import FoundryState
@@ -46,9 +52,6 @@ from utils.output import JSONLWriter
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# System prompt stored in every ChatML record
-# ---------------------------------------------------------------------------
 _SYSTEM_PROMPT = (
     "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE. "
     "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
@@ -57,7 +60,7 @@ _SYSTEM_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
-# Node wrappers (inject DB session via closure)
+# Node wrappers
 # ---------------------------------------------------------------------------
 
 def make_retrieve_node(session: Session):
@@ -66,38 +69,67 @@ def make_retrieve_node(session: Session):
     return _retrieve
 
 
+def append_turn(state: FoundryState) -> dict:
+    """Accumulate the current Q&A turn into conversation_history."""
+    history = list(state.get("conversation_history", []))
+    history.append({"role": "user", "content": state["question"]})
+    history.append({"role": "assistant", "content": state["answer"]})
+    return {
+        "conversation_history": history,
+        "turn_count": state.get("turn_count", 0) + 1,
+        # Reset per-turn fields for the next turn
+        "question": "",
+        "answer": "",
+        "quality_score": 0.0,
+        "retry_count": 0,
+    }
+
+
+def route_after_append(state: FoundryState) -> str:
+    """After appending a turn: continue if budget allows, else write."""
+    if state.get("turn_count", 0) < settings.max_turns:
+        return "simulate_followup"
+    return "write_output"
+
+
 def make_write_node(session: Session, writer: JSONLWriter):
     def _write(state: FoundryState) -> dict:
         chunk_id = uuid.UUID(state["chunk"]["id"])
 
-        # Write to JSONL (atomic append); -1 means refusal cap reached → skip
-        record_index, watermark_hash = writer.write_sample(
-            question=state["question"],
-            answer=state["answer"],
-            system_prompt=_SYSTEM_PROMPT,
-        )
+        # Build full ChatML messages from accumulated conversation_history
+        history = state.get("conversation_history", [])
+        if history:
+            messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + list(history)
+        else:
+            # Fallback: single-turn (should not normally happen)
+            messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": state["question"]},
+                {"role": "assistant", "content": state["answer"]},
+            ]
+
+        record_index, watermark_hash = writer.write_conversation(messages)
 
         if record_index == -1:
-            # Refusal cap: valid answer but dataset quota exceeded — mark ready
+            # Refusal cap reached — mark chunk ready without writing
             try:
                 repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
                 session.commit()
             except Exception as exc:
                 session.rollback()
                 logger.error("Failed to finalize capped chunk %s: %s", chunk_id, exc)
-            logger.info(
-                "⊘ Refusal capped — chunk=%s not written to output",
-                state["chunk"]["id"][:8],
-            )
+            logger.info("⊘ Refusal capped — chunk=%s not written", state["chunk"]["id"][:8])
             return {"status": "ready", "record_index": -1}
 
-        # Persist sample row + mark chunk ready (single transaction → ACID)
+        # Persist sample row (store first Q&A turn as representative) + mark ready
+        first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
+        first_asst = next((m["content"] for m in messages if m["role"] == "assistant"), "")
         try:
             sample = repo.insert_sample(
                 session,
                 chunk_id=chunk_id,
-                question=state["question"],
-                answer=state["answer"],
+                question=first_user,
+                answer=first_asst,
                 system_prompt=_SYSTEM_PROMPT,
                 is_adversarial=state.get("is_adversarial", False),
                 quality_score=state.get("quality_score"),
@@ -131,10 +163,12 @@ def make_write_node(session: Session, writer: JSONLWriter):
             )
             session.commit()
 
+        turns = state.get("turn_count", 0)
         logger.info(
-            "✓ Record %d written (chunk=%s score=%.2f%s)",
+            "✓ Record %d written (chunk=%s turns=%d score=%.2f%s)",
             record_index,
             state["chunk"]["id"][:8],
+            turns,
             state.get("quality_score", 0.0),
             " [watermarked]" if watermark_hash else "",
         )
@@ -175,17 +209,25 @@ def make_unresolvable_node(session: Session):
 def route_after_judge(state: FoundryState) -> str:
     score = state.get("quality_score", 0.0)
     retries = state.get("retry_count", 0)
+    turn = state.get("turn_count", 0)
 
     if score >= settings.quality_threshold:
+        return "append_turn"
+
+    # Follow-up turn failed quality check → write partial conversation (still valuable)
+    if turn > 0:
+        logger.info(
+            "Follow-up score %.2f < %.2f at turn %d — writing partial conversation for chunk %s",
+            score, settings.quality_threshold, turn, state["chunk"]["id"][:8],
+        )
         return "write_output"
 
+    # First turn: retry if budget allows
     if retries < settings.max_retries_per_chunk:
         logger.info(
             "Score %.2f < %.2f — retry %d/%d for chunk %s",
-            score,
-            settings.quality_threshold,
-            retries + 1,
-            settings.max_retries_per_chunk,
+            score, settings.quality_threshold,
+            retries + 1, settings.max_retries_per_chunk,
             state["chunk"]["id"][:8],
         )
         return "retry"
@@ -194,7 +236,6 @@ def route_after_judge(state: FoundryState) -> str:
 
 
 def increment_retry(state: FoundryState) -> dict:
-    """Pseudo-node: bump retry counter before looping back."""
     return {"retry_count": state.get("retry_count", 0) + 1}
 
 
@@ -205,37 +246,53 @@ def increment_retry(state: FoundryState) -> dict:
 def build_graph(session: Session, writer: JSONLWriter) -> StateGraph:
     graph = StateGraph(FoundryState)
 
-    # Add nodes
-    graph.add_node("simulate_question", simulate_question)
-    graph.add_node("retrieve_context", make_retrieve_node(session))
-    graph.add_node("generate_answer", generate_answer)
-    graph.add_node("judge_answer", judge_answer)
-    graph.add_node("write_output", make_write_node(session, writer))
-    graph.add_node("mark_unresolvable", make_unresolvable_node(session))
-    graph.add_node("increment_retry", increment_retry)
+    # Nodes
+    graph.add_node("simulate_question",  simulate_question)
+    graph.add_node("simulate_followup",  simulate_followup)
+    graph.add_node("retrieve_context",   make_retrieve_node(session))
+    graph.add_node("generate_answer",    generate_answer)
+    graph.add_node("judge_answer",       judge_answer)
+    graph.add_node("append_turn",        append_turn)
+    graph.add_node("write_output",       make_write_node(session, writer))
+    graph.add_node("mark_unresolvable",  make_unresolvable_node(session))
+    graph.add_node("increment_retry",    increment_retry)
 
-    # Linear pipeline
-    graph.add_edge(START, "simulate_question")
-    graph.add_edge("simulate_question", "retrieve_context")
-    graph.add_edge("retrieve_context", "generate_answer")
-    graph.add_edge("generate_answer", "judge_answer")
+    # Main pipeline (turn 0)
+    graph.add_edge(START,                "simulate_question")
+    graph.add_edge("simulate_question",  "retrieve_context")
+    graph.add_edge("retrieve_context",   "generate_answer")
+    graph.add_edge("generate_answer",    "judge_answer")
 
-    # Conditional routing after Judge
+    # After judge: route to append_turn, retry, write_output, or unresolvable
     graph.add_conditional_edges(
         "judge_answer",
         route_after_judge,
         {
-            "write_output": "write_output",
-            "retry": "increment_retry",
+            "append_turn":       "append_turn",
+            "retry":             "increment_retry",
+            "write_output":      "write_output",
             "mark_unresolvable": "mark_unresolvable",
         },
     )
 
-    # Retry loop: increment counter → back to Simulator
-    graph.add_edge("increment_retry", "simulate_question")
+    # Retry loop
+    graph.add_edge("increment_retry",   "simulate_question")
+
+    # After appending: continue to follow-up or write
+    graph.add_conditional_edges(
+        "append_turn",
+        route_after_append,
+        {
+            "simulate_followup": "simulate_followup",
+            "write_output":      "write_output",
+        },
+    )
+
+    # Follow-up loop: simulate → retrieve → generate → judge (reuses shared nodes)
+    graph.add_edge("simulate_followup", "retrieve_context")
 
     # Terminal edges
-    graph.add_edge("write_output", END)
-    graph.add_edge("mark_unresolvable", END)
+    graph.add_edge("write_output",       END)
+    graph.add_edge("mark_unresolvable",  END)
 
     return graph.compile()

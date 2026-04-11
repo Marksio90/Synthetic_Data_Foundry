@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     vllm_max_tokens: int = Field(1024)
 
     # ------------------------------------------------------------------
+    # Groq (Llama 3.3 70B — primary question/answer generator)
+    # ------------------------------------------------------------------
+    groq_api_key: str = Field("", description="Groq API key — https://console.groq.com")
+    groq_base_url: str = Field("https://api.groq.com/openai/v1")
+    groq_model: str = Field("llama-3.3-70b-versatile")
+
+    # ------------------------------------------------------------------
     # OpenAI (Judge + Embeddings)
     # ------------------------------------------------------------------
     openai_api_key: str = Field(..., description="OpenAI secret key")
@@ -58,6 +65,7 @@ class Settings(BaseSettings):
     adversarial_ratio: float = Field(0.10, ge=0.0, le=1.0)
     quality_threshold: float = Field(0.90, ge=0.0, le=1.0)
     max_retries_per_chunk: int = Field(3, ge=1)
+    max_turns: int = Field(3, ge=1, le=5, description="Conversation turns per chunk")
     max_refusal_ratio: float = Field(0.10, ge=0.0, le=1.0,
         description="Max fraction of 'Brak danych' records in output (0.10 = 10%)")
     chunk_overlap_chars: int = Field(150, ge=0)

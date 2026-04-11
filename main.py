@@ -198,6 +198,9 @@ def main() -> None:
                     "sample_id": None,
                     "batch_id": args.batch_id,
                     "record_index": writer.record_count,
+                    # Multi-turn conversation state
+                    "conversation_history": [],
+                    "turn_count": 0,
                 }
 
                 try:

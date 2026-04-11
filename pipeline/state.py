@@ -50,6 +50,10 @@ class FoundryState(TypedDict):
     status: str                    # new | in_progress | ready | unresolvable
     error_message: Optional[str]
 
+    # ── Multi-turn conversation ────────────────────────────────────────────
+    conversation_history: list     # accumulates {"role": "user"|"assistant", "content": "..."} dicts
+    turn_count: int                # current turn number (0-based, incremented after each good Q&A)
+
     # ── Output tracking ────────────────────────────────────────────────────
     sample_id: Optional[str]       # UUID of GeneratedSample row
     batch_id: str                  # logical batch identifier
