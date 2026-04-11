@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     adversarial_ratio: float = Field(0.10, ge=0.0, le=1.0)
     quality_threshold: float = Field(0.90, ge=0.0, le=1.0)
     max_retries_per_chunk: int = Field(3, ge=1)
+    max_refusal_ratio: float = Field(0.10, ge=0.0, le=1.0,
+        description="Max fraction of 'Brak danych' records in output (0.10 = 10%)")
     chunk_overlap_chars: int = Field(150, ge=0)
     batch_size: int = Field(10, ge=1)
     watermark_interval: int = Field(50, ge=1)
@@ -80,7 +82,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     log_level: str = Field("INFO")
 
-    @field_validator("adversarial_ratio", "quality_threshold", mode="before")
+    @field_validator("adversarial_ratio", "quality_threshold", "max_refusal_ratio", mode="before")
     @classmethod
     def parse_float(cls, v: object) -> float:
         return float(v)
