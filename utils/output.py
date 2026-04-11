@@ -34,6 +34,8 @@ _SYSTEM_PROMPT = (
     "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie\"."
 )
 
+_REFUSAL_PHRASE = "Brak danych w dyrektywie"
+
 
 class JSONLWriter:
     """Thread-safe, append-only JSONL writer with watermark injection."""
@@ -44,27 +46,36 @@ class JSONLWriter:
         client_id: str = settings.client_id,
         batch_id: str = "",
         watermark_interval: int = settings.watermark_interval,
+        max_refusal_ratio: float = settings.max_refusal_ratio,
     ) -> None:
         self.output_path = Path(output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.client_id = client_id
         self.batch_id = batch_id
         self.watermark_interval = watermark_interval
+        self.max_refusal_ratio = max_refusal_ratio
         self._lock = threading.Lock()
-        self._record_count = self._count_existing_records()
+        self._record_count, self._refusal_count = self._count_existing_records()
         self._watermark_positions: list[int] = []
 
-    def _count_existing_records(self) -> int:
-        """Resume from the last written line so record_index is monotonic."""
+    def _count_existing_records(self) -> tuple[int, int]:
+        """Resume from the last written line; also count existing refusals."""
         if not self.output_path.exists():
-            return 0
-        count = 0
+            return 0, 0
+        total = 0
+        refusals = 0
         with self.output_path.open("r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
-                    count += 1
-        logger.info("Resuming from record %d in %s", count, self.output_path)
-        return count
+                    total += 1
+                    if _REFUSAL_PHRASE in line:
+                        refusals += 1
+        logger.info(
+            "Resuming from record %d in %s (%d refusals, %.1f%%)",
+            total, self.output_path, refusals,
+            100.0 * refusals / total if total else 0,
+        )
+        return total, refusals
 
     def write_sample(
         self,
@@ -74,9 +85,23 @@ class JSONLWriter:
     ) -> tuple[int, Optional[str]]:
         """
         Append one ChatML record.  Returns (record_index, watermark_hash).
+        Returns (-1, None) when the record is silently skipped because the
+        refusal cap (max_refusal_ratio) has been reached.
         watermark_hash is non-None only when a watermark was injected.
         """
         with self._lock:
+            # Cap "Brak danych" refusals at max_refusal_ratio of total output
+            is_refusal = _REFUSAL_PHRASE in answer
+            if is_refusal and self._record_count > 0:
+                current_ratio = self._refusal_count / self._record_count
+                if current_ratio >= self.max_refusal_ratio:
+                    logger.debug(
+                        "Refusal cap %.0f%% reached (%.1f%%) — skipping record",
+                        self.max_refusal_ratio * 100,
+                        current_ratio * 100,
+                    )
+                    return -1, None
+
             idx = self._record_count
             watermark_hash: Optional[str] = None
 
@@ -110,6 +135,8 @@ class JSONLWriter:
                 f.flush()
 
             self._record_count += 1
+            if is_refusal:
+                self._refusal_count += 1
             return idx, watermark_hash
 
     @property

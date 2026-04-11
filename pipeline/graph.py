@@ -70,12 +70,26 @@ def make_write_node(session: Session, writer: JSONLWriter):
     def _write(state: FoundryState) -> dict:
         chunk_id = uuid.UUID(state["chunk"]["id"])
 
-        # Write to JSONL (atomic append)
+        # Write to JSONL (atomic append); -1 means refusal cap reached → skip
         record_index, watermark_hash = writer.write_sample(
             question=state["question"],
             answer=state["answer"],
             system_prompt=_SYSTEM_PROMPT,
         )
+
+        if record_index == -1:
+            # Refusal cap: valid answer but dataset quota exceeded — mark ready
+            try:
+                repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.error("Failed to finalize capped chunk %s: %s", chunk_id, exc)
+            logger.info(
+                "⊘ Refusal capped — chunk=%s not written to output",
+                state["chunk"]["id"][:8],
+            )
+            return {"status": "ready", "record_index": -1}
 
         # Persist sample row + mark chunk ready (single transaction → ACID)
         try:
