@@ -28,12 +28,6 @@ from pipeline.watermark import (
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
-    "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE. "
-    "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
-    "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie\"."
-)
-
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
 
@@ -77,67 +71,25 @@ class JSONLWriter:
         )
         return total, refusals
 
-    def write_sample(
-        self,
-        question: str,
-        answer: str,
-        system_prompt: str = _SYSTEM_PROMPT,
-    ) -> tuple[int, Optional[str]]:
+    def should_skip(self, messages: list[dict]) -> bool:
         """
-        Append one ChatML record.  Returns (record_index, watermark_hash).
-        Returns (-1, None) when the record is silently skipped because the
-        refusal cap (max_refusal_ratio) has been reached.
-        watermark_hash is non-None only when a watermark was injected.
+        Thread-safe pre-check: would write_conversation skip this record?
+        Call this BEFORE DB commit to avoid committing a record we won't write.
         """
         with self._lock:
-            # Cap "Brak danych" refusals at max_refusal_ratio of total output
-            is_refusal = _REFUSAL_PHRASE in answer
-            if is_refusal and self._record_count > 0:
-                current_ratio = self._refusal_count / self._record_count
-                if current_ratio >= self.max_refusal_ratio:
-                    logger.debug(
-                        "Refusal cap %.0f%% reached (%.1f%%) — skipping record",
-                        self.max_refusal_ratio * 100,
-                        current_ratio * 100,
-                    )
-                    return -1, None
+            return self._is_refusal_capped(messages)
 
-            idx = self._record_count
-            watermark_hash: Optional[str] = None
-
-            # Apply watermark every N records (Self-Check B2B patch)
-            if self.watermark_interval > 0 and idx % self.watermark_interval == 0 and idx > 0:
-                technique = idx // self.watermark_interval
-                answer = inject_watermark(answer, technique)
-                watermark_hash = compute_watermark_hash(self.client_id, self.batch_id, idx)
-                self._watermark_positions.append(idx)
-                logger.debug(
-                    "Watermark injected at record %d (technique=%s, hash=%s)",
-                    idx,
-                    build_watermark_description(technique),
-                    watermark_hash[:8] + "...",
-                )
-
-            record = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": question},
-                    {"role": "assistant", "content": answer},
-                ]
-            }
-
-            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-            # Validate round-trip before appending (no truncated JSON)
-            json.loads(line)
-
-            with self.output_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-
-            self._record_count += 1
-            if is_refusal:
-                self._refusal_count += 1
-            return idx, watermark_hash
+    def _is_refusal_capped(self, messages: list[dict]) -> bool:
+        """Check if record is a refusal and cap has been reached (not thread-safe, call under lock)."""
+        assistant_turns = [m for m in messages if m["role"] == "assistant"]
+        if not assistant_turns:
+            return False
+        refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
+        # Count as refusal if majority of turns are "Brak danych"
+        is_mostly_refusals = refusal_turns / len(assistant_turns) > 0.5
+        if is_mostly_refusals and self._record_count > 0:
+            return (self._refusal_count / self._record_count) >= self.max_refusal_ratio
+        return False
 
     def write_conversation(self, messages: list[dict]) -> tuple[int, Optional[str]]:
         """
@@ -147,16 +99,13 @@ class JSONLWriter:
         Returns (-1, None) when skipped due to refusal cap.
         """
         with self._lock:
-            # Check refusal cap: count assistant turns that are pure refusals
+            # Check refusal cap (majority-based: >50% refusal turns = refusal record)
+            if self._is_refusal_capped(messages):
+                logger.debug("Refusal cap reached — skipping multi-turn record")
+                return -1, None
             assistant_turns = [m for m in messages if m["role"] == "assistant"]
             refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
-            is_all_refusals = len(assistant_turns) > 0 and refusal_turns == len(assistant_turns)
-
-            if is_all_refusals and self._record_count > 0:
-                current_ratio = self._refusal_count / self._record_count
-                if current_ratio >= self.max_refusal_ratio:
-                    logger.debug("Refusal cap reached — skipping multi-turn record")
-                    return -1, None
+            is_mostly_refusals = len(assistant_turns) > 0 and refusal_turns / len(assistant_turns) > 0.5
 
             idx = self._record_count
             watermark_hash: Optional[str] = None
@@ -192,7 +141,7 @@ class JSONLWriter:
                 f.flush()
 
             self._record_count += 1
-            if is_all_refusals:
+            if is_mostly_refusals:
                 self._refusal_count += 1
             return idx, watermark_hash
 

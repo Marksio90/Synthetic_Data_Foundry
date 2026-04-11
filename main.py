@@ -21,14 +21,14 @@ import sys
 import uuid
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from agents.chunker import chunk_document
 from agents.ingestor import ingest_pdf
 from config.settings import settings
 from db.models import Base, DirectiveChunk
-from db.repository import get_pending_chunks
+from db.repository import claim_chunk, get_pending_chunks
 from pipeline.graph import build_graph
 from pipeline.state import FoundryState
 from utils.output import JSONLWriter
@@ -59,6 +59,65 @@ def get_engine():
 
 def create_tables(engine):
     Base.metadata.create_all(engine)
+
+
+def run_migrations(engine) -> None:
+    """
+    Idempotent schema patches applied on every startup.
+
+    1. Re-create finalize_chunk with a status guard so a failed 2nd/3rd
+       perspective cannot demote an already-ready chunk back to 'new'.
+    2. Add perspective TEXT column to generated_samples (IF NOT EXISTS).
+    3. Add conversation_json JSONB column to generated_samples (IF NOT EXISTS).
+    """
+    with engine.connect() as conn:
+        # ── Patch 1: status-guarded finalize_chunk ───────────────────────────
+        conn.execute(text("""
+            CREATE OR REPLACE FUNCTION finalize_chunk(
+                p_chunk_id  UUID,
+                p_success   BOOLEAN,
+                p_error     TEXT DEFAULT NULL
+            )
+            RETURNS VOID AS $$
+            BEGIN
+                IF p_success THEN
+                    -- Only mark ready if not already finalized (idempotency)
+                    UPDATE directive_chunks
+                    SET status = 'ready', updated_at = NOW()
+                    WHERE id = p_chunk_id
+                      AND status != 'ready';
+                ELSE
+                    -- Never demote a chunk that already succeeded or is terminal
+                    UPDATE directive_chunks
+                    SET
+                        retry_count = retry_count + 1,
+                        status = CASE
+                                    WHEN retry_count + 1 >= 3 THEN 'unresolvable'
+                                    ELSE 'new'
+                                 END,
+                        error_log = p_error,
+                        updated_at = NOW()
+                    WHERE id = p_chunk_id
+                      AND status NOT IN ('ready', 'unresolvable');
+                END IF;
+            END;
+            $$ LANGUAGE plpgsql;
+        """))
+
+        # ── Patch 2: perspective column ──────────────────────────────────────
+        conn.execute(text("""
+            ALTER TABLE generated_samples
+            ADD COLUMN IF NOT EXISTS perspective TEXT;
+        """))
+
+        # ── Patch 3: full conversation JSON ─────────────────────────────────
+        conn.execute(text("""
+            ALTER TABLE generated_samples
+            ADD COLUMN IF NOT EXISTS conversation_json JSONB;
+        """))
+
+        conn.commit()
+    logger.info("DB migrations applied (finalize_chunk guard + schema patches)")
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +156,7 @@ def main() -> None:
     args = parse_args()
     engine = get_engine()
     create_tables(engine)
+    run_migrations(engine)
     Session = sessionmaker(bind=engine)
 
     writer = JSONLWriter(
@@ -177,6 +237,19 @@ def main() -> None:
                     chunk.valid_from_date.isoformat() if chunk.valid_from_date else ""
                 ),
             }
+
+            # Atomically claim chunk (new → in_progress) before processing.
+            # Prevents concurrent workers from double-processing the same chunk.
+            # Also safe for re-runs: if chunk is already in_progress (crashed run),
+            # claim_chunk returns False but we still process it (recovery path).
+            claimed = claim_chunk(session, chunk.id)
+            if not claimed:
+                # Chunk was already in_progress (crashed run) — process it anyway
+                logger.debug("Chunk %s not freshly claimed (in_progress recovery)", chunk.id)
+            try:
+                session.commit()
+            except Exception:
+                session.rollback()
 
             # Run pipeline once per perspective (CFO / prawnik / audytor).
             # Each run produces one multi-turn conversation record (up to max_turns turns).

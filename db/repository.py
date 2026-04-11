@@ -79,10 +79,17 @@ def finalize_chunk(
 
 
 def get_pending_chunks(session: Session, limit: int = 100) -> list[DirectiveChunk]:
+    """
+    Return chunks eligible for processing:
+      - status='new' (normal path)
+      - status='in_progress' (recovery path: picks up chunks left in_progress
+        by a previous crashed run — safe in single-worker deployments)
+    Both filtered by retry_count < 3 to skip permanently failed chunks.
+    """
     return list(
         session.scalars(
             select(DirectiveChunk)
-            .where(DirectiveChunk.status == "new")
+            .where(DirectiveChunk.status.in_(["new", "in_progress"]))
             .where(DirectiveChunk.retry_count < 3)
             .order_by(DirectiveChunk.created_at)
             .limit(limit)
@@ -131,7 +138,7 @@ def hybrid_search(
         SELECT directive_chunks.*
         FROM   combined
         JOIN   directive_chunks ON directive_chunks.id = combined.id
-        ORDER  BY combined.score DESC
+        ORDER  BY combined.score DESC, directive_chunks.id ASC
         LIMIT  :top_k
         """
     )
