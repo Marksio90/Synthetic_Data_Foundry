@@ -178,7 +178,8 @@ def main() -> None:
                 ),
             }
 
-            # Run pipeline once per perspective (CFO / prawnik / audytor)
+            # Run pipeline once per perspective (CFO / prawnik / audytor).
+            # Each run produces one multi-turn conversation record (up to max_turns turns).
             chunk_ready = False
             for perspective in perspectives:
                 initial_state: FoundryState = {
@@ -195,6 +196,8 @@ def main() -> None:
                     "retry_count": 0,
                     "status": "in_progress",
                     "error_message": None,
+                    "conversation_history": [],
+                    "turn_count": 0,
                     "sample_id": None,
                     "batch_id": args.batch_id,
                     "record_index": writer.record_count,
@@ -205,14 +208,15 @@ def main() -> None:
                     final_status = final_state.get("status", "unknown")
                     if final_status == "ready":
                         chunk_ready = True
-                        total_ready += 1
                 except Exception as exc:
                     logger.error(
                         "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
                     )
 
             total_processed += 1
-            if not chunk_ready:
+            if chunk_ready:
+                total_ready += 1
+            else:
                 total_unresolvable += 1
 
             if total_processed % 10 == 0:

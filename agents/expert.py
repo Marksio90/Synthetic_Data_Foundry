@@ -9,6 +9,10 @@ Two-phase operation:
   Phase 2 (generate): prompt Llama 3 (local vLLM) with retrieved context
     + original chunk.  If question is adversarial, the grounding prompt
     forces the refusal phrase "Brak danych w dyrektywie".
+
+Groq routing (primary when GROQ_API_KEY is set):
+  Uses Llama 3.3 70B via Groq API for answer generation.
+  Falls back to VLLM_BASE_URL / OpenAI when GROQ_API_KEY is empty.
 """
 
 from __future__ import annotations
@@ -17,6 +21,13 @@ import logging
 
 import openai
 from sqlalchemy.orm import Session
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from config.settings import settings
 from db import repository as repo
@@ -38,19 +49,76 @@ ZASADY ODPOWIEDZI:
 """
 
 
+# ---------------------------------------------------------------------------
+# Retry decorator for Groq/vLLM calls (handles 429 and 5xx)
+# ---------------------------------------------------------------------------
+
+def _is_retryable_vllm(exc: BaseException) -> bool:
+    if isinstance(exc, openai.RateLimitError):
+        return True
+    if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
+        return True
+    return False
+
+
+def _retry_vllm(func):
+    return retry(
+        reraise=True,
+        retry=retry_if_exception(_is_retryable_vllm),
+        wait=wait_exponential(
+            multiplier=1,
+            min=settings.tenacity_initial_wait,
+            max=settings.tenacity_max_wait,
+        ),
+        stop=stop_after_attempt(settings.tenacity_max_attempts),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )(func)
+
+
+@_retry_vllm
 def _call_vllm(system: str, user: str) -> str:
-    """Call answer-generation LLM — local vLLM or OpenAI depending on VLLM_BASE_URL."""
-    is_openai = "openai.com" in settings.vllm_base_url
-    client = openai.OpenAI(
-        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
-        base_url=None if is_openai else settings.vllm_base_url,
-    )
+    """Prefer Groq (Llama 3.3) when GROQ_API_KEY is set, fall back to VLLM/OpenAI."""
+    if settings.groq_api_key:
+        client = openai.OpenAI(
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
+        )
+        model = settings.groq_model
+    else:
+        is_openai = "openai.com" in settings.vllm_base_url
+        client = openai.OpenAI(
+            api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
+            base_url=None if is_openai else settings.vllm_base_url,
+        )
+        model = settings.vllm_model
     response = client.chat.completions.create(
-        model=settings.vllm_model,
+        model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        temperature=0.2,
+        max_tokens=settings.vllm_max_tokens,
+    )
+    return response.choices[0].message.content.strip()
+
+
+@_retry_vllm
+def _call_vllm_messages(messages: list[dict]) -> str:
+    """Same Groq/vLLM routing but accepts full messages list (for multi-turn context)."""
+    if settings.groq_api_key:
+        client = openai.OpenAI(api_key=settings.groq_api_key, base_url=settings.groq_base_url)
+        model = settings.groq_model
+    else:
+        is_openai = "openai.com" in settings.vllm_base_url
+        client = openai.OpenAI(
+            api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
+            base_url=None if is_openai else settings.vllm_base_url,
+        )
+        model = settings.vllm_model
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
         temperature=0.2,
         max_tokens=settings.vllm_max_tokens,
     )
@@ -94,13 +162,16 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
 
 def generate_answer(state: FoundryState) -> dict:
     """
-    Phase 2: Generate grounded answer using Llama 3.
+    Phase 2: Generate grounded answer using Groq/vLLM.
+    Uses conversation history for follow-up turns (turn_count > 0).
     Returns {"answer": ...}.
     """
     question = state["question"]
     is_adversarial = state.get("is_adversarial", False)
     chunk = state["chunk"]
     retrieved = state.get("retrieved_context", [])
+    conversation_history = state.get("conversation_history", [])
+    turn_count = state.get("turn_count", 0)
 
     # Build context block
     context_parts = [f"[Główny fragment]\n{chunk['content']}"]
@@ -115,15 +186,33 @@ def generate_answer(state: FoundryState) -> dict:
             "Jeśli tak jest, musisz odpowiedzieć dokładnie: \"Brak danych w dyrektywie.\""
         )
 
-    user_prompt = (
-        f"KONTEKST:\n{context_block}"
-        f"{adversarial_hint}"
-        f"\n\nPYTANIE: {question}"
-        f"\n\nODPOWIEDŹ:"
-    )
-
     try:
-        answer = _call_vllm(_EXPERT_SYSTEM, user_prompt)
+        if turn_count > 0 and conversation_history:
+            # Multi-turn: build full messages list with history for context
+            system_msg = {"role": "system", "content": _EXPERT_SYSTEM}
+            context_user_msg = {
+                "role": "user",
+                "content": f"KONTEKST:\n{context_block}{adversarial_hint}",
+            }
+            context_assistant_msg = {
+                "role": "assistant",
+                "content": "Rozumiem. Jestem gotowy odpowiadać na pytania na podstawie dostarczonego kontekstu.",
+            }
+            # Build: system + context exchange + conversation history + new question
+            messages = (
+                [system_msg, context_user_msg, context_assistant_msg]
+                + list(conversation_history)
+                + [{"role": "user", "content": f"PYTANIE: {question}\n\nODPOWIEDŹ:"}]
+            )
+            answer = _call_vllm_messages(messages)
+        else:
+            user_prompt = (
+                f"KONTEKST:\n{context_block}"
+                f"{adversarial_hint}"
+                f"\n\nPYTANIE: {question}"
+                f"\n\nODPOWIEDŹ:"
+            )
+            answer = _call_vllm(_EXPERT_SYSTEM, user_prompt)
     except Exception as exc:
         logger.error("Expert vLLM generation failed: %s", exc)
         answer = _REFUSAL_PHRASE
