@@ -52,10 +52,37 @@ from utils.output import JSONLWriter
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
+# Perspective-aware system prompts written into the JSONL record (what the
+# fine-tuned model will see in production).  Concise — no chain-of-thought
+# ZASADY needed here; those are only for generation guidance in expert.py.
+_SYSTEM_PROMPTS: dict[str, str] = {
+    "cfo": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
+        "z perspektywy CFO dużej spółki notowanej na giełdzie. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: "
+        "\"Brak danych w dyrektywie.\""
+    ),
+    "prawnik": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
+        "z perspektywy radcy prawnego specjalizującego się w prawie korporacyjnym UE. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: "
+        "\"Brak danych w dyrektywie.\""
+    ),
+    "audytor": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
+        "z perspektywy biegłego rewidenta przeprowadzającego audit ESG. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: "
+        "\"Brak danych w dyrektywie.\""
+    ),
+}
+# Fallback for any unknown perspective
+_DEFAULT_SYSTEM_PROMPT = (
     "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE. "
     "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
-    "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie\"."
+    "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
 )
 
 
@@ -95,14 +122,16 @@ def route_after_append(state: FoundryState) -> str:
 def make_write_node(session: Session, writer: JSONLWriter):
     def _write(state: FoundryState) -> dict:
         chunk_id = uuid.UUID(state["chunk"]["id"])
+        perspective = state.get("perspective", "cfo")
+        system_prompt = _SYSTEM_PROMPTS.get(perspective, _DEFAULT_SYSTEM_PROMPT)
 
         # Build full ChatML messages from accumulated conversation_history
         history = state.get("conversation_history", [])
         if history:
-            messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + list(history)
+            messages = [{"role": "system", "content": system_prompt}] + list(history)
         else:
             messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": state["question"]},
                 {"role": "assistant", "content": state["answer"]},
             ]
@@ -127,12 +156,14 @@ def make_write_node(session: Session, writer: JSONLWriter):
                 chunk_id=chunk_id,
                 question=first_user,
                 answer=first_asst,
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 is_adversarial=state.get("is_adversarial", False),
                 quality_score=state.get("quality_score"),
                 judge_model=state.get("judge_model"),
                 judge_reasoning=state.get("judge_reasoning"),
                 batch_id=state.get("batch_id", ""),
+                perspective=perspective,
+                conversation_json=messages,
             )
             repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
             session.commit()  # ← DB committed BEFORE file write (prevents desync)

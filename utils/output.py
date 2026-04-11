@@ -28,12 +28,6 @@ from pipeline.watermark import (
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
-    "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE. "
-    "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
-    "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie\"."
-)
-
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
 
@@ -76,68 +70,6 @@ class JSONLWriter:
             100.0 * refusals / total if total else 0,
         )
         return total, refusals
-
-    def write_sample(
-        self,
-        question: str,
-        answer: str,
-        system_prompt: str = _SYSTEM_PROMPT,
-    ) -> tuple[int, Optional[str]]:
-        """
-        Append one ChatML record.  Returns (record_index, watermark_hash).
-        Returns (-1, None) when the record is silently skipped because the
-        refusal cap (max_refusal_ratio) has been reached.
-        watermark_hash is non-None only when a watermark was injected.
-        """
-        with self._lock:
-            # Cap "Brak danych" refusals at max_refusal_ratio of total output
-            is_refusal = _REFUSAL_PHRASE in answer
-            if is_refusal and self._record_count > 0:
-                current_ratio = self._refusal_count / self._record_count
-                if current_ratio >= self.max_refusal_ratio:
-                    logger.debug(
-                        "Refusal cap %.0f%% reached (%.1f%%) — skipping record",
-                        self.max_refusal_ratio * 100,
-                        current_ratio * 100,
-                    )
-                    return -1, None
-
-            idx = self._record_count
-            watermark_hash: Optional[str] = None
-
-            # Apply watermark every N records (Self-Check B2B patch)
-            if self.watermark_interval > 0 and idx % self.watermark_interval == 0 and idx > 0:
-                technique = idx // self.watermark_interval
-                answer = inject_watermark(answer, technique)
-                watermark_hash = compute_watermark_hash(self.client_id, self.batch_id, idx)
-                self._watermark_positions.append(idx)
-                logger.debug(
-                    "Watermark injected at record %d (technique=%s, hash=%s)",
-                    idx,
-                    build_watermark_description(technique),
-                    watermark_hash[:8] + "...",
-                )
-
-            record = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": question},
-                    {"role": "assistant", "content": answer},
-                ]
-            }
-
-            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-            # Validate round-trip before appending (no truncated JSON)
-            json.loads(line)
-
-            with self.output_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-
-            self._record_count += 1
-            if is_refusal:
-                self._refusal_count += 1
-            return idx, watermark_hash
 
     def should_skip(self, messages: list[dict]) -> bool:
         """

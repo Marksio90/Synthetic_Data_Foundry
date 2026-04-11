@@ -23,7 +23,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 
@@ -104,6 +104,10 @@ class GeneratedSample(Base):
     quality_score: Optional[float] = Column(Float)
     judge_model: Optional[str] = Column(Text)
     judge_reasoning: Optional[str] = Column(Text)
+    # Dataset labelling
+    perspective: Optional[str] = Column(Text)          # "cfo" | "prawnik" | "audytor"
+    # Full multi-turn conversation (mirrors JSONL record for audit / analysis)
+    conversation_json: Optional[list] = Column(JSONB)
     # Watermark (Self-Check B2B)
     watermark_hash: Optional[str] = Column(String(64))
     batch_id: Optional[str] = Column(Text)
