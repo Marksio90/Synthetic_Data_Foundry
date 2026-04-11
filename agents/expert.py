@@ -37,16 +37,39 @@ logger = logging.getLogger(__name__)
 
 _REFUSAL_PHRASE = "Brak danych w dyrektywie."
 
-_EXPERT_SYSTEM = """Jesteś ekspertem ds. ESG i prawa korporacyjnego UE.
+# Perspective-aware expert system prompts — improve answer precision per role
+_EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
+    "cfo": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy CFO.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: zakresie podmiotowym, terminach, progach kwalifikacyjnych, wymogach ujawnień.\n"
+        "5. Odpowiadaj po polsku, zwięźle i precyzyjnie (2–8 zdań)."
+    ),
+    "prawnik": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy radcy prawnego.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj podstawę prawną: artykuł, ustęp, punkt.\n"
+        "4. Interpretuj literalnie: zakres podmiotowy, przedmiotowy, wyjątki, definicje legalne.\n"
+        "5. Odpowiadaj po polsku z precyzją języka prawniczego (2–8 zdań)."
+    ),
+    "audytor": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy biegłego rewidenta ESG.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: wymogach ujawnień, kryteriach kwalifikacji, wskaźnikach ESG, metodach pomiaru.\n"
+        "5. Odpowiadaj po polsku, technicznie i precyzyjnie (2–8 zdań)."
+    ),
+}
 
-ZASADY ODPOWIEDZI:
-1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w sekcji KONTEKST.
-2. Nie wolno Ci podawać informacji spoza dostarczonego kontekstu.
-3. Jeśli pytanie dotyczy czegoś, czego nie ma w kontekście, odpowiedz dokładnie:
-   "Brak danych w dyrektywie."
-4. Cytuj artykuły i ustępy, jeśli są podane w tekście.
-5. Odpowiadaj po polsku, w sposób profesjonalny i precyzyjny.
-"""
+# Max context chars — leaves room for question + history in model's context window
+_MAX_CONTEXT_CHARS = 3500
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +186,7 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
 def generate_answer(state: FoundryState) -> dict:
     """
     Phase 2: Generate grounded answer using Groq/vLLM.
-    Uses conversation history for follow-up turns (turn_count > 0).
+    Uses perspective-aware system prompt and conversation history for follow-up turns.
     Returns {"answer": ...}.
     """
     question = state["question"]
@@ -172,52 +195,58 @@ def generate_answer(state: FoundryState) -> dict:
     retrieved = state.get("retrieved_context", [])
     conversation_history = state.get("conversation_history", [])
     turn_count = state.get("turn_count", 0)
+    perspective = state.get("perspective", "cfo")
 
-    # Build context block
+    # Pick perspective-aware system prompt
+    system_prompt = _EXPERT_SYSTEM_BY_PERSPECTIVE.get(
+        perspective, _EXPERT_SYSTEM_BY_PERSPECTIVE["cfo"]
+    )
+
+    # Build context block — dynamically cap to avoid token overflow
     context_parts = [f"[Główny fragment]\n{chunk['content']}"]
     for i, ctx in enumerate(retrieved[:4], start=1):
         context_parts.append(f"[Powiązany fragment {i}]\n{ctx}")
     context_block = "\n\n---\n\n".join(context_parts)
 
-    adversarial_hint = ""
-    if is_adversarial:
-        adversarial_hint = (
-            "\n\nUWAGA: To pytanie może wykraczać poza zakres dostarczonych fragmentów. "
-            "Jeśli tak jest, musisz odpowiedzieć dokładnie: \"Brak danych w dyrektywie.\""
-        )
+    # Dynamic truncation: leave room for conversation history + question + answer
+    history_chars = sum(len(m["content"]) for m in conversation_history)
+    available = _MAX_CONTEXT_CHARS - history_chars
+    if len(context_block) > available:
+        context_block = context_block[:max(available, 500)]
+        logger.debug("Context truncated to %d chars (history=%d)", len(context_block), history_chars)
+
+    adversarial_hint = (
+        "\n\nUWAGA: To pytanie może wykraczać poza zakres dostarczonych fragmentów. "
+        "Jeśli tak jest, musisz odpowiedzieć DOKŁADNIE: \"Brak danych w dyrektywie.\""
+        if is_adversarial else ""
+    )
 
     try:
         if turn_count > 0 and conversation_history:
-            # Multi-turn: build full messages list with history for context
-            system_msg = {"role": "system", "content": _EXPERT_SYSTEM}
-            context_user_msg = {
-                "role": "user",
-                "content": f"KONTEKST:\n{context_block}{adversarial_hint}",
-            }
-            context_assistant_msg = {
-                "role": "assistant",
-                "content": "Rozumiem. Jestem gotowy odpowiadać na pytania na podstawie dostarczonego kontekstu.",
-            }
-            # Build: system + context exchange + conversation history + new question
+            # Multi-turn: inject context only in system, conversation history in messages
+            # Avoids duplicating context in every turn
+            system_with_ctx = (
+                f"{system_prompt}\n\nKONTEKST DYREKTYWY (obowiązuje przez całą rozmowę):\n"
+                f"{context_block}"
+            )
             messages = (
-                [system_msg, context_user_msg, context_assistant_msg]
+                [{"role": "system", "content": system_with_ctx}]
                 + list(conversation_history)
-                + [{"role": "user", "content": f"PYTANIE: {question}\n\nODPOWIEDŹ:"}]
+                + [{"role": "user", "content": f"PYTANIE: {question}{adversarial_hint}\n\nODPOWIEDŹ:"}]
             )
             answer = _call_vllm_messages(messages)
         else:
+            # First turn: simple system + user format
             user_prompt = (
                 f"KONTEKST:\n{context_block}"
                 f"{adversarial_hint}"
                 f"\n\nPYTANIE: {question}"
                 f"\n\nODPOWIEDŹ:"
             )
-            answer = _call_vllm(_EXPERT_SYSTEM, user_prompt)
+            answer = _call_vllm(system_prompt, user_prompt)
     except Exception as exc:
-        logger.error("Expert vLLM generation failed: %s", exc)
+        logger.error("Expert generation failed: %s", exc)
         answer = _REFUSAL_PHRASE
 
-    # Sanity check: adversarial questions that slip through should be caught
-    # here — if the model hallucinated something, the Judge will catch it.
-    logger.debug("Expert answer (%d chars): %s", len(answer), answer[:80])
+    logger.debug("Expert [%s] answer (%d chars): %s", perspective, len(answer), answer[:80])
     return {"answer": answer}

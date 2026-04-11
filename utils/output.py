@@ -139,6 +139,26 @@ class JSONLWriter:
                 self._refusal_count += 1
             return idx, watermark_hash
 
+    def should_skip(self, messages: list[dict]) -> bool:
+        """
+        Thread-safe pre-check: would write_conversation skip this record?
+        Call this BEFORE DB commit to avoid committing a record we won't write.
+        """
+        with self._lock:
+            return self._is_refusal_capped(messages)
+
+    def _is_refusal_capped(self, messages: list[dict]) -> bool:
+        """Check if record is a refusal and cap has been reached (not thread-safe, call under lock)."""
+        assistant_turns = [m for m in messages if m["role"] == "assistant"]
+        if not assistant_turns:
+            return False
+        refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
+        # Count as refusal if majority of turns are "Brak danych"
+        is_mostly_refusals = refusal_turns / len(assistant_turns) > 0.5
+        if is_mostly_refusals and self._record_count > 0:
+            return (self._refusal_count / self._record_count) >= self.max_refusal_ratio
+        return False
+
     def write_conversation(self, messages: list[dict]) -> tuple[int, Optional[str]]:
         """
         Write a multi-turn conversation as a single JSONL record.
@@ -147,16 +167,13 @@ class JSONLWriter:
         Returns (-1, None) when skipped due to refusal cap.
         """
         with self._lock:
-            # Check refusal cap: count assistant turns that are pure refusals
+            # Check refusal cap (majority-based: >50% refusal turns = refusal record)
+            if self._is_refusal_capped(messages):
+                logger.debug("Refusal cap reached — skipping multi-turn record")
+                return -1, None
             assistant_turns = [m for m in messages if m["role"] == "assistant"]
             refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
-            is_all_refusals = len(assistant_turns) > 0 and refusal_turns == len(assistant_turns)
-
-            if is_all_refusals and self._record_count > 0:
-                current_ratio = self._refusal_count / self._record_count
-                if current_ratio >= self.max_refusal_ratio:
-                    logger.debug("Refusal cap reached — skipping multi-turn record")
-                    return -1, None
+            is_mostly_refusals = len(assistant_turns) > 0 and refusal_turns / len(assistant_turns) > 0.5
 
             idx = self._record_count
             watermark_hash: Optional[str] = None
@@ -192,7 +209,7 @@ class JSONLWriter:
                 f.flush()
 
             self._record_count += 1
-            if is_all_refusals:
+            if is_mostly_refusals:
                 self._refusal_count += 1
             return idx, watermark_hash
 

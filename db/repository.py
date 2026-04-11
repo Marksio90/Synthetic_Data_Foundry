@@ -131,7 +131,7 @@ def hybrid_search(
         SELECT directive_chunks.*
         FROM   combined
         JOIN   directive_chunks ON directive_chunks.id = combined.id
-        ORDER  BY combined.score DESC
+        ORDER  BY combined.score DESC, directive_chunks.id ASC
         LIMIT  :top_k
         """
     )

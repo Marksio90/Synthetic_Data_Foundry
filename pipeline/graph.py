@@ -101,17 +101,14 @@ def make_write_node(session: Session, writer: JSONLWriter):
         if history:
             messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + list(history)
         else:
-            # Fallback: single-turn (should not normally happen)
             messages = [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": state["question"]},
                 {"role": "assistant", "content": state["answer"]},
             ]
 
-        record_index, watermark_hash = writer.write_conversation(messages)
-
-        if record_index == -1:
-            # Refusal cap reached — mark chunk ready without writing
+        # Pre-check refusal cap BEFORE any I/O — avoids DB commit for skipped records
+        if writer.should_skip(messages):
             try:
                 repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
                 session.commit()
@@ -121,7 +118,7 @@ def make_write_node(session: Session, writer: JSONLWriter):
             logger.info("⊘ Refusal capped — chunk=%s not written", state["chunk"]["id"][:8])
             return {"status": "ready", "record_index": -1}
 
-        # Persist sample row (store first Q&A turn as representative) + mark ready
+        # ── Phase 1: Persist to DB first (ACID: DB commit before JSONL write) ───────
         first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
         first_asst = next((m["content"] for m in messages if m["role"] == "assistant"), "")
         try:
@@ -137,31 +134,39 @@ def make_write_node(session: Session, writer: JSONLWriter):
                 judge_reasoning=state.get("judge_reasoning"),
                 batch_id=state.get("batch_id", ""),
             )
+            repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
+            session.commit()  # ← DB committed BEFORE file write (prevents desync)
+        except Exception as exc:
+            session.rollback()
+            logger.error("Failed to persist sample for chunk %s: %s", chunk_id, exc)
+            raise
+
+        # ── Phase 2: Write to JSONL (local I/O — rarely fails) ──────────────────────
+        record_index, watermark_hash = writer.write_conversation(messages)
+
+        # ── Phase 3: Update DB with record_index + watermark (best-effort) ──────────
+        try:
             repo.mark_sample_written(
                 session,
                 sample_id=sample.id,
                 record_index=record_index,
                 watermark_hash=watermark_hash,
             )
-            repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
+            if watermark_hash:
+                technique = record_index // settings.watermark_interval
+                repo.register_watermark(
+                    session,
+                    batch_id=state.get("batch_id", "default"),
+                    client_id=settings.client_id,
+                    watermark_signature=build_watermark_description(technique),
+                    watermark_hash=watermark_hash,
+                    record_indices=[record_index],
+                    total_records=writer.record_count,
+                )
             session.commit()
         except Exception as exc:
             session.rollback()
-            logger.error("Failed to persist sample for chunk %s: %s", chunk_id, exc)
-            raise
-
-        if watermark_hash:
-            technique = record_index // settings.watermark_interval
-            repo.register_watermark(
-                session,
-                batch_id=state.get("batch_id", "default"),
-                client_id=settings.client_id,
-                watermark_signature=build_watermark_description(technique),
-                watermark_hash=watermark_hash,
-                record_indices=[record_index],
-                total_records=writer.record_count,
-            )
-            session.commit()
+            logger.warning("Could not update record_index for sample %s: %s", sample.id, exc)
 
         turns = state.get("turn_count", 0)
         logger.info(

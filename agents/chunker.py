@@ -27,7 +27,7 @@ from db.models import DirectiveChunk
 logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
-_MIN_CHUNK_CHARS = 100   # discard degenerate micro-chunks
+_MIN_CHUNK_CHARS = 150   # discard degenerate micro-chunks (increased from 100)
 _MAX_CHUNK_CHARS = 3000  # hard cap; very long chunks split further
 
 
@@ -72,13 +72,17 @@ def _split_long_section(body: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[st
 
 
 def _add_overlap(chunks: list[str], overlap_chars: int) -> list[str]:
-    """Prepend the last *overlap_chars* of the previous chunk to each chunk."""
+    """
+    Prepend the last *overlap_chars* of the previous chunk to each chunk.
+    Uses a clear separator to preserve semantic boundaries (not a bare space).
+    """
     if overlap_chars <= 0 or len(chunks) < 2:
         return chunks
     result = [chunks[0]]
     for i in range(1, len(chunks)):
-        tail = chunks[i - 1][-overlap_chars:]
-        result.append(tail + " " + chunks[i])
+        tail = chunks[i - 1][-overlap_chars:].strip()
+        # Separator makes the overlap boundary explicit for the model
+        result.append(f"[...{tail}]\n\n{chunks[i]}")
     return result
 
 
@@ -146,10 +150,15 @@ def chunk_document(
         chunk_ids.append(str(chunk.id))
 
     session.commit()
-    logger.info(
-        "Chunked doc %s → %d chunks (overlap=%d chars)",
-        source_doc_id,
-        len(chunk_ids),
-        overlap_chars,
-    )
+
+    # Log chunk size distribution for quality monitoring
+    lengths = [len(c) for _, c in raw_chunks]
+    if lengths:
+        logger.info(
+            "Chunked doc %s → %d chunks (overlap=%d) | len: min=%d p50=%d max=%d",
+            source_doc_id, len(chunk_ids), overlap_chars,
+            min(lengths),
+            sorted(lengths)[len(lengths) // 2],
+            max(lengths),
+        )
     return chunk_ids

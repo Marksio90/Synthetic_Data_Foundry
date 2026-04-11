@@ -128,10 +128,17 @@ def _parse_judge_response(raw: str) -> dict:
     return data
 
 
+_MIN_ANSWER_CHARS = 30  # answers shorter than this are rejected without calling the LLM
+
+
 def _build_messages(state: FoundryState) -> list[dict]:
-    context = "\n---\n".join(state.get("retrieved_context", [state["chunk"]["content"]]))
+    context_parts = state.get("retrieved_context", [state["chunk"]["content"]])
+    context_raw = "\n---\n".join(context_parts)
+    if len(context_raw) > 5000:
+        logger.debug("Judge context truncated from %d to 5000 chars", len(context_raw))
+        context_raw = context_raw[:5000]
     user_content = _JUDGE_USER_TEMPLATE.format(
-        context=context[:3000],  # cap context to avoid token limits
+        context=context_raw,
         question=state["question"],
         answer=state["answer"],
     )
@@ -141,6 +148,15 @@ def _build_messages(state: FoundryState) -> list[dict]:
     ]
 
 
+def _safe_score(raw_score: object) -> float:
+    """Clamp and validate judge score to [0.0, 1.0]."""
+    try:
+        s = float(raw_score)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, s))
+
+
 def judge_answer(state: FoundryState) -> dict:
     """
     LangGraph node.
@@ -148,6 +164,15 @@ def judge_answer(state: FoundryState) -> dict:
     """
     is_adversarial = state.get("is_adversarial", False)
     answer = state.get("answer", "")
+
+    # Fast-path: reject trivially short non-adversarial answers immediately
+    if not is_adversarial and len(answer.strip()) < _MIN_ANSWER_CHARS:
+        logger.warning("Answer too short (%d chars) — rejecting without LLM call", len(answer.strip()))
+        return {
+            "quality_score": 0.0,
+            "judge_model": "rule-based",
+            "judge_reasoning": f"Answer too short ({len(answer.strip())} chars < {_MIN_ANSWER_CHARS} minimum).",
+        }
 
     # Fast-path for adversarial samples: check refusal compliance
     if is_adversarial:
@@ -171,11 +196,11 @@ def judge_answer(state: FoundryState) -> dict:
     try:
         raw = _call_judge_model(settings.openai_primary_model, messages)
         result = _parse_judge_response(raw)
-        score: float = float(result.get("score", 0.0))
-        confidence: float = float(result.get("confidence", 1.0))
+        score: float = _safe_score(result.get("score", 0.0))
+        confidence: float = _safe_score(result.get("confidence", 1.0))
         judge_model = settings.openai_primary_model
 
-        # Cascade: if confidence < threshold, escalate to o1-mini (Self-Check 2.0)
+        # Cascade: if confidence < threshold, escalate to fallback model (Self-Check 2.0)
         if confidence < settings.quality_threshold:
             logger.info(
                 "Judge confidence %.2f < %.2f — escalating to %s",
@@ -183,7 +208,7 @@ def judge_answer(state: FoundryState) -> dict:
             )
             raw2 = _call_judge_model(settings.openai_fallback_model, messages)
             result = _parse_judge_response(raw2)
-            score = float(result.get("score", 0.0))
+            score = _safe_score(result.get("score", 0.0))
             judge_model = settings.openai_fallback_model
 
     except Exception as exc:

@@ -220,8 +220,11 @@ def simulate_question(state: FoundryState) -> dict:
         question = _call_vllm(system, prompt)
     except Exception as exc:
         logger.error("Simulator vLLM call failed: %s", exc)
-        question = "Jakie są główne wymogi określone w tej sekcji dyrektywy?"
-        is_adversarial = False
+        # Preserve adversarial intent — use a simple fallback question of the right type
+        if is_adversarial:
+            question = "Jakie sankcje przewiduje ta dyrektywa za naruszenie obowiązków raportowych?"
+        else:
+            question = "Jakie są główne wymogi określone w tej sekcji dyrektywy?"
 
     logger.debug(
         "Simulator [%s] → %s: %s",
