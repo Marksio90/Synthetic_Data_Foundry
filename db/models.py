@@ -104,8 +104,11 @@ class GeneratedSample(Base):
     quality_score: Optional[float] = Column(Float)
     judge_model: Optional[str] = Column(Text)
     judge_reasoning: Optional[str] = Column(Text)
-    # Dataset labelling
-    perspective: Optional[str] = Column(Text)          # "cfo" | "prawnik" | "audytor"
+    # Dataset labelling and quality metadata
+    perspective: Optional[str] = Column(Text)          # "cfo" | "prawnik" | "audytor" | "cross_doc"
+    question_type: Optional[str] = Column(Text)        # factual | scope | process | compliance | comparative
+    difficulty: Optional[str] = Column(Text)           # easy | medium | hard
+    rejected_answer: Optional[str] = Column(Text)      # first-attempt answer for DPO pairing
     # Full multi-turn conversation (mirrors JSONL record for audit / analysis)
     conversation_json: Optional[list] = Column(JSONB)
     # Watermark (Self-Check B2B)

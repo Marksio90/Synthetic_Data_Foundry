@@ -37,6 +37,20 @@ logger = logging.getLogger(__name__)
 
 _REFUSAL_PHRASE = "Brak danych w dyrektywie."
 
+# Chain-of-Thought format appended to every perspective prompt.
+# Teaches the model to reason before answering; <reasoning> tags are stripped
+# by the Judge for quality evaluation but kept in the JSONL for fine-tuning.
+_COT_FORMAT = (
+    "\n\nFORMAT ODPOWIEDZI:\n"
+    "Przed udzieleniem odpowiedzi przeprowadź krótkie rozumowanie w tagach:\n"
+    "<reasoning>\n"
+    "Pytanie dotyczy: [kluczowy element pytania]\n"
+    "Relevantne artykuły: [które artykuły/ustępy w kontekście są istotne]\n"
+    "Wniosek: [co wynika bezpośrednio z kontekstu]\n"
+    "</reasoning>\n\n"
+    "Następnie podaj właściwą odpowiedź po polsku (2–8 zdań)."
+)
+
 # Perspective-aware expert system prompts — improve answer precision per role
 _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
     "cfo": (
@@ -47,6 +61,7 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
         "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
         "4. Skup się na: zakresie podmiotowym, terminach, progach kwalifikacyjnych, wymogach ujawnień.\n"
         "5. Odpowiadaj po polsku, zwięźle i precyzyjnie (2–8 zdań)."
+        + _COT_FORMAT
     ),
     "prawnik": (
         "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy radcy prawnego.\n\n"
@@ -56,6 +71,7 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
         "3. Cytuj podstawę prawną: artykuł, ustęp, punkt.\n"
         "4. Interpretuj literalnie: zakres podmiotowy, przedmiotowy, wyjątki, definicje legalne.\n"
         "5. Odpowiadaj po polsku z precyzją języka prawniczego (2–8 zdań)."
+        + _COT_FORMAT
     ),
     "audytor": (
         "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy biegłego rewidenta ESG.\n\n"
@@ -65,6 +81,7 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
         "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
         "4. Skup się na: wymogach ujawnień, kryteriach kwalifikacji, wskaźnikach ESG, metodach pomiaru.\n"
         "5. Odpowiadaj po polsku, technicznie i precyzyjnie (2–8 zdań)."
+        + _COT_FORMAT
     ),
 }
 
