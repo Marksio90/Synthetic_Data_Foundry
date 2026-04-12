@@ -54,6 +54,11 @@ class FoundryState(TypedDict):
     conversation_history: list     # accumulates {"role": "user"|"assistant", "content": "..."} dicts
     turn_count: int                # current turn number (0-based, incremented after each good Q&A)
 
+    # ── DPO / quality metadata ─────────────────────────────────────────────
+    rejected_answer: Optional[str]   # first-attempt answer that scored below threshold
+    question_type: str               # factual | scope | process | compliance | comparative
+    difficulty: str                  # easy | medium | hard
+
     # ── Output tracking ────────────────────────────────────────────────────
     sample_id: Optional[str]       # UUID of GeneratedSample row
     batch_id: str                  # logical batch identifier

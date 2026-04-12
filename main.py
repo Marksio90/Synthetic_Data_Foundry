@@ -7,8 +7,12 @@ Usage:
 Pipeline:
     1. For each PDF: Ingestor → Chunker (stores chunks in PG)
     2. For each pending chunk: run LangGraph swarm
-         Simulator → Expert (RAG) → Judge → write/retry/skip
-    3. Output: output/dataset_esg_v1.jsonl (ChatML format)
+         Simulator → Expert (RAG + CoT) → Judge → write/retry/skip
+    3. Cross-document synthesis pass (chunks from different directives)
+    4. Output:
+         output/dataset_esg_v1.jsonl       — SFT ChatML (main dataset)
+         output/dataset_esg_v1_dpo.jsonl   — DPO preference pairs
+         output/dataset_esg_v1.datacard.json — statistics / quality report
 
 Idempotent: re-running after a crash skips already-processed chunks.
 """
@@ -25,13 +29,16 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from agents.chunker import chunk_document
+from agents.cross_doc import generate_cross_doc_samples
 from agents.ingestor import ingest_pdf
 from config.settings import settings
 from db.models import Base, DirectiveChunk
 from db.repository import claim_chunk, get_pending_chunks
 from pipeline.graph import build_graph
 from pipeline.state import FoundryState
-from utils.output import JSONLWriter
+from utils.datacard import generate_datacard
+from utils.dedup import MinHashDeduplicator
+from utils.output import DPOWriter, JSONLWriter
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -67,8 +74,8 @@ def run_migrations(engine) -> None:
 
     1. Re-create finalize_chunk with a status guard so a failed 2nd/3rd
        perspective cannot demote an already-ready chunk back to 'new'.
-    2. Add perspective TEXT column to generated_samples (IF NOT EXISTS).
-    3. Add conversation_json JSONB column to generated_samples (IF NOT EXISTS).
+    2. Add perspective, conversation_json, question_type, difficulty,
+       rejected_answer columns to generated_samples (IF NOT EXISTS).
     """
     with engine.connect() as conn:
         # ── Patch 1: status-guarded finalize_chunk ───────────────────────────
@@ -81,13 +88,11 @@ def run_migrations(engine) -> None:
             RETURNS VOID AS $$
             BEGIN
                 IF p_success THEN
-                    -- Only mark ready if not already finalized (idempotency)
                     UPDATE directive_chunks
                     SET status = 'ready', updated_at = NOW()
                     WHERE id = p_chunk_id
                       AND status != 'ready';
                 ELSE
-                    -- Never demote a chunk that already succeeded or is terminal
                     UPDATE directive_chunks
                     SET
                         retry_count = retry_count + 1,
@@ -104,20 +109,18 @@ def run_migrations(engine) -> None:
             $$ LANGUAGE plpgsql;
         """))
 
-        # ── Patch 2: perspective column ──────────────────────────────────────
-        conn.execute(text("""
-            ALTER TABLE generated_samples
-            ADD COLUMN IF NOT EXISTS perspective TEXT;
-        """))
-
-        # ── Patch 3: full conversation JSON ─────────────────────────────────
-        conn.execute(text("""
-            ALTER TABLE generated_samples
-            ADD COLUMN IF NOT EXISTS conversation_json JSONB;
-        """))
+        # ── Patch 2–6: new columns on generated_samples ──────────────────────
+        for col_ddl in [
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS perspective TEXT",
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS conversation_json JSONB",
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS question_type TEXT",
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS difficulty TEXT",
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS rejected_answer TEXT",
+        ]:
+            conn.execute(text(col_ddl + ";"))
 
         conn.commit()
-    logger.info("DB migrations applied (finalize_chunk guard + schema patches)")
+    logger.info("DB migrations applied (finalize_chunk guard + 5 schema patches)")
 
 
 # ---------------------------------------------------------------------------
@@ -159,12 +162,17 @@ def main() -> None:
     run_migrations(engine)
     Session = sessionmaker(bind=engine)
 
+    # Writers & quality tools (shared across all chunks)
     writer = JSONLWriter(
         output_path=settings.output_file,
         client_id=settings.client_id,
         batch_id=args.batch_id,
         watermark_interval=settings.watermark_interval,
     )
+    dpo_writer = DPOWriter(output_path=settings.dpo_output_file)
+    deduplicator = MinHashDeduplicator(threshold=settings.dedup_threshold)
+    # Pre-load existing questions so resume runs don't generate duplicates
+    deduplicator.load_from_jsonl(settings.output_file)
 
     # ── Phase 1: Ingest & Chunk all PDFs ────────────────────────────────────
     all_pdf_paths = [Path(p) for p in args.pdfs]
@@ -177,7 +185,6 @@ def main() -> None:
         with Session() as session:
             source_doc_id, markdown = ingest_pdf(str(pdf_path), session)
 
-            # Determine valid_from_date from the ingested document row
             from sqlalchemy import select
             from db.models import SourceDocument
             doc = session.scalar(
@@ -185,7 +192,6 @@ def main() -> None:
             )
             valid_from = doc.valid_from_date if doc else None
 
-            # Check if chunks already exist (idempotency)
             from sqlalchemy import func
             existing_count = session.scalar(
                 select(func.count(DirectiveChunk.id)).where(
@@ -209,13 +215,12 @@ def main() -> None:
     # ── Phase 2: Run swarm on pending chunks ────────────────────────────────
     logger.info("=== Starting swarm on pending chunks (batch=%s) ===", args.batch_id)
 
-    graph = None  # built lazily per session to inject the session
     total_processed = 0
     total_ready = 0
     total_unresolvable = 0
 
     with Session() as session:
-        graph = build_graph(session, writer)
+        graph = build_graph(session, writer, dpo_writer, deduplicator)
 
         limit = args.chunk_limit if args.chunk_limit > 0 else 10_000
         pending = get_pending_chunks(session, limit=limit)
@@ -244,7 +249,6 @@ def main() -> None:
             # claim_chunk returns False but we still process it (recovery path).
             claimed = claim_chunk(session, chunk.id)
             if not claimed:
-                # Chunk was already in_progress (crashed run) — process it anyway
                 logger.debug("Chunk %s not freshly claimed (in_progress recovery)", chunk.id)
             try:
                 session.commit()
@@ -271,6 +275,9 @@ def main() -> None:
                     "error_message": None,
                     "conversation_history": [],
                     "turn_count": 0,
+                    "rejected_answer": None,
+                    "question_type": "factual",
+                    "difficulty": "medium",
                     "sample_id": None,
                     "batch_id": args.batch_id,
                     "record_index": writer.record_count,
@@ -294,20 +301,59 @@ def main() -> None:
 
             if total_processed % 10 == 0:
                 logger.info(
-                    "Progress: %d chunks | %d ready | %d unresolvable | %d records written",
-                    total_processed, total_ready, total_unresolvable, writer.record_count,
+                    "Progress: %d chunks | %d ready | %d unresolvable | "
+                    "%d records | %d DPO pairs",
+                    total_processed, total_ready, total_unresolvable,
+                    writer.record_count, dpo_writer.pair_count,
                 )
 
-    # ── Summary ─────────────────────────────────────────────────────────────
+    # ── Phase 3: Cross-document synthesis pass ───────────────────────────────
+    if settings.cross_doc_samples > 0:
+        logger.info(
+            "=== Cross-document synthesis pass (target=%d samples) ===",
+            settings.cross_doc_samples,
+        )
+        with Session() as session:
+            cross_written = generate_cross_doc_samples(
+                session=session,
+                writer=writer,
+                dpo_writer=dpo_writer,
+                deduplicator=deduplicator,
+                batch_id=args.batch_id,
+                n_samples=settings.cross_doc_samples,
+            )
+        logger.info("Cross-doc pass: %d records written", cross_written)
+    else:
+        cross_written = 0
+
+    # ── Phase 4: Generate datacard ────────────────────────────────────────────
+    card = generate_datacard(
+        jsonl_path=settings.output_file,
+        batch_id=args.batch_id,
+        extra_meta={
+            "dpo_pairs_count": dpo_writer.pair_count,
+            "dpo_file": settings.dpo_output_file,
+            "cross_doc_records": cross_written,
+            "dedup_index_size": deduplicator.size,
+        },
+    )
+
+    # ── Summary ──────────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("ESG Data Foundry — Run Complete")
-    logger.info("  Batch ID         : %s", args.batch_id)
-    logger.info("  Chunks processed : %d", total_processed)
-    logger.info("  Records ready    : %d", total_ready)
-    logger.info("  Unresolvable     : %d", total_unresolvable)
-    logger.info("  Output file      : %s", settings.output_file)
-    logger.info("  Records written  : %d", writer.record_count)
-    logger.info("  Watermark hits   : %s", writer.watermark_positions)
+    logger.info("  Batch ID           : %s", args.batch_id)
+    logger.info("  Chunks processed   : %d", total_processed)
+    logger.info("  Records ready      : %d", total_ready)
+    logger.info("  Unresolvable       : %d", total_unresolvable)
+    logger.info("  SFT records total  : %d", writer.record_count)
+    logger.info("  DPO pairs total    : %d", dpo_writer.pair_count)
+    logger.info("  Cross-doc records  : %d", cross_written)
+    logger.info("  Watermark hits     : %s", writer.watermark_positions)
+    logger.info("  Output (SFT)       : %s", settings.output_file)
+    logger.info("  Output (DPO)       : %s", settings.dpo_output_file)
+    logger.info("  Datacard           : %s", Path(settings.output_file).with_suffix(".datacard.json"))
+    logger.info("  Refusal %%          : %.1f%%", card.get("refusal_pct", 0))
+    logger.info("  Multi-turn %%       : %.1f%%", card.get("turns", {}).get("multi_turn_pct", 0))
     logger.info("=" * 60)
 
 

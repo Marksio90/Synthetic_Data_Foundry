@@ -12,7 +12,7 @@ Graph topology (per chunk, multi-turn):
   [retrieve_context]       ← pgvector + BM25 hybrid search
     │
     ▼
-  [generate_answer]        ← Groq/Llama grounded answer (uses conversation history)
+  [generate_answer]        ← Groq/Llama grounded answer with CoT reasoning
     │
     ▼
   [judge_answer]           ← gpt-4o-mini (cascade → gpt-4o if confidence < threshold)
@@ -21,22 +21,29 @@ Graph topology (per chunk, multi-turn):
     │                              │
     │                              ├── turn < MAX_TURNS ──► [simulate_followup]
     │                              │                              │
-    │                              │                          (loops back to retrieve_context)
+    │                              │                   (loops back to retrieve_context)
     │                              │
     │                              └── turn >= MAX_TURNS ──► [write_output] ──► END
     │
     └── score < threshold ───► (turn==0) retry_count < MAX_RETRIES?
-                                  │ yes → [increment_retry] → [simulate_question]
+                                  │ yes → [increment_retry] → [retrieve_context]
+                                  │       ↑ saves rejected_answer for DPO
                                   │ no  → [mark_unresolvable] → END
                                (turn>0) → [write_output] (write partial conversation) → END
 
-All DB mutations happen inside write_output and mark_unresolvable nodes.
+write_output:
+  1. Near-duplicate check (MinHash) — skip if too similar to existing question
+  2. Classify question (type + difficulty)
+  3. DB commit BEFORE JSONL write (ACID)
+  4. Write JSONL with metadata field
+  5. Write DPO pair if rejected_answer is available
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+from typing import Optional
 
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
@@ -48,13 +55,14 @@ from config.settings import settings
 from db import repository as repo
 from pipeline.state import FoundryState
 from pipeline.watermark import build_watermark_description, compute_watermark_hash
-from utils.output import JSONLWriter
+from utils.classifier import classify_question
+from utils.dedup import MinHashDeduplicator
+from utils.output import DPOWriter, JSONLWriter
 
 logger = logging.getLogger(__name__)
 
-# Perspective-aware system prompts written into the JSONL record (what the
-# fine-tuned model will see in production).  Concise — no chain-of-thought
-# ZASADY needed here; those are only for generation guidance in expert.py.
+# Perspective-aware system prompts for the JSONL output.
+# These are what the fine-tuned model will see in production.
 _SYSTEM_PROMPTS: dict[str, str] = {
     "cfo": (
         "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
@@ -78,7 +86,6 @@ _SYSTEM_PROMPTS: dict[str, str] = {
         "\"Brak danych w dyrektywie.\""
     ),
 }
-# Fallback for any unknown perspective
 _DEFAULT_SYSTEM_PROMPT = (
     "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE. "
     "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
@@ -119,7 +126,12 @@ def route_after_append(state: FoundryState) -> str:
     return "write_output"
 
 
-def make_write_node(session: Session, writer: JSONLWriter):
+def make_write_node(
+    session: Session,
+    writer: JSONLWriter,
+    dpo_writer: Optional[DPOWriter] = None,
+    deduplicator: Optional[MinHashDeduplicator] = None,
+):
     def _write(state: FoundryState) -> dict:
         chunk_id = uuid.UUID(state["chunk"]["id"])
         perspective = state.get("perspective", "cfo")
@@ -136,7 +148,7 @@ def make_write_node(session: Session, writer: JSONLWriter):
                 {"role": "assistant", "content": state["answer"]},
             ]
 
-        # Pre-check refusal cap BEFORE any I/O — avoids DB commit for skipped records
+        # ── Pre-check 1: Refusal cap ──────────────────────────────────────────
         if writer.should_skip(messages):
             try:
                 repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
@@ -147,9 +159,24 @@ def make_write_node(session: Session, writer: JSONLWriter):
             logger.info("⊘ Refusal capped — chunk=%s not written", state["chunk"]["id"][:8])
             return {"status": "ready", "record_index": -1}
 
-        # ── Phase 1: Persist to DB first (ACID: DB commit before JSONL write) ───────
+        # ── Pre-check 2: Near-duplicate detection ─────────────────────────────
         first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
+        if deduplicator and first_user and deduplicator.is_duplicate(first_user):
+            try:
+                repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.error("Failed to finalize dedup-skipped chunk %s: %s", chunk_id, exc)
+            logger.info("⊘ Near-duplicate question — chunk=%s not written", state["chunk"]["id"][:8])
+            return {"status": "ready", "record_index": -1}
+
+        # ── Classify question ─────────────────────────────────────────────────
+        q_type, difficulty = classify_question(first_user) if first_user else ("factual", "medium")
+
+        # ── Phase 1: DB commit first (ACID) ───────────────────────────────────
         first_asst = next((m["content"] for m in messages if m["role"] == "assistant"), "")
+        rejected = state.get("rejected_answer") or ""
         try:
             sample = repo.insert_sample(
                 session,
@@ -164,25 +191,43 @@ def make_write_node(session: Session, writer: JSONLWriter):
                 batch_id=state.get("batch_id", ""),
                 perspective=perspective,
                 conversation_json=messages,
+                question_type=q_type,
+                difficulty=difficulty,
+                rejected_answer=rejected or None,
             )
             repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
-            session.commit()  # ← DB committed BEFORE file write (prevents desync)
+            session.commit()
         except Exception as exc:
             session.rollback()
             logger.error("Failed to persist sample for chunk %s: %s", chunk_id, exc)
             raise
 
-        # ── Phase 2: Write to JSONL (local I/O — rarely fails) ──────────────────────
-        record_index, watermark_hash = writer.write_conversation(messages)
+        # ── Phase 2: Write JSONL with metadata ───────────────────────────────
+        metadata = {
+            "perspective": perspective,
+            "question_type": q_type,
+            "difficulty": difficulty,
+            "source_document": state["chunk"].get("source_document", ""),
+            "batch_id": state.get("batch_id", ""),
+        }
+        record_index, watermark_hash = writer.write_conversation(messages, metadata=metadata)
 
-        # ── Phase 3: Update DB with record_index + watermark (best-effort) ──────────
-        try:
-            repo.mark_sample_written(
-                session,
-                sample_id=sample.id,
-                record_index=record_index,
-                watermark_hash=watermark_hash,
+        # ── Phase 3: Write DPO pair (if a rejected answer is available) ───────
+        if dpo_writer and rejected and record_index >= 0:
+            prompt_msgs = [m for m in messages if m["role"] in ("system", "user")][:2]
+            pair_idx = dpo_writer.write_pair(
+                prompt_messages=prompt_msgs,
+                chosen_answer=first_asst,
+                rejected_answer=rejected,
             )
+            if pair_idx >= 0:
+                logger.debug(
+                    "DPO pair #%d written for chunk=%s", pair_idx, state["chunk"]["id"][:8]
+                )
+
+        # ── Phase 4: Update record_index (best-effort) ────────────────────────
+        try:
+            repo.mark_sample_written(session, sample.id, record_index, watermark_hash)
             if watermark_hash:
                 technique = record_index // settings.watermark_interval
                 repo.register_watermark(
@@ -201,14 +246,16 @@ def make_write_node(session: Session, writer: JSONLWriter):
 
         turns = state.get("turn_count", 0)
         logger.info(
-            "✓ Record %d written (chunk=%s turns=%d score=%.2f%s)",
+            "✓ Record %d written (chunk=%s turns=%d score=%.2f type=%s difficulty=%s%s)",
             record_index,
             state["chunk"]["id"][:8],
             turns,
             state.get("quality_score", 0.0),
+            q_type,
+            difficulty,
             " [watermarked]" if watermark_hash else "",
         )
-        return {"status": "ready", "record_index": record_index}
+        return {"status": "ready", "record_index": record_index, "question_type": q_type, "difficulty": difficulty}
 
     return _write
 
@@ -258,10 +305,11 @@ def route_after_judge(state: FoundryState) -> str:
         )
         return "write_output"
 
-    # First turn: retry if budget allows
+    # First turn: retry answer (NOT question) if budget allows.
+    # Keeps the same question for DPO pair alignment.
     if retries < settings.max_retries_per_chunk:
         logger.info(
-            "Score %.2f < %.2f — retry %d/%d for chunk %s",
+            "Score %.2f < %.2f — retry answer %d/%d for chunk %s",
             score, settings.quality_threshold,
             retries + 1, settings.max_retries_per_chunk,
             state["chunk"]["id"][:8],
@@ -272,14 +320,24 @@ def route_after_judge(state: FoundryState) -> str:
 
 
 def increment_retry(state: FoundryState) -> dict:
-    return {"retry_count": state.get("retry_count", 0) + 1}
+    """Increment retry counter and save the failed answer for DPO pairing."""
+    return {
+        "retry_count": state.get("retry_count", 0) + 1,
+        # Save the failed answer — if next retry succeeds, this becomes the DPO "rejected"
+        "rejected_answer": state.get("answer", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
 
-def build_graph(session: Session, writer: JSONLWriter) -> StateGraph:
+def build_graph(
+    session: Session,
+    writer: JSONLWriter,
+    dpo_writer: Optional[DPOWriter] = None,
+    deduplicator: Optional[MinHashDeduplicator] = None,
+) -> StateGraph:
     graph = StateGraph(FoundryState)
 
     # Nodes
@@ -289,7 +347,7 @@ def build_graph(session: Session, writer: JSONLWriter) -> StateGraph:
     graph.add_node("generate_answer",    generate_answer)
     graph.add_node("judge_answer",       judge_answer)
     graph.add_node("append_turn",        append_turn)
-    graph.add_node("write_output",       make_write_node(session, writer))
+    graph.add_node("write_output",       make_write_node(session, writer, dpo_writer, deduplicator))
     graph.add_node("mark_unresolvable",  make_unresolvable_node(session))
     graph.add_node("increment_retry",    increment_retry)
 
@@ -311,8 +369,9 @@ def build_graph(session: Session, writer: JSONLWriter) -> StateGraph:
         },
     )
 
-    # Retry loop
-    graph.add_edge("increment_retry",   "simulate_question")
+    # Retry loop: re-retrieve context and re-generate answer for the SAME question.
+    # This keeps the question stable for DPO pair alignment (same Q, good/bad A).
+    graph.add_edge("increment_retry",   "retrieve_context")
 
     # After appending: continue to follow-up or write
     graph.add_conditional_edges(

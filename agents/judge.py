@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
+# Strip <reasoning>...</reasoning> blocks before quality evaluation so the
+# judge scores only the final answer, not the chain-of-thought scaffolding.
+_REASONING_RE = re.compile(r"<reasoning>.*?</reasoning>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove <reasoning>...</reasoning> block; return only the final answer."""
+    return _REASONING_RE.sub("", text).strip()
+
+
 _JUDGE_SYSTEM = """Jesteś rygorystycznym audytorem jakości zestawów danych ESG.
 
 Oceniasz parę (pytanie, odpowiedź) pod kątem:
@@ -137,10 +147,12 @@ def _build_messages(state: FoundryState) -> list[dict]:
     if len(context_raw) > 5000:
         logger.debug("Judge context truncated from %d to 5000 chars", len(context_raw))
         context_raw = context_raw[:5000]
+    # Strip CoT reasoning block — judge evaluates the final answer only
+    answer_for_eval = _strip_reasoning(state["answer"])
     user_content = _JUDGE_USER_TEMPLATE.format(
         context=context_raw,
         question=state["question"],
-        answer=state["answer"],
+        answer=answer_for_eval,
     )
     return [
         {"role": "system", "content": _JUDGE_SYSTEM},
@@ -164,19 +176,21 @@ def judge_answer(state: FoundryState) -> dict:
     """
     is_adversarial = state.get("is_adversarial", False)
     answer = state.get("answer", "")
+    # Strip CoT block for all rule-based checks — evaluate final answer only
+    answer_eval = _strip_reasoning(answer)
 
     # Fast-path: reject trivially short non-adversarial answers immediately
-    if not is_adversarial and len(answer.strip()) < _MIN_ANSWER_CHARS:
-        logger.warning("Answer too short (%d chars) — rejecting without LLM call", len(answer.strip()))
+    if not is_adversarial and len(answer_eval) < _MIN_ANSWER_CHARS:
+        logger.warning("Answer too short (%d chars) — rejecting without LLM call", len(answer_eval))
         return {
             "quality_score": 0.0,
             "judge_model": "rule-based",
-            "judge_reasoning": f"Answer too short ({len(answer.strip())} chars < {_MIN_ANSWER_CHARS} minimum).",
+            "judge_reasoning": f"Answer too short ({len(answer_eval)} chars < {_MIN_ANSWER_CHARS} minimum).",
         }
 
     # Fast-path for adversarial samples: check refusal compliance
     if is_adversarial:
-        if _REFUSAL_PHRASE in answer:
+        if _REFUSAL_PHRASE in answer_eval:
             logger.debug("Adversarial sample correctly refused → score=1.0")
             return {
                 "quality_score": 1.0,

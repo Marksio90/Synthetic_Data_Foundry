@@ -36,7 +36,8 @@ class Settings(BaseSettings):
     vllm_model: str = Field("llama3")
     vllm_api_key: str = Field("not-needed", description="'not-needed' for local vLLM; set to openai_api_key when routing through OpenAI")
     vllm_temperature: float = Field(0.7)
-    vllm_max_tokens: int = Field(1024)
+    vllm_max_tokens: int = Field(1536,
+        description="Max tokens for expert generation (increased to accommodate CoT reasoning block)")
 
     # ------------------------------------------------------------------
     # Groq (Llama 3.3 70B — primary question/answer generator)
@@ -76,7 +77,21 @@ class Settings(BaseSettings):
     # Output
     # ------------------------------------------------------------------
     output_file: str = Field("/app/output/dataset_esg_v1.jsonl")
+    dpo_output_file: str = Field("/app/output/dataset_esg_v1_dpo.jsonl",
+        description="DPO preference pairs (TRL DPOTrainer format)")
     client_id: str = Field("dev_client")
+
+    # ------------------------------------------------------------------
+    # Near-duplicate detection (MinHash)
+    # ------------------------------------------------------------------
+    dedup_threshold: float = Field(0.85, ge=0.0, le=1.0,
+        description="Jaccard similarity threshold for duplicate question detection")
+
+    # ------------------------------------------------------------------
+    # Cross-document synthesis pass
+    # ------------------------------------------------------------------
+    cross_doc_samples: int = Field(50, ge=0,
+        description="Number of cross-document Q&A pairs to generate after main pass (0 = skip)")
 
     # ------------------------------------------------------------------
     # Tenacity (Self-Check 2.0 — API rate-limit backoff)
@@ -90,7 +105,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     log_level: str = Field("INFO")
 
-    @field_validator("adversarial_ratio", "quality_threshold", "max_refusal_ratio", mode="before")
+    @field_validator("adversarial_ratio", "quality_threshold", "max_refusal_ratio", "dedup_threshold", mode="before")
     @classmethod
     def parse_float(cls, v: object) -> float:
         return float(v)
