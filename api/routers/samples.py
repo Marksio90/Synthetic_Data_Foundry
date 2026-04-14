@@ -108,6 +108,75 @@ def dataset_stats(session: Session = Depends(get_session)) -> dict:
     }
 
 
+@router.post("/auto-review")
+def auto_review(
+    batch_id: str | None = None,
+    approve_threshold: float = 0.88,
+    review_threshold: float = 0.70,
+    session: Session = Depends(get_session),
+) -> dict:
+    """
+    Run AutoReviewer on all unreviewed samples.
+    Auto-approves score >= approve_threshold, auto-rejects < review_threshold.
+    Grey zone (between thresholds) is left for optional human review.
+    """
+    from agents.auto_reviewer import run_auto_review
+    summary = run_auto_review(
+        session,
+        batch_id=batch_id,
+        approve_threshold=approve_threshold,
+        review_threshold=review_threshold,
+    )
+    return {
+        "total": summary.total,
+        "approved": summary.approved,
+        "queued": summary.queued,
+        "rejected": summary.rejected,
+        "approval_rate": round(summary.approval_rate, 3),
+    }
+
+
+@router.patch("/{sample_id}/review")
+def human_review(
+    sample_id: str,
+    action: str,  # "approve" | "reject" | "edit"
+    edited_answer: str | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    """
+    Human review decision for a single sample.
+    action: 'approve' → human_reviewed=True, human_flag='human_approved'
+            'reject'  → human_reviewed=False, human_flag='human_rejected'
+    """
+    import uuid as _uuid
+    from sqlalchemy import update as sa_update
+
+    try:
+        sid = _uuid.UUID(sample_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID")
+
+    sample = session.scalar(select(GeneratedSample).where(GeneratedSample.id == sid))
+    if sample is None:
+        raise HTTPException(status_code=404, detail="Sample not found")
+
+    if action == "approve":
+        sample.human_reviewed = True
+        sample.human_flag = "human_approved"
+    elif action == "reject":
+        sample.human_reviewed = False
+        sample.human_flag = "human_rejected"
+    elif action == "edit" and edited_answer:
+        sample.answer = edited_answer
+        sample.human_reviewed = True
+        sample.human_flag = "human_edited"
+    else:
+        raise HTTPException(status_code=400, detail="action must be approve|reject|edit")
+
+    session.commit()
+    return {"id": sample_id, "action": action, "human_flag": sample.human_flag}
+
+
 @router.get("/{sample_id}")
 def get_sample(sample_id: str, session: Session = Depends(get_session)) -> dict:
     """Return full detail for one sample (including full conversation JSON)."""

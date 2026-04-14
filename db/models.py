@@ -111,6 +111,10 @@ class GeneratedSample(Base):
     rejected_answer: Optional[str] = Column(Text)      # first-attempt answer for DPO pairing
     # Full multi-turn conversation (mirrors JSONL record for audit / analysis)
     conversation_json: Optional[list] = Column(JSONB)
+    # Human review (Sprint 2 — Auto-Reviewer)
+    human_reviewed: Optional[bool] = Column(Boolean, nullable=True, default=None)
+    human_flag: Optional[str] = Column(Text, nullable=True)  # auto_approved|auto_rejected|human_approved|human_rejected
+
     # Watermark (Self-Check B2B)
     watermark_hash: Optional[str] = Column(String(64))
     batch_id: Optional[str] = Column(Text)
