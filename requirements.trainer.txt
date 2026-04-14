@@ -1,0 +1,21 @@
+# =============================================================================
+# requirements.trainer.txt — GPU training container dependencies
+# Installed AFTER torch (order matters for CUDA linking)
+# =============================================================================
+
+# HuggingFace stack
+transformers>=4.44.0
+datasets>=2.20.0
+accelerate>=0.33.0
+peft>=0.12.0
+
+# Fine-tuning
+trl>=0.10.0
+
+# GGUF / export
+sentencepiece
+protobuf
+gguf
+
+# Misc
+scipy

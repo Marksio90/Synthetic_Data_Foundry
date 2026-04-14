@@ -5,6 +5,7 @@ Services:
   /api/documents/*  — PDF upload, listing, deletion
   /api/pipeline/*   — AutoPilot run, status, log, WebSocket
   /api/samples/*    — Q&A dataset browsing
+  /api/training/*   — Hardware inspect, quality gate, SFT/DPO training, export
   /health           — liveness probe
 
 Start locally:
@@ -16,7 +17,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import documents, pipeline, samples
+from api.routers import documents, pipeline, samples, training
 
 app = FastAPI(
     title="Foundry Studio API",
@@ -35,6 +36,7 @@ app.add_middleware(
 app.include_router(documents.router, prefix="/api/documents", tags=["documents"])
 app.include_router(pipeline.router,  prefix="/api/pipeline",  tags=["pipeline"])
 app.include_router(samples.router,   prefix="/api/samples",   tags=["samples"])
+app.include_router(training.router,  prefix="/api/training",  tags=["training"])
 
 
 @app.get("/health")
