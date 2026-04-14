@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -400,6 +401,12 @@ def main() -> None:
                 total_ready += 1
             else:
                 total_unresolvable += 1
+
+            # Throttle — prevents Groq/OpenAI 429 rate-limit storms.
+            # Groq free tier: 12k TPM. Each chunk uses ~2k tokens × 3 perspectives = 6k tokens.
+            # At 2s delay the effective throughput is ~30 chunks/min which stays under the limit.
+            if settings.chunk_delay_seconds > 0:
+                time.sleep(settings.chunk_delay_seconds)
 
             if total_processed % 10 == 0:
                 logger.info(

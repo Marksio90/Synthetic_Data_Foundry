@@ -101,6 +101,17 @@ class Settings(BaseSettings):
     tenacity_max_wait: float = Field(64.0)       # seconds
 
     # ------------------------------------------------------------------
+    # Rate-limit throttling
+    # ------------------------------------------------------------------
+    chunk_delay_seconds: float = Field(
+        2.0,
+        description=(
+            "Seconds to sleep between chunks to avoid Groq/OpenAI rate limits. "
+            "Groq free tier: 12k TPM — increase to 5+ if you see many 429s."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Auto-calibration
     # ------------------------------------------------------------------
     calibration_samples: int = Field(

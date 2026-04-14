@@ -21,12 +21,15 @@ import logging
 
 import openai
 from sqlalchemy.orm import Session
+import re as _re
+
 from tenacity import (
     before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
     wait_exponential,
+    wait_fixed,
 )
 
 from config.settings import settings
@@ -101,15 +104,34 @@ def _is_retryable_vllm(exc: BaseException) -> bool:
     return False
 
 
+def _parse_groq_retry_after(exc: BaseException) -> float:
+    """Extract 'try again in X.XXs' from Groq 429 error message, with 2s buffer."""
+    m = _re.search(r"try again in (\d+(?:\.\d+)?)s", str(exc), _re.IGNORECASE)
+    if m:
+        return float(m.group(1)) + 2.0
+    return settings.tenacity_initial_wait
+
+
+def _groq_aware_wait(retry_state) -> float:  # type: ignore[return]
+    """
+    Respects Groq's 'retry-after' hint from 429 body.
+    Falls back to exponential backoff for other errors.
+    """
+    exc = retry_state.outcome.exception()
+    if exc and isinstance(exc, openai.RateLimitError):
+        return _parse_groq_retry_after(exc)
+    # Exponential for 5xx
+    return min(
+        settings.tenacity_initial_wait * (2 ** max(0, retry_state.attempt_number - 1)),
+        settings.tenacity_max_wait,
+    )
+
+
 def _retry_vllm(func):
     return retry(
         reraise=True,
         retry=retry_if_exception(_is_retryable_vllm),
-        wait=wait_exponential(
-            multiplier=1,
-            min=settings.tenacity_initial_wait,
-            max=settings.tenacity_max_wait,
-        ),
+        wait=_groq_aware_wait,
         stop=stop_after_attempt(settings.tenacity_max_attempts),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )(func)
@@ -119,9 +141,11 @@ def _retry_vllm(func):
 def _call_vllm(system: str, user: str) -> str:
     """Prefer Groq (Llama 3.3) when GROQ_API_KEY is set, fall back to VLLM/OpenAI."""
     if settings.groq_api_key:
+        # max_retries=0 — wyłącz wbudowany retry klienta; Tenacity zarządza retry
         client = openai.OpenAI(
             api_key=settings.groq_api_key,
             base_url=settings.groq_base_url,
+            max_retries=0,
         )
         model = settings.groq_model
     else:
@@ -129,6 +153,7 @@ def _call_vllm(system: str, user: str) -> str:
         client = openai.OpenAI(
             api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
             base_url=None if is_openai else settings.vllm_base_url,
+            max_retries=0,
         )
         model = settings.vllm_model
     response = client.chat.completions.create(
@@ -147,13 +172,18 @@ def _call_vllm(system: str, user: str) -> str:
 def _call_vllm_messages(messages: list[dict]) -> str:
     """Same Groq/vLLM routing but accepts full messages list (for multi-turn context)."""
     if settings.groq_api_key:
-        client = openai.OpenAI(api_key=settings.groq_api_key, base_url=settings.groq_base_url)
+        client = openai.OpenAI(
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
+            max_retries=0,
+        )
         model = settings.groq_model
     else:
         is_openai = "openai.com" in settings.vllm_base_url
         client = openai.OpenAI(
             api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
             base_url=None if is_openai else settings.vllm_base_url,
+            max_retries=0,
         )
         model = settings.vllm_model
     response = client.chat.completions.create(
