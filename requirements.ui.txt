@@ -1,0 +1,7 @@
+# =============================================================================
+# requirements.ui.txt — deps for the Streamlit UI container
+# Minimal: only UI framework + HTTP client (no pipeline deps needed)
+# =============================================================================
+
+streamlit>=1.36.0,<2.0
+requests>=2.32.0,<3.0

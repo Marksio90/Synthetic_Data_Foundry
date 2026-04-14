@@ -116,11 +116,14 @@ def run_migrations(engine) -> None:
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS question_type TEXT",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS difficulty TEXT",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS rejected_answer TEXT",
+            # Sprint 2 — Auto-Reviewer
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS human_reviewed BOOLEAN",
+            "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS human_flag TEXT",
         ]:
             conn.execute(text(col_ddl + ";"))
 
         conn.commit()
-    logger.info("DB migrations applied (finalize_chunk guard + 5 schema patches)")
+    logger.info("DB migrations applied (finalize_chunk guard + 7 schema patches)")
 
 
 # ---------------------------------------------------------------------------

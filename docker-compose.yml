@@ -193,6 +193,179 @@ services:
       - foundry_net
     logging: *default-logging
 
+  # ---------------------------------------------------------------------------
+  # Foundry Studio — FastAPI backend (document upload, pipeline orchestration,
+  # WebSocket progress streaming, dataset browsing)
+  # ---------------------------------------------------------------------------
+  foundry-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: foundry_api
+    restart: unless-stopped
+    environment:
+      # Database (same credentials as app service)
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      # LLM credentials forwarded (needed by DocAnalyzer + Calibrator)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?err}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      # Directories
+      DATA_DIR: /app/data
+      OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
+      # Defaults forwarded so subprocess main.py picks them up
+      POSTGRES_USER: ${POSTGRES_USER:-esg_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
+      VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      VLLM_API_KEY: ${OPENAI_API_KEY}
+      LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
+      CLIENT_ID: ${CLIENT_ID:-dev_client}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "2.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Chatbot stack — Ollama + Open WebUI (optional profile)
+  #
+  # Start with:
+  #   docker compose --profile chatbot up -d
+  #
+  # Then open: http://localhost:3000
+  # ---------------------------------------------------------------------------
+  ollama:
+    profiles: [chatbot]
+    image: ollama/ollama:latest
+    container_name: foundry_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    mem_limit: 8g
+    memswap_limit: 8g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  open-webui:
+    profiles: [chatbot]
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: foundry_webui
+    restart: unless-stopped
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_AUTH: "False"
+    ports:
+      - "3000:8080"
+    depends_on:
+      - ollama
+    mem_limit: 512m
+    memswap_limit: 512m
+    volumes:
+      - webui_data:/app/backend/data
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Foundry Trainer — GPU container for SFT + DPO fine-tuning
+  #
+  # Start with:
+  #   docker compose --profile train run --rm foundry-trainer \
+  #     python -m training.train_sft \
+  #       --jsonl /app/output/dataset_esg_v1.jsonl \
+  #       --model meta-llama/Llama-3.2-3B-Instruct \
+  #       --output-dir /app/output/models
+  #
+  # Or trigger through the API /api/training/run endpoint.
+  # ---------------------------------------------------------------------------
+  foundry-trainer:
+    profiles: [train]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.trainer
+    container_name: foundry_trainer
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?err}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      # Disable wandb by default
+      WANDB_DISABLED: "true"
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data:ro
+      - hf_cache:/root/.cache/huggingface
+    # No mem_limit — trainer needs all available RAM/VRAM
+    ipc: host
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Foundry Studio — Streamlit UI (1-button AutoPilot frontend)
+  # ---------------------------------------------------------------------------
+  foundry-ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    container_name: foundry_ui
+    restart: unless-stopped
+    environment:
+      API_URL: http://foundry-api:8080
+    ports:
+      - "8501:8501"
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "1.0"
+    depends_on:
+      - foundry-api
+    networks:
+      - foundry_net
+    logging: *default-logging
+
 # =============================================================================
 # Named volumes
 # =============================================================================
@@ -201,6 +374,10 @@ volumes:
     driver: local
   hf_cache:
     driver: local             # persists downloaded model weights between restarts
+  ollama_models:
+    driver: local             # persists Ollama model files (GGUF) between restarts
+  webui_data:
+    driver: local             # persists Open WebUI data (chats, settings)
 
 # =============================================================================
 # Network — isolated bridge; no external exposure except via host port mapping
