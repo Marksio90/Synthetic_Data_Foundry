@@ -208,6 +208,13 @@ services:
     volumes:
       - ./output:/app/output
       - ./data:/app/data
+      - ./api:/app/api:ro
+      - ./agents:/app/agents:ro
+      - ./pipeline:/app/pipeline:ro
+      - ./training:/app/training:ro
+      - ./utils:/app/utils:ro
+      - ./config:/app/config:ro
+      - ./db:/app/db:ro
     mem_limit: 2g
     memswap_limit: 2g
     cpus: "2.0"
@@ -235,6 +242,8 @@ services:
       OLLAMA_URL: http://ollama:11434
     ports:
       - "8501:8501"
+    volumes:
+      - ./ui:/app/ui:ro
     mem_limit: 512m
     memswap_limit: 512m
     cpus: "1.0"
