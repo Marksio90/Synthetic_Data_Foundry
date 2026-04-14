@@ -101,6 +101,37 @@ class Settings(BaseSettings):
     tenacity_max_wait: float = Field(64.0)       # seconds
 
     # ------------------------------------------------------------------
+    # Auto-calibration
+    # ------------------------------------------------------------------
+    calibration_samples: int = Field(
+        50, ge=10, le=500,
+        description="Number of chunks to analyse for auto-calibrating quality_threshold",
+    )
+    calibration_target_accept_rate: float = Field(
+        0.85, ge=0.5, le=1.0,
+        description="Fraction of samples that should pass quality gate (calibrator targets this)",
+    )
+
+    # ------------------------------------------------------------------
+    # Translation (non-PL source documents)
+    # ------------------------------------------------------------------
+    source_language: str = Field(
+        "auto",
+        description="Source document language ('auto'=detect, 'pl', 'en', 'de', 'fr')",
+    )
+    deepl_api_key: str = Field(
+        "",
+        description="DeepL API key for high-quality translation (optional; falls back to Groq)",
+    )
+
+    # ------------------------------------------------------------------
+    # API / UI service
+    # ------------------------------------------------------------------
+    api_host: str = Field("0.0.0.0")
+    api_port: int = Field(8080)
+    data_dir: str = Field("/app/data", description="Directory where input PDFs are stored")
+
+    # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     log_level: str = Field("INFO")

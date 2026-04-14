@@ -194,6 +194,76 @@ services:
       - foundry_net
     logging: *default-logging
 
+  # ---------------------------------------------------------------------------
+  # Foundry Studio — FastAPI backend (document upload, pipeline orchestration,
+  # WebSocket progress streaming, dataset browsing)
+  # ---------------------------------------------------------------------------
+  foundry-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: foundry_api
+    restart: unless-stopped
+    environment:
+      # Database (same credentials as app service)
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+      # LLM credentials forwarded (needed by DocAnalyzer + Calibrator)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?err}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      # Directories
+      DATA_DIR: /app/data
+      OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
+      # Defaults forwarded so subprocess main.py picks them up
+      POSTGRES_USER: ${POSTGRES_USER:-esg_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
+      VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      VLLM_API_KEY: ${OPENAI_API_KEY}
+      LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
+      CLIENT_ID: ${CLIENT_ID:-dev_client}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "2.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Foundry Studio — Streamlit UI (1-button AutoPilot frontend)
+  # ---------------------------------------------------------------------------
+  foundry-ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    container_name: foundry_ui
+    restart: unless-stopped
+    environment:
+      API_URL: http://foundry-api:8080
+    ports:
+      - "8501:8501"
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "1.0"
+    depends_on:
+      - foundry-api
+    networks:
+      - foundry_net
+    logging: *default-logging
+
 # =============================================================================
 # Named volumes
 # =============================================================================

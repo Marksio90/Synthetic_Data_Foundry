@@ -1,0 +1,9 @@
+# =============================================================================
+# requirements.api.txt — additional deps for the FastAPI service
+# Installed on top of requirements.txt in docker/Dockerfile.api
+# =============================================================================
+
+fastapi>=0.111.0,<1.0
+uvicorn[standard]>=0.30.0,<1.0
+python-multipart>=0.0.9        # multipart file upload support
+websockets>=12.0,<14.0         # WebSocket server support (used by uvicorn)

@@ -1,0 +1,29 @@
+# =============================================================================
+# docker/Dockerfile.ui — Foundry Studio Streamlit UI
+#
+# Minimal image — only needs Streamlit + requests.
+# Communicates with foundry-api via HTTP (no direct DB access).
+# =============================================================================
+
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim
+
+WORKDIR /app
+
+COPY requirements.ui.txt ./
+RUN pip install --no-cache-dir -r requirements.ui.txt
+
+# Copy only the UI directory
+COPY ui/ ./ui/
+
+EXPOSE 8501
+
+# Disable Streamlit telemetry and auto-open browser
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_SERVER_ENABLE_CORS=false
+
+CMD ["streamlit", "run", "ui/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]
