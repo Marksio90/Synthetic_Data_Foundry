@@ -346,15 +346,37 @@ with tab_export:
 
             cfg = status_data.get("config") or {}
             if cfg.get("zip_path"):
-                st.success(f"✅ Paczka gotowa: `{cfg['zip_path']}`")
+                zip_name = cfg["zip_path"].split("/")[-1]
+                st.success(f"✅ Paczka gotowa: `{zip_name}`")
                 st.info(
-                    "Skopiuj plik ZIP do klienta. Zawartość:\n"
+                    "Zawartość paczki:\n"
                     "- `docker-compose.yml` — uruchomienie jedną komendą\n"
                     "- `Modelfile` — konfiguracja Ollama\n"
                     "- `*.gguf` — model w formacie GGUF\n"
                     "- `datacard.json` — statystyki datasetu\n"
                     "- `README.md` — instrukcja dla klienta"
                 )
+
+                # Download button via streaming API endpoint
+                import requests as _req
+                try:
+                    dl_resp = _req.get(
+                        f"{API_URL}/api/training/export/download/{export_run_id}",
+                        timeout=30,
+                        stream=True,
+                    )
+                    if dl_resp.ok:
+                        st.download_button(
+                            label=f"⬇️ Pobierz {zip_name}",
+                            data=dl_resp.content,
+                            file_name=zip_name,
+                            mime="application/zip",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.warning(f"Nie można pobrać pliku (kod {dl_resp.status_code}).")
+                except Exception as e:
+                    st.warning(f"Pobieranie niedostępne: {e}")
 
             # Log
             log_data = _get(f"/api/training/log/{export_run_id}", offset=0, limit=100)

@@ -214,6 +214,8 @@ services:
       GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
       OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
       DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      # Ollama (chatbot profile — override for Docker networking)
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       # Directories
       DATA_DIR: /app/data
       OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
