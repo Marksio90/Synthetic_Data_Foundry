@@ -1,11 +1,62 @@
 # =============================================================================
-# ESG Data Foundry — docker-compose.yml
-# Architecture: PostgreSQL (pgvector) + vLLM (Llama 3) + Python Pipeline
+# Foundry Studio — docker-compose.yml
 #
-# Safety patches applied:
-#   [Self-Check 1.0] Hard mem_limit on every service, vLLM capped at 80% VRAM
-#   [Self-Check 2.0] OpenAI rate-limit handled in app layer (Tenacity backoff)
-#   [Self-Check 3.0] is_superseded filter enforced at DB schema level
+# WSZYSTKIE KOMENDY:
+#
+# --- SETUP ---
+#   cp .env.example .env                    # skopiuj i uzupelnij klucze API
+#   docker compose build                    # zbuduj wszystkie obrazy
+#
+# --- CORE STACK (API + UI + baza) ---
+#   docker compose up -d                    # uruchom
+#   docker compose down                     # zatrzymaj
+#   docker compose logs -f                  # logi wszystkich serwisow
+#   docker compose logs -f foundry-api      # logi tylko API
+#   docker compose ps                       # status kontenerow
+#
+# --- PIPELINE (generowanie Q&A) ---
+#   docker compose run --rm app             # uruchom z domyslnymi PDFami z .env
+#
+#   Lub z wlasnym zestawem plikow:
+#   docker compose run --rm app python main.py \
+#     --pdf /app/data/plik1.pdf \
+#     --pdf /app/data/plik2.pdf \
+#     --batch-id batch-001 \
+#     --chunk-limit 50
+#
+# --- TRENING (wymaga GPU) ---
+#   docker compose --profile train run --rm foundry-trainer \
+#     python -m training.train_sft \
+#       --jsonl   /app/output/dataset_esg_v1.jsonl \
+#       --model   meta-llama/Llama-3.2-3B-Instruct \
+#       --output-dir /app/output/models
+#
+#   docker compose --profile train run --rm foundry-trainer \
+#     python -m training.train_dpo \
+#       --dpo-jsonl  /app/output/dataset_esg_v1_dpo.jsonl \
+#       --sft-model  /app/output/models/sft \
+#       --output-dir /app/output/models
+#
+# --- CHATBOT ---
+#   docker compose --profile chatbot up -d               # uruchom Ollama + WebUI
+#   docker compose --profile chatbot down                # zatrzymaj
+#   docker exec foundry_ollama ollama pull llama3.2      # pobierz gotowy model
+#   docker exec foundry_ollama ollama create NAZWA -f /Modelfile  # zaladuj wlasny model
+#
+# --- LOCAL GPU (vLLM zamiast OpenAI) ---
+#   docker compose --profile gpu up -d vllm
+#
+# --- PELNE ZATRZYMANIE + CZYSZCZENIE ---
+#   docker compose --profile chatbot --profile train --profile gpu down
+#   docker compose --profile chatbot --profile train --profile gpu down -v  # kasuje wolumeny!
+#
+# PORTY:
+#   8501  Streamlit UI       http://localhost:8501
+#   8080  FastAPI + Swagger  http://localhost:8080/docs
+#   3000  Open WebUI         http://localhost:3000   (--profile chatbot)
+#  11434  Ollama API         http://localhost:11434  (--profile chatbot)
+#   5432  PostgreSQL         (tylko wewnatrz sieci Docker)
+#
 # =============================================================================
 
 
@@ -15,10 +66,30 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "5"
 
+# Wspolne zmienne srodowiskowe dla kontenerow z baza i LLM
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+  ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
+  OPENAI_API_KEY: ${OPENAI_API_KEY:?Ustaw OPENAI_API_KEY w pliku .env}
+  OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+  OPENAI_FALLBACK_MODEL: ${OPENAI_FALLBACK_MODEL:-gpt-4o}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+  GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+  VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
+  VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+  VLLM_API_KEY: ${OPENAI_API_KEY}
+  LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
+  OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
+  DPO_OUTPUT_FILE: /app/output/dataset_esg_v1_dpo.jsonl
+  CLIENT_ID: ${CLIENT_ID:-dev_client}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
 services:
 
   # ---------------------------------------------------------------------------
-  # PostgreSQL 16 + pgvector + pg_trgm (BM25-like full-text search)
+  # PostgreSQL 16 + pgvector
+  # Uruchomienie: docker compose up -d postgres
   # ---------------------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
@@ -27,8 +98,7 @@ services:
     environment:
       POSTGRES_DB: esg_foundry
       POSTGRES_USER: ${POSTGRES_USER:-esg_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?err — set POSTGRES_PASSWORD in .env}
-      # Tune shared_buffers to ~25% of mem_limit (512 MB)
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Ustaw POSTGRES_PASSWORD w pliku .env}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
     command: >
       postgres
@@ -37,14 +107,11 @@ services:
         -c maintenance_work_mem=256MB
         -c work_mem=64MB
         -c max_connections=50
-        -c wal_level=replica
-        -c synchronous_commit=on
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro
-    # Hard RAM cap — cannot be overridden by the PG process
     mem_limit: 2g
-    memswap_limit: 2g        # disable swap extension
+    memswap_limit: 2g
     cpus: "2.0"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-esg_user} -d esg_foundry"]
@@ -57,20 +124,136 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # vLLM — OpenAI-compatible inference server (Llama 3.1 8B)
+  # Pipeline — generowanie Q&A z dokumentow PDF
   #
-  # REQUIRES GPU with CUDA capability >= 7.0 (Volta or newer).
-  # Start only when GPU is available:
-  #   docker compose --profile gpu up -d vllm
+  # Uruchomienie z domyslnymi PDFami (zdefiniowanymi w command ponizej):
+  #   docker compose run --rm app
   #
-  # Key safety flags:
-  #   --gpu-memory-utilization 0.80   → uses 80% VRAM, leaves 20% for the OS
-  #   --max-model-len 8192            → caps KV-cache to avoid GPU OOM
-  #   --enforce-eager                 → disables CUDA graph (saves VRAM)
-  #   mem_limit: 10g                  → host-RAM guard (model weights + buffers)
+  # Uruchomienie z wlasnym zestawem plikow:
+  #   docker compose run --rm app python main.py \
+  #     --pdf /app/data/mojdokument.pdf \
+  #     --batch-id moj-batch \
+  #     --chunk-limit 100
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: esg_app
+    restart: "no"
+    environment:
+      <<: *app-env
+      ADVERSARIAL_RATIO: ${ADVERSARIAL_RATIO:-0.10}
+      QUALITY_THRESHOLD: ${QUALITY_THRESHOLD:-0.90}
+      MAX_RETRIES_PER_CHUNK: ${MAX_RETRIES_PER_CHUNK:-3}
+      MAX_TURNS: ${MAX_TURNS:-3}
+      MAX_REFUSAL_RATIO: ${MAX_REFUSAL_RATIO:-0.10}
+      WATERMARK_INTERVAL: ${WATERMARK_INTERVAL:-50}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+      DEDUP_THRESHOLD: ${DEDUP_THRESHOLD:-0.85}
+      CROSS_DOC_SAMPLES: ${CROSS_DOC_SAMPLES:-50}
+      VLLM_MAX_TOKENS: ${VLLM_MAX_TOKENS:-1536}
+      BATCH_ID: ${BATCH_ID:-batch-001}
+      CHUNK_LIMIT: ${CHUNK_LIMIT:-0}
+    command:
+      - python
+      - main.py
+      - --pdf
+      - /app/data/csddd.pdf
+      - --pdf
+      - /app/data/csrd.pdf
+      - --pdf
+      - /app/data/sfdr.pdf
+      - --pdf
+      - /app/data/taksonomia.pdf
+      - --batch-id
+      - ${BATCH_ID:-batch-001}
+      - --chunk-limit
+      - "${CHUNK_LIMIT:-0}"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data:ro
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: "4.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # FastAPI backend — REST API, WebSocket, pipeline orchestration
+  #
+  # Uruchomienie: docker compose up -d foundry-api
+  # Swagger UI:   http://localhost:8080/docs
+  # Health check: http://localhost:8080/health
+  # ---------------------------------------------------------------------------
+  foundry-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: foundry_api
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      DATA_DIR: /app/data
+      POSTGRES_USER: ${POSTGRES_USER:-esg_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "2.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Streamlit UI — interfejs uzytkownika
+  #
+  # Uruchomienie: docker compose up -d foundry-ui
+  # Dostep:       http://localhost:8501
+  # ---------------------------------------------------------------------------
+  foundry-ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    container_name: foundry_ui
+    restart: unless-stopped
+    environment:
+      API_URL: http://foundry-api:8080
+      OLLAMA_URL: http://ollama:11434
+    ports:
+      - "8501:8501"
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "1.0"
+    depends_on:
+      - foundry-api
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # vLLM — lokalny serwer inference (opcjonalny, tylko GPU)
+  #
+  # Uruchomienie: docker compose --profile gpu up -d vllm
+  # Po uruchomieniu zmien w .env:
+  #   VLLM_BASE_URL=http://vllm:8000/v1
+  #   VLLM_API_KEY=not-needed
   # ---------------------------------------------------------------------------
   vllm:
-    profiles: [gpu]           # ← only started with: docker compose --profile gpu up
+    profiles: [gpu]
     image: vllm/vllm-openai:latest
     container_name: esg_vllm
     restart: unless-stopped
@@ -79,16 +262,12 @@ services:
       --dtype half
       --gpu-memory-utilization 0.80
       --max-model-len 8192
-      --tensor-parallel-size 1
-      --max-num-batched-tokens 16384
-      --max-num-seqs 64
       --enforce-eager
       --host 0.0.0.0
       --port 8000
       --served-model-name llama3
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
     volumes:
       - hf_cache:/root/.cache/huggingface
     mem_limit: 10g
@@ -96,9 +275,7 @@ services:
     shm_size: 2g
     ipc: host
     ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+      memlock: { soft: -1, hard: -1 }
     deploy:
       resources:
         reservations:
@@ -117,139 +294,22 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # ESG Foundry Pipeline — Python 3.12 app (LangGraph swarm)
-  # ---------------------------------------------------------------------------
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        PYTHON_VERSION: "3.12"
-    container_name: esg_app
-    restart: "no"             # pipeline runs once; supervisor restarts if needed
-    environment:
-      # Database
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
-      ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
-      # Question-generation LLM — routed through OpenAI (no local GPU required)
-      # To use local vLLM instead: docker compose --profile gpu up vllm
-      # and change these two lines to: http://vllm:8000/v1 / llama3
-      VLLM_BASE_URL: https://api.openai.com/v1
-      VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
-      VLLM_API_KEY: ${OPENAI_API_KEY}
-      # Groq (Llama 3.3 70B — primary question/answer generator when key is set)
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
-      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
-      # OpenAI (Judge agent)
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?err — set OPENAI_API_KEY in .env}
-      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
-      OPENAI_FALLBACK_MODEL: ${OPENAI_FALLBACK_MODEL:-o1-mini}
-      # LlamaParse (Ingestor agent)
-      LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
-      # Pipeline tuning
-      ADVERSARIAL_RATIO: ${ADVERSARIAL_RATIO:-0.10}
-      QUALITY_THRESHOLD: ${QUALITY_THRESHOLD:-0.90}
-      MAX_RETRIES_PER_CHUNK: ${MAX_RETRIES_PER_CHUNK:-3}
-      MAX_TURNS: ${MAX_TURNS:-3}
-      MAX_REFUSAL_RATIO: ${MAX_REFUSAL_RATIO:-0.10}
-      WATERMARK_INTERVAL: ${WATERMARK_INTERVAL:-50}
-      BATCH_SIZE: ${BATCH_SIZE:-10}
-      # PRO features
-      DEDUP_THRESHOLD: ${DEDUP_THRESHOLD:-0.85}
-      CROSS_DOC_SAMPLES: ${CROSS_DOC_SAMPLES:-50}
-      DPO_OUTPUT_FILE: /app/output/dataset_esg_v1_dpo.jsonl
-      VLLM_MAX_TOKENS: ${VLLM_MAX_TOKENS:-1536}
-      # Output
-      OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
-      CLIENT_ID: ${CLIENT_ID:-dev_client}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Pipeline run parameters
-      BATCH_ID: ${BATCH_ID:-batch-default}
-      CHUNK_LIMIT: ${CHUNK_LIMIT:-0}
-    command:
-      - --pdf
-      - /app/data/csddd.pdf
-      - --pdf
-      - /app/data/csrd.pdf
-      - --pdf
-      - /app/data/sfdr.pdf
-      - --pdf
-      - /app/data/taksonomia.pdf
-      - --batch-id
-      - ${BATCH_ID:-batch-default}
-      - --chunk-limit
-      - "${CHUNK_LIMIT:-0}"
-    volumes:
-      - ./output:/app/output
-      - ./data:/app/data:ro  # source PDFs
-    mem_limit: 4g
-    memswap_limit: 4g
-    cpus: "4.0"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - foundry_net
-    logging: *default-logging
-
-  # ---------------------------------------------------------------------------
-  # Foundry Studio — FastAPI backend (document upload, pipeline orchestration,
-  # WebSocket progress streaming, dataset browsing)
-  # ---------------------------------------------------------------------------
-  foundry-api:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api
-    container_name: foundry_api
-    restart: unless-stopped
-    environment:
-      # Database (same credentials as app service)
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
-      ASYNC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
-      # LLM credentials forwarded (needed by DocAnalyzer + Calibrator)
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?err}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
-      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
-      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
-      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
-      # Ollama (chatbot profile — override for Docker networking)
-      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      # Directories
-      DATA_DIR: /app/data
-      OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
-      # Defaults forwarded so subprocess main.py picks them up
-      POSTGRES_USER: ${POSTGRES_USER:-esg_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
-      VLLM_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
-      VLLM_API_KEY: ${OPENAI_API_KEY}
-      LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
-      CLIENT_ID: ${CLIENT_ID:-dev_client}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./output:/app/output
-      - ./data:/app/data
-    mem_limit: 2g
-    memswap_limit: 2g
-    cpus: "2.0"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - foundry_net
-    logging: *default-logging
-
-  # ---------------------------------------------------------------------------
-  # Chatbot stack — Ollama + Open WebUI (optional profile)
+  # Ollama — serwer modeli GGUF (profil chatbot)
   #
-  # Start with:
-  #   docker compose --profile chatbot up -d
+  # Uruchomienie: docker compose --profile chatbot up -d
+  # Zatrzymanie:  docker compose --profile chatbot down
   #
-  # Then open: http://localhost:3000
+  # Zaladowanie gotowego modelu z internetu:
+  #   docker exec foundry_ollama ollama pull llama3.2
+  #   docker exec foundry_ollama ollama pull phi4-mini
+  #
+  # Zaladowanie wlasnego modelu (po eksporcie):
+  #   docker cp output/model.gguf foundry_ollama:/models/model.gguf
+  #   docker cp output/Modelfile  foundry_ollama:/Modelfile
+  #   docker exec foundry_ollama ollama create NAZWA-MODELU -f /Modelfile
+  #
+  # Lista zaladowanych modeli:
+  #   docker exec foundry_ollama ollama list
   # ---------------------------------------------------------------------------
   ollama:
     profiles: [chatbot]
@@ -273,6 +333,11 @@ services:
       - foundry_net
     logging: *default-logging
 
+  # ---------------------------------------------------------------------------
+  # Open WebUI — interfejs czatu (profil chatbot)
+  #
+  # Dostep: http://localhost:3000
+  # ---------------------------------------------------------------------------
   open-webui:
     profiles: [chatbot]
     image: ghcr.io/open-webui/open-webui:main
@@ -294,16 +359,29 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # Foundry Trainer — GPU container for SFT + DPO fine-tuning
+  # Foundry Trainer — GPU container dla treningu SFT + DPO
   #
-  # Start with:
+  # SFT (fine-tuning):
   #   docker compose --profile train run --rm foundry-trainer \
   #     python -m training.train_sft \
-  #       --jsonl /app/output/dataset_esg_v1.jsonl \
-  #       --model meta-llama/Llama-3.2-3B-Instruct \
+  #       --jsonl      /app/output/dataset_esg_v1.jsonl \
+  #       --model      meta-llama/Llama-3.2-3B-Instruct \
+  #       --output-dir /app/output/models \
+  #       --lora-rank  16 \
+  #       --epochs     3
+  #
+  # DPO (alignment):
+  #   docker compose --profile train run --rm foundry-trainer \
+  #     python -m training.train_dpo \
+  #       --dpo-jsonl  /app/output/dataset_esg_v1_dpo.jsonl \
+  #       --sft-model  /app/output/models/sft \
   #       --output-dir /app/output/models
   #
-  # Or trigger through the API /api/training/run endpoint.
+  # Datacard (statystyki datasetu):
+  #   docker compose --profile train run --rm foundry-trainer \
+  #     python -m training.datacard \
+  #       --jsonl /app/output/dataset_esg_v1.jsonl \
+  #       --dpo   /app/output/dataset_esg_v1_dpo.jsonl
   # ---------------------------------------------------------------------------
   foundry-trainer:
     profiles: [train]
@@ -313,25 +391,18 @@ services:
     container_name: foundry_trainer
     restart: "no"
     environment:
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?err}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
+      <<: *app-env
       HF_TOKEN: ${HF_TOKEN:-}
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-      # Disable wandb by default
       WANDB_DISABLED: "true"
       TRANSFORMERS_CACHE: /root/.cache/huggingface
     volumes:
       - ./output:/app/output
       - ./data:/app/data:ro
       - hf_cache:/root/.cache/huggingface
-    # No mem_limit — trainer needs all available RAM/VRAM
     ipc: host
     ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+      memlock: { soft: -1, hard: -1 }
     deploy:
       resources:
         reservations:
@@ -346,43 +417,21 @@ services:
       - foundry_net
     logging: *default-logging
 
-  # ---------------------------------------------------------------------------
-  # Foundry Studio — Streamlit UI (1-button AutoPilot frontend)
-  # ---------------------------------------------------------------------------
-  foundry-ui:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.ui
-    container_name: foundry_ui
-    restart: unless-stopped
-    environment:
-      API_URL: http://foundry-api:8080
-    ports:
-      - "8501:8501"
-    mem_limit: 512m
-    memswap_limit: 512m
-    cpus: "1.0"
-    depends_on:
-      - foundry-api
-    networks:
-      - foundry_net
-    logging: *default-logging
-
 # =============================================================================
-# Named volumes
+# Volumes
 # =============================================================================
 volumes:
   postgres_data:
     driver: local
   hf_cache:
-    driver: local             # persists downloaded model weights between restarts
+    driver: local
   ollama_models:
-    driver: local             # persists Ollama model files (GGUF) between restarts
+    driver: local
   webui_data:
-    driver: local             # persists Open WebUI data (chats, settings)
+    driver: local
 
 # =============================================================================
-# Network — isolated bridge; no external exposure except via host port mapping
+# Network
 # =============================================================================
 networks:
   foundry_net:
