@@ -15,13 +15,19 @@
 #   docker compose ps                       # status kontenerow
 #
 # --- PIPELINE (generowanie Q&A) ---
-#   docker compose run --rm app             # uruchom z domyslnymi PDFami z .env
+#   # Tryb 1: wszystkie PDFy z folderu data/ (domyslny)
+#   docker compose run --rm app
 #
-#   Lub z wlasnym zestawem plikow:
+#   # Tryb 2: wybrany podfolder (rozne tematy osobno)
 #   docker compose run --rm app \
-#     --pdf /app/data/plik1.pdf \
-#     --pdf /app/data/plik2.pdf \
-#     --batch-id batch-001 \
+#     --data-dir /app/data/esg \
+#     --batch-id esg-v1
+#
+#   # Tryb 3: konkretne pliki
+#   docker compose run --rm app \
+#     --pdf /app/data/csddd.pdf \
+#     --pdf /app/data/csrd.pdf \
+#     --batch-id esg-v1 \
 #     --chunk-limit 50
 #
 # --- TRENING (wymaga GPU) ---
@@ -127,14 +133,15 @@ services:
   # ---------------------------------------------------------------------------
   # Pipeline — generowanie Q&A z dokumentow PDF
   #
-  # Uruchomienie z domyslnymi PDFami (zdefiniowanymi w command ponizej):
+  # Domyslnie: przetwarza WSZYSTKIE *.pdf z folderu data/
   #   docker compose run --rm app
   #
-  # Uruchomienie z wlasnym zestawem plikow:
-  #   docker compose run --rm app \
-  #     --pdf /app/data/mojdokument.pdf \
-  #     --batch-id moj-batch \
-  #     --chunk-limit 100
+  # Wybrany podfolder (rozne tematy osobno — zalecane!):
+  #   docker compose run --rm app --data-dir /app/data/esg --batch-id esg-v1
+  #   docker compose run --rm app --data-dir /app/data/finanse --batch-id finanse-v1
+  #
+  # Konkretne pliki:
+  #   docker compose run --rm app --pdf /app/data/csrd.pdf --batch-id csrd-only
   # ---------------------------------------------------------------------------
   app:
     profiles: [pipeline]
@@ -158,14 +165,8 @@ services:
       BATCH_ID: ${BATCH_ID:-batch-001}
       CHUNK_LIMIT: ${CHUNK_LIMIT:-0}
     command:
-      - --pdf
-      - /app/data/csddd.pdf
-      - --pdf
-      - /app/data/csrd.pdf
-      - --pdf
-      - /app/data/sfdr.pdf
-      - --pdf
-      - /app/data/taksonomia.pdf
+      - --data-dir
+      - /app/data
       - --batch-id
       - ${BATCH_ID:-batch-001}
       - --chunk-limit

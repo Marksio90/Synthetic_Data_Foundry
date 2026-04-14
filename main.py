@@ -137,8 +137,15 @@ def parse_args() -> argparse.Namespace:
         dest="pdfs",
         action="append",
         metavar="PATH",
-        required=True,
+        default=[],
         help="Path to a directive PDF (can be specified multiple times)",
+    )
+    p.add_argument(
+        "--data-dir",
+        dest="data_dir",
+        metavar="DIR",
+        default=None,
+        help="Process all *.pdf files in this directory (recursive)",
     )
     p.add_argument(
         "--batch-id",
@@ -151,7 +158,22 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Process at most N chunks (0 = unlimited; useful for testing)",
     )
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Collect PDFs from --data-dir
+    if args.data_dir:
+        dir_path = Path(args.data_dir)
+        if not dir_path.is_dir():
+            p.error(f"--data-dir does not exist or is not a directory: {args.data_dir}")
+        found = sorted(dir_path.glob("*.pdf"))
+        if not found:
+            p.error(f"No *.pdf files found in: {args.data_dir}")
+        args.pdfs.extend(str(f) for f in found)
+
+    if not args.pdfs:
+        p.error("Provide at least one --pdf PATH or --data-dir DIR")
+
+    return args
 
 
 # ---------------------------------------------------------------------------
