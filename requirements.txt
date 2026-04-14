@@ -42,3 +42,13 @@ numpy>=1.26.0,<3.0
 tqdm>=4.66.4
 rich>=13.7.1
 typer>=0.12.3
+
+# ── API / UI (pełny stack do lokalnego uruchomienia bez Dockera) ───────────
+# Te same paczki są w requirements.api.txt i requirements.ui.txt dla Dockera.
+# Tutaj zebrane razem, żeby `pip install -r requirements.txt` wystarczyło.
+fastapi>=0.111.0,<1.0
+uvicorn[standard]>=0.30.0,<1.0
+python-multipart>=0.0.9        # multipart file upload (POST /upload)
+websockets>=12.0,<14.0         # WebSocket support (live pipeline log)
+streamlit>=1.36.0,<2.0
+requests>=2.32.0,<3.0          # używane przez UI do komunikacji z API
