@@ -136,6 +136,7 @@ services:
   #     --chunk-limit 100
   # ---------------------------------------------------------------------------
   app:
+    profiles: [pipeline]
     build:
       context: .
       dockerfile: Dockerfile
