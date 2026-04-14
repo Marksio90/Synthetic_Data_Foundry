@@ -104,23 +104,29 @@ st.divider()
 with st.expander("⚙️ Opcjonalne ustawienia ręczne (pozostaw puste = auto)", expanded=False):
     col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
+        use_threshold = st.checkbox("Ustaw quality_threshold", value=False)
         manual_threshold = st.number_input(
             "quality_threshold", min_value=0.5, max_value=1.0,
-            value=0.0, step=0.01,
-            help="0 = auto (zalecane)"
-        )
+            value=0.82, step=0.01,
+            disabled=not use_threshold,
+            help="Odznacz żeby użyć auto-kalibracji",
+        ) if use_threshold else None
     with col_b:
+        use_turns = st.checkbox("Ustaw max_turns", value=False)
         manual_turns = st.number_input(
             "max_turns", min_value=1, max_value=5,
-            value=0, step=1,
-            help="0 = auto"
-        )
+            value=3, step=1,
+            disabled=not use_turns,
+            help="Odznacz żeby użyć auto-kalibracji",
+        ) if use_turns else None
     with col_c:
+        use_adversarial = st.checkbox("Ustaw adversarial_ratio", value=False)
         manual_adversarial = st.number_input(
             "adversarial_ratio", min_value=0.0, max_value=0.3,
-            value=0.0, step=0.01,
-            help="0 = auto"
-        )
+            value=0.10, step=0.01,
+            disabled=not use_adversarial,
+            help="Odznacz żeby użyć auto-kalibracji",
+        ) if use_adversarial else None
     with col_d:
         chunk_limit = st.number_input(
             "chunk_limit (0=wszystkie)", min_value=0, max_value=10000,
@@ -147,9 +153,9 @@ if not run_in_progress:
             "filenames": selected,
             "batch_id": custom_batch_id or None,
             "chunk_limit": chunk_limit,
-            "quality_threshold": manual_threshold if manual_threshold > 0 else None,
-            "max_turns": manual_turns if manual_turns > 0 else None,
-            "adversarial_ratio": manual_adversarial if manual_adversarial > 0 else None,
+            "quality_threshold": manual_threshold,
+            "max_turns": manual_turns,
+            "adversarial_ratio": manual_adversarial,
         }
         with st.spinner("Uruchamiam AutoPilota..."):
             try:
