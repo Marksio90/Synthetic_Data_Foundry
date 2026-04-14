@@ -11,7 +11,7 @@ FROM python:${PYTHON_VERSION}-slim
 WORKDIR /app
 
 COPY requirements.ui.txt ./
-RUN pip install --no-cache-dir -r requirements.ui.txt
+RUN pip install --no-cache-dir --timeout 300 --retries 5 -r requirements.ui.txt
 
 # Copy only the UI directory
 COPY ui/ ./ui/
