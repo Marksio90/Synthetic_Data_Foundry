@@ -243,6 +243,56 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
+  # Chatbot stack — Ollama + Open WebUI (optional profile)
+  #
+  # Start with:
+  #   docker compose --profile chatbot up -d
+  #
+  # Then open: http://localhost:3000
+  # ---------------------------------------------------------------------------
+  ollama:
+    profiles: [chatbot]
+    image: ollama/ollama:latest
+    container_name: foundry_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    mem_limit: 8g
+    memswap_limit: 8g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  open-webui:
+    profiles: [chatbot]
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: foundry_webui
+    restart: unless-stopped
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_AUTH: "False"
+    ports:
+      - "3000:8080"
+    depends_on:
+      - ollama
+    mem_limit: 512m
+    memswap_limit: 512m
+    volumes:
+      - webui_data:/app/backend/data
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
   # Foundry Trainer — GPU container for SFT + DPO fine-tuning
   #
   # Start with:
@@ -325,6 +375,10 @@ volumes:
     driver: local
   hf_cache:
     driver: local             # persists downloaded model weights between restarts
+  ollama_models:
+    driver: local             # persists Ollama model files (GGUF) between restarts
+  webui_data:
+    driver: local             # persists Open WebUI data (chats, settings)
 
 # =============================================================================
 # Network — isolated bridge; no external exposure except via host port mapping
