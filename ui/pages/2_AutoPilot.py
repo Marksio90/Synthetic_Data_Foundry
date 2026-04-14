@@ -65,7 +65,7 @@ if st.button("🔍 Analizuj dokumenty (podgląd)", help="Szybka analiza bez uruc
         try:
             r = requests.post(
                 f"{API_URL}/api/pipeline/analyze",
-                json=selected,
+                json={"filenames": selected},
                 timeout=15,
             )
             if r.ok:

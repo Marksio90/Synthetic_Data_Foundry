@@ -24,7 +24,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -88,7 +88,7 @@ def _get_calibration_chunks(session: Session, filenames: list[str]) -> list:
 
 @router.post("/analyze", response_model=AnalysisResponse)
 def analyze(
-    filenames: list[str],
+    filenames: list[str] = Body(embed=True),
     session: Session = Depends(get_session),
 ) -> AnalysisResponse:
     """
@@ -299,7 +299,10 @@ def list_runs() -> list[dict]:
             "batch_id": r.batch_id,
             "status": r.status,
             "progress_pct": r.progress_pct,
+            "chunks_done": r.chunks_done,
+            "chunks_total": r.chunks_total,
             "records_written": r.records_written,
+            "dpo_pairs": r.dpo_pairs,
             "elapsed_seconds": r.elapsed_seconds,
         }
         for r in runs.list_runs()

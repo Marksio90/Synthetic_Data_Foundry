@@ -134,10 +134,13 @@ with col_pipe:
         prog = last.get("progress_pct", 0)
         if prog:
             st.progress(int(prog) / 100, text=f"{prog:.0f}%")
-        chunks = last.get("chunks_done", 0)
-        records = last.get("records_done", 0)
-        if chunks or records:
-            st.caption(f"Chunki: {chunks} | Q&A: {records}")
+        chunks_done = last.get("chunks_done", 0)
+        chunks_total = last.get("chunks_total", 0)
+        records = last.get("records_written", 0)
+        dpo = last.get("dpo_pairs", 0)
+        chunks_str = f"{chunks_done}/{chunks_total}" if chunks_total else str(chunks_done)
+        if chunks_done or records:
+            st.caption(f"Chunki: {chunks_str} | Q&A: {records} | DPO: {dpo}")
     else:
         st.info("Brak uruchomionych pipeline'ów.")
 
