@@ -26,7 +26,7 @@ from pathlib import Path
 
 router = APIRouter()
 
-_OLLAMA_URL = "http://localhost:11434"
+_OLLAMA_URL = settings.ollama_url
 
 OUTPUT_DIR = Path(settings.output_file).parent
 

@@ -130,6 +130,10 @@ class Settings(BaseSettings):
     api_host: str = Field("0.0.0.0")
     api_port: int = Field(8080)
     data_dir: str = Field("/app/data", description="Directory where input PDFs are stored")
+    ollama_url: str = Field(
+        "http://localhost:11434",
+        description="Ollama API endpoint (override to http://ollama:11434 in Docker)",
+    )
 
     # ------------------------------------------------------------------
     # Logging

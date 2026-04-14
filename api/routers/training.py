@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -167,6 +168,8 @@ async def start_training(req: TrainingRunRequest) -> dict:
         "--epochs", str(config.epochs_sft),
         "--lr", str(config.learning_rate),
         "--batch-size", str(batch_size),
+        "--grad-accum", str(grad_accum),
+        "--max-seq-length", str(hw.recommended_model.max_seq_length),
         "--run-name", req.run_name,
     ]
 
@@ -320,15 +323,22 @@ async def export_model(req: ExportRequest) -> dict:
             runs.append_log(export_run_id, f"[Export] Konwertuję do GGUF ({req.quantization})...")
             gguf = convert_to_gguf(merged, str(OUTPUT_DIR / "models"), req.quantization)
 
-            runs.append_log(export_run_id, "[Export] Buduję paczkę dla klienta...")
-
-            # Count records in dataset
-            n_records = 0
+            runs.append_log(export_run_id, "[Export] Generuję datacard...")
+            from training.datacard import generate_datacard
             jsonl = OUTPUT_DIR / "dataset_esg_v1.jsonl"
+            dpo_jsonl = OUTPUT_DIR / "dataset_esg_v1_dpo.jsonl"
+            datacard_path = generate_datacard(
+                jsonl_path=str(jsonl),
+                dpo_path=str(dpo_jsonl) if dpo_jsonl.exists() else None,
+                domain_label=req.domain_label,
+                base_model=req.base_model,
+            )
+
+            runs.append_log(export_run_id, "[Export] Buduję paczkę dla klienta...")
+            n_records = 0
             if jsonl.exists():
                 n_records = sum(1 for l in jsonl.open("r", encoding="utf-8") if l.strip())
 
-            datacard = str(jsonl.with_suffix(".datacard.json"))
             zip_path = build_client_package(
                 gguf_path=gguf,
                 model_name=req.model_name,
@@ -336,7 +346,7 @@ async def export_model(req: ExportRequest) -> dict:
                 base_model=req.base_model,
                 domain_label=req.domain_label,
                 n_records=n_records,
-                datacard_path=datacard if Path(datacard).exists() else None,
+                datacard_path=datacard_path,
             )
             runs.update(export_run_id, status="done", progress_pct=100)
             runs.update(export_run_id, **{"analysis": {"zip_path": zip_path}})
@@ -347,3 +357,61 @@ async def export_model(req: ExportRequest) -> dict:
 
     asyncio.create_task(_do_export())
     return {"export_run_id": export_run_id, "status": "started"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/training/export/download/{export_run_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/export/download/{export_run_id}")
+def download_export(export_run_id: str) -> FileResponse:
+    """Download the client ZIP package built by a completed export run."""
+    rec = runs.get(export_run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Export run not found: {export_run_id}")
+    if rec.status != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Export not complete yet (status={rec.status}). Try again later.",
+        )
+    zip_path = (rec.analysis or {}).get("zip_path")
+    if not zip_path or not Path(zip_path).exists():
+        raise HTTPException(status_code=404, detail="ZIP file not found on server.")
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=Path(zip_path).name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/training/datacard  — generate datacard on demand
+# ---------------------------------------------------------------------------
+
+class DatacardRequest(BaseModel):
+    jsonl_path: str = Field(default="", description="Path to SFT JSONL (empty = auto-detect)")
+    dpo_path: str = Field(default="", description="Path to DPO JSONL (empty = auto-detect)")
+    domain_label: str = Field(default="ESG / Prawo korporacyjne UE")
+    base_model: str = Field(default="")
+
+
+@router.post("/datacard")
+def generate_datacard_endpoint(req: DatacardRequest) -> dict:
+    """Generate (or regenerate) datacard.json from the current dataset."""
+    from training.datacard import generate_datacard
+
+    jsonl = req.jsonl_path or str(OUTPUT_DIR / "dataset_esg_v1.jsonl")
+    dpo = req.dpo_path or str(OUTPUT_DIR / "dataset_esg_v1_dpo.jsonl")
+
+    try:
+        path = generate_datacard(
+            jsonl_path=jsonl,
+            dpo_path=dpo if Path(dpo).exists() else None,
+            domain_label=req.domain_label,
+            base_model=req.base_model,
+        )
+        import json
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {"status": "ok", "path": path, "datacard": data}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

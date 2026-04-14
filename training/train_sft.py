@@ -226,6 +226,10 @@ def main():
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--grad-accum", type=int, default=4,
+                   help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)")
+    p.add_argument("--max-seq-length", type=int, default=8192,
+                   help="Maximum sequence length for tokenisation and KV-cache")
     p.add_argument("--run-name", default="foundry-sft")
     args = p.parse_args()
 
@@ -237,6 +241,8 @@ def main():
         epochs=args.epochs,
         learning_rate=args.lr,
         batch_size=args.batch_size,
+        grad_accum=args.grad_accum,
+        max_seq_length=args.max_seq_length,
         run_name=args.run_name,
     )
 
