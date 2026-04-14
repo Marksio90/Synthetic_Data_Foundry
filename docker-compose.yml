@@ -18,7 +18,7 @@
 #   docker compose run --rm app             # uruchom z domyslnymi PDFami z .env
 #
 #   Lub z wlasnym zestawem plikow:
-#   docker compose run --rm app python main.py \
+#   docker compose run --rm app \
 #     --pdf /app/data/plik1.pdf \
 #     --pdf /app/data/plik2.pdf \
 #     --batch-id batch-001 \
@@ -131,7 +131,7 @@ services:
   #   docker compose run --rm app
   #
   # Uruchomienie z wlasnym zestawem plikow:
-  #   docker compose run --rm app python main.py \
+  #   docker compose run --rm app \
   #     --pdf /app/data/mojdokument.pdf \
   #     --batch-id moj-batch \
   #     --chunk-limit 100
@@ -157,8 +157,6 @@ services:
       BATCH_ID: ${BATCH_ID:-batch-001}
       CHUNK_LIMIT: ${CHUNK_LIMIT:-0}
     command:
-      - python
-      - main.py
       - --pdf
       - /app/data/csddd.pdf
       - --pdf
