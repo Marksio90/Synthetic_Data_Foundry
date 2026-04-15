@@ -97,8 +97,16 @@ _MAX_CONTEXT_CHARS = 3500
 # Retry decorator for Groq/vLLM calls (handles 429 and 5xx)
 # ---------------------------------------------------------------------------
 
+def _is_tpd_limit(exc: BaseException) -> bool:
+    """Zwraca True gdy Groq zwraca dzienny limit TPD (nie minutowy TPM)."""
+    return isinstance(exc, openai.RateLimitError) and "tokens per day" in str(exc).lower()
+
+
 def _is_retryable_vllm(exc: BaseException) -> bool:
     if isinstance(exc, openai.RateLimitError):
+        # TPD (daily limit) — nie ma sensu retry, poczekać trzeba 20+ minut
+        if _is_tpd_limit(exc):
+            return False
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
         return True
@@ -106,8 +114,20 @@ def _is_retryable_vllm(exc: BaseException) -> bool:
 
 
 def _parse_groq_retry_after(exc: BaseException) -> float:
-    """Extract 'try again in X.XXs' from Groq 429 error message, with 2s buffer."""
-    m = _re.search(r"try again in (\d+(?:\.\d+)?)s", str(exc), _re.IGNORECASE)
+    """
+    Parsuje czas oczekiwania z komunikatu Groq 429.
+    Obsługuje formaty:
+      - 'try again in 8.69s'      → 8.69s
+      - 'try again in 21m17.856s' → 1277.856s
+    Dodaje 2s buforu.
+    """
+    body = str(exc)
+    # Format minuty + sekundy: "21m17.856s"
+    m = _re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", body, _re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 60 + float(m.group(2)) + 2.0
+    # Format same sekundy: "8.69s"
+    m = _re.search(r"try again in (\d+(?:\.\d+)?)s", body, _re.IGNORECASE)
     if m:
         return float(m.group(1)) + 2.0
     return settings.tenacity_initial_wait
