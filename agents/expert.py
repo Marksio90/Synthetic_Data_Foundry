@@ -23,8 +23,6 @@ import re as _re
 
 import openai
 from sqlalchemy.orm import Session
-import re as _re
-
 from tenacity import (
     before_sleep_log,
     retry,
@@ -184,7 +182,7 @@ def _call_vllm(system: str, user: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.2,
+        temperature=settings.vllm_temperature,
         max_tokens=settings.vllm_max_tokens,
     )
     return response.choices[0].message.content.strip()
@@ -211,7 +209,7 @@ def _call_vllm_messages(messages: list[dict]) -> str:
     response = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.2,
+        temperature=settings.vllm_temperature,
         max_tokens=settings.vllm_max_tokens,
     )
     return response.choices[0].message.content.strip()
