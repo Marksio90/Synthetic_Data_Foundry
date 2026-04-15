@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS generated_samples (
     quality_score   REAL        CHECK (quality_score BETWEEN 0.0 AND 1.0),
     judge_model     TEXT,
     judge_reasoning TEXT,
+    -- Extended metadata (perspective / type / difficulty)
+    perspective     TEXT,                          -- cfo | prawnik | audytor | cross_doc
+    question_type   TEXT,                          -- factual | scope | process | compliance | comparative
+    difficulty      TEXT,                          -- easy | medium | hard
+    -- DPO pairing
+    rejected_answer TEXT,                          -- first-attempt answer for DPO pairs
+    conversation_json JSONB,                       -- multi-turn conversation history
+    -- Human review workflow
+    human_reviewed  BOOLEAN,
+    human_flag      TEXT,                          -- auto_approved | auto_rejected | human_approved | human_rejected
     -- Watermarking (Self-Check B2B protection)
     watermark_hash  CHAR(64),
     batch_id        TEXT,
