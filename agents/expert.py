@@ -6,14 +6,18 @@ LangGraph node: expert_answer(state) → partial state update
 Two-phase operation:
   Phase 1 (retrieve): hybrid search (vector cosine + BM25 ts_rank) in
     PostgreSQL, filtered WHERE is_superseded = FALSE (Self-Check 3.0).
-  Phase 2 (generate): prompt Llama 3 (local vLLM) with retrieved context
-    + original chunk.  If question is adversarial, the grounding prompt
-    forces the refusal phrase "Brak danych w dyrektywie".
+  Phase 2 (generate): prompt LLM with retrieved context + original chunk.
+    If question is adversarial, the grounding prompt forces the refusal
+    phrase "Brak danych w dyrektywie".
 
-Groq routing (primary when GROQ_API_KEY is set):
-  Domyślnie llama-3.1-8b-instant (200k TPM free tier).
-  Zmień GROQ_MODEL=llama-3.3-70b-versatile dla wyższej jakości (12k TPM).
-  Falls back to VLLM_BASE_URL / OpenAI when GROQ_API_KEY is empty.
+Provider routing (priority order):
+  1. Ollama LOCAL  (darmowy, ~4.7 GB RAM dla llama3.1:8b)
+  2. LLaMA API     (Groq/Together — tani cloud)
+  3. OpenAI / vLLM (fallback — zawsze działa)
+
+Embeddings routing:
+  USE_LOCAL_EMBEDDINGS=true  → Ollama nomic-embed-text (darmowy, 0.3 GB RAM)
+  USE_LOCAL_EMBEDDINGS=false → OpenAI text-embedding-3-small (domyślny)
 """
 
 from __future__ import annotations
@@ -88,8 +92,10 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
     ),
 }
 
-# Max context chars — leaves room for question + history in model's context window
-_MAX_CONTEXT_CHARS = 3500
+# Max context chars — increased for local Ollama (no token cost) and larger context windows.
+# Ollama llama3.1:8b supports 128k context; Groq/OpenAI gpt-4o-mini supports 128k.
+# We cap at 6000 chars (~1500 tokens) to leave room for question + history + answer.
+_MAX_CONTEXT_CHARS = 6000
 
 
 # ---------------------------------------------------------------------------
@@ -157,65 +163,100 @@ def _retry_vllm(func):
     )(func)
 
 
-@_retry_vllm
-def _call_vllm(system: str, user: str) -> str:
-    """Prefer Groq (Llama 3.3) when GROQ_API_KEY is set, fall back to VLLM/OpenAI."""
+def _make_ollama_client() -> openai.OpenAI:
+    """Klient Ollama przez OpenAI-compatible API."""
+    base = settings.ollama_url.rstrip("/")
+    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0)
+
+
+def _call_provider(messages: list[dict]) -> str:
+    """
+    Routing 3-poziomowy dla odpowiedzi (długich — max vllm_max_tokens):
+      1. Ollama LOCAL  (darmowy, brak limitu)
+      2. LLaMA API     (Groq/Together — tani cloud)
+      3. OpenAI/vLLM   (fallback — zawsze działa)
+    """
+    max_tok = settings.vllm_max_tokens
+
+    # ── 1. Ollama LOCAL ──────────────────────────────────────────────
+    if settings.ollama_model:
+        try:
+            client = _make_ollama_client()
+            resp = client.chat.completions.create(
+                model=settings.ollama_model,
+                messages=messages,
+                temperature=settings.vllm_temperature,
+                max_tokens=max_tok,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning("Ollama niedostępny (%s), przełączam na LLaMA API / OpenAI", e)
+
+    # ── 2. LLaMA API (Groq / Together) ───────────────────────────────
     if settings.groq_api_key:
-        # max_retries=0 — wyłącz wbudowany retry klienta; Tenacity zarządza retry
         client = openai.OpenAI(
             api_key=settings.groq_api_key,
             base_url=settings.groq_base_url,
             max_retries=0,
         )
-        model = settings.groq_model
-    else:
-        is_openai = "openai.com" in settings.vllm_base_url
-        client = openai.OpenAI(
-            api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
-            base_url=None if is_openai else settings.vllm_base_url,
-            max_retries=0,
+        resp = client.chat.completions.create(
+            model=settings.groq_model,
+            messages=messages,
+            temperature=settings.vllm_temperature,
+            max_tokens=max_tok,
         )
-        model = settings.vllm_model
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=settings.vllm_temperature,
-        max_tokens=settings.vllm_max_tokens,
+        return resp.choices[0].message.content.strip()
+
+    # ── 3. OpenAI / vLLM fallback ────────────────────────────────────
+    is_openai = "openai.com" in settings.vllm_base_url
+    client = openai.OpenAI(
+        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
+        base_url=None if is_openai else settings.vllm_base_url,
+        max_retries=0,
     )
-    return response.choices[0].message.content.strip()
+    resp = client.chat.completions.create(
+        model=settings.openai_primary_model if is_openai else settings.vllm_model,
+        messages=messages,
+        temperature=settings.vllm_temperature,
+        max_tokens=max_tok,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+@_retry_vllm
+def _call_vllm(system: str, user: str) -> str:
+    """Wrapper z retry — buduje messages i wywołuje _call_provider."""
+    return _call_provider([
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ])
 
 
 @_retry_vllm
 def _call_vllm_messages(messages: list[dict]) -> str:
-    """Same Groq/vLLM routing but accepts full messages list (for multi-turn context)."""
-    if settings.groq_api_key:
-        client = openai.OpenAI(
-            api_key=settings.groq_api_key,
-            base_url=settings.groq_base_url,
-            max_retries=0,
-        )
-        model = settings.groq_model
-    else:
-        is_openai = "openai.com" in settings.vllm_base_url
-        client = openai.OpenAI(
-            api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
-            base_url=None if is_openai else settings.vllm_base_url,
-            max_retries=0,
-        )
-        model = settings.vllm_model
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=settings.vllm_temperature,
-        max_tokens=settings.vllm_max_tokens,
-    )
-    return response.choices[0].message.content.strip()
+    """Wrapper z retry dla multi-turn context."""
+    return _call_provider(messages)
 
 
 def _embed_query(query: str) -> list[float]:
+    """
+    Embeddingi z routingiem:
+      USE_LOCAL_EMBEDDINGS=true  → Ollama nomic-embed-text (darmowy, ~1536 dims)
+      USE_LOCAL_EMBEDDINGS=false → OpenAI text-embedding-3-small (domyślny)
+    """
+    if settings.use_local_embeddings and settings.ollama_embed_model:
+        try:
+            base = settings.ollama_url.rstrip("/")
+            client = openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0)
+            resp = client.embeddings.create(
+                model=settings.ollama_embed_model,
+                input=[query],
+            )
+            return resp.data[0].embedding
+        except Exception as e:
+            logger.warning("Ollama embed niedostępny (%s), używam OpenAI embeddings", e)
+
+    # OpenAI embeddings (default)
     client = openai.OpenAI(api_key=settings.openai_api_key)
     resp = client.embeddings.create(
         model=settings.openai_embedding_model,
@@ -237,7 +278,7 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
             session,
             query_embedding=query_embedding,
             query_text=question,
-            top_k=5,
+            top_k=8,  # zwiększone z 5 → bogatszy kontekst RAG
         )
         context_texts = [c.content for c in chunks]
         context_ids = [str(c.id) for c in chunks]
@@ -271,7 +312,7 @@ def generate_answer(state: FoundryState) -> dict:
 
     # Build context block — dynamically cap to avoid token overflow
     context_parts = [f"[Główny fragment]\n{chunk['content']}"]
-    for i, ctx in enumerate(retrieved[:4], start=1):
+    for i, ctx in enumerate(retrieved[:6], start=1):   # zwiększone z 4 → 6 fragmentów
         context_parts.append(f"[Powiązany fragment {i}]\n{ctx}")
     context_block = "\n\n---\n\n".join(context_parts)
 

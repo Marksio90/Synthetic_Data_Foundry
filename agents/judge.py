@@ -144,9 +144,9 @@ _MIN_ANSWER_CHARS = 30  # answers shorter than this are rejected without calling
 def _build_messages(state: FoundryState) -> list[dict]:
     context_parts = state.get("retrieved_context", [state["chunk"]["content"]])
     context_raw = "\n---\n".join(context_parts)
-    if len(context_raw) > 5000:
-        logger.debug("Judge context truncated from %d to 5000 chars", len(context_raw))
-        context_raw = context_raw[:5000]
+    if len(context_raw) > 8000:
+        logger.debug("Judge context truncated from %d to 8000 chars", len(context_raw))
+        context_raw = context_raw[:8000]
     # Strip CoT reasoning block — judge evaluates the final answer only
     answer_for_eval = _strip_reasoning(state["answer"])
     user_content = _JUDGE_USER_TEMPLATE.format(

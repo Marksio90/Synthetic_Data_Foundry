@@ -9,9 +9,10 @@ Adversarial prompting (Self-Check spec):
   - 10% of the time: generate a "trick" question about something NOT present
     in the text.  The Expert agent must then respond with the refusal phrase.
 
-Groq routing (primary when GROQ_API_KEY is set):
-  Uses Llama 3.3 70B via Groq API for question generation.
-  Falls back to VLLM_BASE_URL / OpenAI when GROQ_API_KEY is empty.
+Provider routing (priority order):
+  1. Ollama (LOCAL, darmowy) — gdy OLLAMA_MODEL ustawiony i serwer dostępny
+  2. LLaMA API / Groq (CLOUD, tani) — gdy GROQ_API_KEY ustawiony
+  3. OpenAI / vLLM (FALLBACK) — zawsze dostępny przez OPENAI_API_KEY
 """
 
 from __future__ import annotations
@@ -166,33 +167,73 @@ def _retry_vllm(func):
     )(func)
 
 
-@_retry_vllm
-def _call_vllm(system_prompt: str, user_text: str) -> str:
-    """Prefer Groq (Llama 3.3) when GROQ_API_KEY is set, fall back to VLLM/OpenAI."""
+def _make_ollama_client() -> openai.OpenAI:
+    """Klient Ollama przez OpenAI-compatible API."""
+    base = settings.ollama_url.rstrip("/")
+    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0)
+
+
+def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) -> str:
+    """
+    Routing 3-poziomowy:
+      1. Ollama LOCAL  (darmowy, brak limitu)
+      2. LLaMA API     (Groq/Together — tani cloud)
+      3. OpenAI/vLLM   (fallback — zawsze działa)
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+
+    # ── 1. Ollama LOCAL ──────────────────────────────────────────────
+    if settings.ollama_model:
+        try:
+            client = _make_ollama_client()
+            resp = client.chat.completions.create(
+                model=settings.ollama_model,
+                messages=messages,
+                temperature=settings.vllm_temperature,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning("Ollama niedostępny (%s), przełączam na LLaMA API / OpenAI", e)
+
+    # ── 2. LLaMA API (Groq / Together) ───────────────────────────────
     if settings.groq_api_key:
         client = openai.OpenAI(
             api_key=settings.groq_api_key,
             base_url=settings.groq_base_url,
+            max_retries=0,
         )
-        model = settings.groq_model
-    else:
-        is_openai = "openai.com" in settings.vllm_base_url
-        client = openai.OpenAI(
-            api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
-            base_url=None if is_openai else settings.vllm_base_url,
+        resp = client.chat.completions.create(
+            model=settings.groq_model,
+            messages=messages,
+            temperature=settings.vllm_temperature,
+            max_tokens=max_tokens,
         )
-        model = settings.vllm_model
+        return resp.choices[0].message.content.strip()
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        temperature=settings.vllm_temperature,
-        max_tokens=256,
+    # ── 3. OpenAI / vLLM fallback ────────────────────────────────────
+    is_openai = "openai.com" in settings.vllm_base_url
+    client = openai.OpenAI(
+        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
+        base_url=None if is_openai else settings.vllm_base_url,
+        max_retries=0,
     )
-    return response.choices[0].message.content.strip()
+    resp = client.chat.completions.create(
+        model=settings.openai_primary_model if is_openai else settings.vllm_model,
+        messages=messages,
+        temperature=settings.vllm_temperature,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+@_retry_vllm
+def _call_vllm(system_prompt: str, user_text: str) -> str:
+    """Wrapper z retry dla _call_provider (pytania — krótkie, max 256 tokenów)."""
+    return _call_provider(system_prompt, user_text, max_tokens=256)
 
 
 _PERSPECTIVES = ["cfo", "prawnik", "audytor"]
