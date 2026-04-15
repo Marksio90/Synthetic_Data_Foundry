@@ -189,7 +189,8 @@ async def run_pipeline(
     })
 
     # Build main.py command
-    cmd = [_PYTHON, "main.py"]
+    _APP_ROOT = Path(__file__).parent.parent.parent  # /app/api/routers → /app
+    cmd = [_PYTHON, str(_APP_ROOT / "main.py")]
     for p in paths:
         cmd += ["--pdf", str(p)]
     cmd += ["--batch-id", batch_id, "--chunk-limit", str(req.chunk_limit)]
@@ -225,7 +226,7 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
-            cwd=str(Path(__file__).parent.parent),  # repo root
+            cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
         )
         assert proc.stdout is not None
         async for raw_line in proc.stdout:

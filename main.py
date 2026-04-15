@@ -22,11 +22,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 import uuid
 from pathlib import Path
 
 import openai
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from agents.chunker import chunk_document
@@ -34,7 +35,7 @@ from agents.cross_doc import generate_cross_doc_samples
 from agents.expert import _is_tpd_limit
 from agents.ingestor import ingest_pdf
 from config.settings import settings
-from db.models import Base, DirectiveChunk
+from db.models import Base, DirectiveChunk, SourceDocument
 from db.repository import claim_chunk, get_pending_chunks
 from pipeline.graph import build_graph
 from pipeline.state import FoundryState
@@ -74,13 +75,91 @@ def run_migrations(engine) -> None:
     """
     Idempotent schema patches applied on every startup.
 
-    1. Re-create finalize_chunk with a status guard so a failed 2nd/3rd
-       perspective cannot demote an already-ready chunk back to 'new'.
-    2. Add perspective, conversation_json, question_type, difficulty,
-       rejected_answer columns to generated_samples (IF NOT EXISTS).
+    Działa zarówno w Dockerze (gdzie init/01_schema.sql był uruchamiany przez
+    postgres entrypoint) jak i w lokalnym środowisku deweloperskim (gdzie
+    create_all tworzy tabele, ale nie uruchamia skryptów SQL).
+
+    Patch 0: Rozszerzenia PostgreSQL (pgvector, pg_trgm).
+    Patch 1: Kolumna fts_vector + trigger do automatycznej indeksacji FTS.
+    Patch 2: Stored procedure claim_chunk_for_processing (używana w repository.py).
+    Patch 3: Status-guarded finalize_chunk.
+    Patch 4-10: Nowe kolumny na generated_samples (IF NOT EXISTS).
     """
     with engine.connect() as conn:
-        # ── Patch 1: status-guarded finalize_chunk ───────────────────────────
+        # ── Patch 0: Rozszerzenia ─────────────────────────────────────────────
+        for ext in ("vector", "pg_trgm", '"uuid-ossp"'):
+            conn.execute(text(f"CREATE EXTENSION IF NOT EXISTS {ext};"))
+
+        # ── Patch 1a: kolumna fts_vector ──────────────────────────────────────
+        conn.execute(text(
+            "ALTER TABLE directive_chunks "
+            "ADD COLUMN IF NOT EXISTS fts_vector TSVECTOR;"
+        ))
+
+        # ── Patch 1b: funkcja triggerowa update_chunk_fts ─────────────────────
+        conn.execute(text("""
+            CREATE OR REPLACE FUNCTION update_chunk_fts()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.fts_vector := to_tsvector('simple', COALESCE(NEW.content, ''));
+                NEW.updated_at  := NOW();
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """))
+
+        # ── Patch 1c: trigger (DROP + CREATE zamiast IF NOT EXISTS) ───────────
+        conn.execute(text(
+            "DROP TRIGGER IF EXISTS trg_chunk_fts ON directive_chunks;"
+        ))
+        conn.execute(text("""
+            CREATE TRIGGER trg_chunk_fts
+                BEFORE INSERT OR UPDATE OF content
+                ON directive_chunks
+                FOR EACH ROW EXECUTE FUNCTION update_chunk_fts();
+        """))
+
+        # ── Patch 1d: GIN index na fts_vector ────────────────────────────────
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_fts "
+            "ON directive_chunks USING gin (fts_vector);"
+        ))
+
+        # ── Patch 1e: IVFFlat ANN index (best-effort — może nie istnieć) ─────
+        try:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_embedding "
+                "ON directive_chunks "
+                "USING ivfflat (embedding vector_cosine_ops) "
+                "WITH (lists = 100);"
+            ))
+        except Exception as exc:
+            logger.warning(
+                "IVFFlat index creation skipped (insufficient data or pgvector missing): %s", exc
+            )
+            conn.rollback()
+            # Ponownie otwórz transakcję po rollback
+            conn.execute(text("SELECT 1"))
+
+        # ── Patch 2: claim_chunk_for_processing ───────────────────────────────
+        conn.execute(text("""
+            CREATE OR REPLACE FUNCTION claim_chunk_for_processing(p_chunk_id UUID)
+            RETURNS BOOLEAN AS $$
+            DECLARE
+                rows_updated INTEGER;
+            BEGIN
+                UPDATE directive_chunks
+                SET    status = 'in_progress', updated_at = NOW()
+                WHERE  id = p_chunk_id
+                  AND  status = 'new'
+                  AND  retry_count < 3;
+                GET DIAGNOSTICS rows_updated = ROW_COUNT;
+                RETURN rows_updated = 1;
+            END;
+            $$ LANGUAGE plpgsql;
+        """))
+
+        # ── Patch 3: status-guarded finalize_chunk ────────────────────────────
         conn.execute(text("""
             CREATE OR REPLACE FUNCTION finalize_chunk(
                 p_chunk_id  UUID,
@@ -111,7 +190,7 @@ def run_migrations(engine) -> None:
             $$ LANGUAGE plpgsql;
         """))
 
-        # ── Patch 2–6: new columns on generated_samples ──────────────────────
+        # ── Patch 4–10: nowe kolumny na generated_samples ────────────────────
         for col_ddl in [
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS perspective TEXT",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS conversation_json JSONB",
@@ -125,7 +204,9 @@ def run_migrations(engine) -> None:
             conn.execute(text(col_ddl + ";"))
 
         conn.commit()
-    logger.info("DB migrations applied (finalize_chunk guard + 7 schema patches)")
+    logger.info(
+        "DB migrations applied: extensions + fts_vector + claim/finalize funcs + 7 schema patches"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +293,11 @@ def main() -> None:
         with Session() as session:
             source_doc_id, markdown = ingest_pdf(str(pdf_path), session)
 
-            from sqlalchemy import select
-            from db.models import SourceDocument
             doc = session.scalar(
                 select(SourceDocument).where(SourceDocument.id == uuid.UUID(source_doc_id))
             )
             valid_from = doc.valid_from_date if doc else None
 
-            from sqlalchemy import func
             existing_count = session.scalar(
                 select(func.count(DirectiveChunk.id)).where(
                     DirectiveChunk.source_doc_id == uuid.UUID(source_doc_id)
@@ -317,12 +395,15 @@ def main() -> None:
                         chunk_ready = True
                 except openai.RateLimitError as exc:
                     if _is_tpd_limit(exc):
+                        # Groq dzienny limit wyczerpany — nie ma sensu kontynuować
                         logger.critical(
-                            "⛔ Groq dzienny limit TPD wyczerpany! Poczekaj do północy UTC "
-                            "lub zmień model (GROQ_API_KEY= + VLLM_MODEL=gpt-4o-mini). Błąd: %s", exc
+                            "⛔ Groq dzienny limit TPD wyczerpany! Poczekaj do północy (UTC) "
+                            "lub zmień model: GROQ_MODEL=llama-3.1-8b-instant. Błąd: %s", exc
                         )
                         sys.exit(1)
-                    logger.error("Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc)
+                    logger.error(
+                        "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
+                    )
                 except Exception as exc:
                     logger.error(
                         "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
@@ -333,6 +414,12 @@ def main() -> None:
                 total_ready += 1
             else:
                 total_unresolvable += 1
+
+            # Throttle — prevents Groq/OpenAI 429 rate-limit storms.
+            # Groq free tier: 12k TPM. Each chunk uses ~2k tokens × 3 perspectives = 6k tokens.
+            # At 2s delay the effective throughput is ~30 chunks/min which stays under the limit.
+            if settings.chunk_delay_seconds > 0:
+                time.sleep(settings.chunk_delay_seconds)
 
             if total_processed % 10 == 0:
                 logger.info(
