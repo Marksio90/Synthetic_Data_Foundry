@@ -106,8 +106,8 @@ export default function DatasetPage() {
   const startItem = page * PAGE_SIZE + 1;
   const endItem = Math.min((page + 1) * PAGE_SIZE, total);
 
-  const perspectives = stats ? Object.keys(stats.perspectives) : [];
-  const difficulties = stats ? Object.keys(stats.difficulties) : [];
+  const perspectives = Object.keys(stats?.perspectives ?? {});
+  const difficulties = Object.keys(stats?.difficulties ?? {});
 
   return (
     <div className="space-y-6">
