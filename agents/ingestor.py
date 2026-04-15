@@ -3,8 +3,10 @@ agents/ingestor.py — Agent Ingestor (Poborca & Parser)
 
 Responsibilities:
   1. Accept a PDF file path.
-  2. Convert it to Markdown using LlamaParse (preferred) or OpenAI Vision API
-     as a fallback.  Both paths handle tables correctly.
+  2. Convert it to Markdown using (in order of preference):
+       a) LlamaParse (cloud, best table support — requires API key)
+       b) PyMuPDF   (local, free, no limits — default fallback)
+       c) OpenAI Vision API (last resort for scans/image-only PDFs)
   3. Extract directive metadata (name, year, valid_from_date).
   4. Detect supersession relationships (e.g. amendment replaces old article)
      and set is_superseded=True on any previously stored chunks of the same
@@ -52,6 +54,45 @@ def _parse_with_llamaparse(pdf_path: Path) -> str:
     )
     documents = parser.load_data(str(pdf_path))
     return "\n\n".join(doc.text for doc in documents)
+
+
+def _parse_with_pymupdf(pdf_path: Path) -> str:
+    """
+    Parse PDF locally using PyMuPDF (fitz) — free, no API limits.
+    Builds a Markdown representation: headings for large font sizes,
+    plain paragraphs otherwise; inserts <!-- Page N --> markers between pages.
+    """
+    import fitz  # type: ignore  # pymupdf
+
+    doc = fitz.open(str(pdf_path))
+    pages_md: list[str] = []
+
+    for page_num, page in enumerate(doc, start=1):
+        page_dict = page.get_text("dict")
+        lines: list[str] = []
+
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:  # 0 = text block
+                continue
+            for line in block.get("lines", []):
+                line_parts: list[str] = []
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    if not text:
+                        continue
+                    font_size = span.get("size", 0)
+                    if font_size > 13:
+                        line_parts.append(f"## {text}")
+                    else:
+                        line_parts.append(text)
+                if line_parts:
+                    lines.append(" ".join(line_parts))
+
+        page_md = "\n".join(lines)
+        pages_md.append(f"<!-- Page {page_num} -->\n{page_md}")
+
+    doc.close()
+    return "\n\n".join(pages_md)
 
 
 def _parse_with_openai_vision(pdf_path: Path) -> str:
@@ -159,14 +200,24 @@ def ingest_pdf(pdf_path: str, session: Session) -> tuple[str, str]:
         return str(existing.id), existing.raw_markdown or ""
 
     # Parse PDF → Markdown
+    # 1. LlamaParse (jeśli API key) — najlepsza jakość tabel
     markdown = ""
     if settings.llama_parse_api_key:
         logger.info("Parsing with LlamaParse: %s", path.name)
         try:
             markdown = _parse_with_llamaparse(path)
         except Exception as exc:
-            logger.warning("LlamaParse failed (%s), falling back to OpenAI Vision", exc)
+            logger.warning("LlamaParse failed (%s), falling back to PyMuPDF", exc)
 
+    # 2. PyMuPDF (lokalnie, bezpłatnie) — domyślny fallback
+    if not markdown:
+        logger.info("Parsing with PyMuPDF (local, free): %s", path.name)
+        try:
+            markdown = _parse_with_pymupdf(path)
+        except Exception as exc:
+            logger.warning("PyMuPDF failed (%s), falling back to OpenAI Vision", exc)
+
+    # 3. OpenAI Vision (ostateczny fallback dla skanów/obrazów)
     if not markdown:
         logger.info("Parsing with OpenAI Vision: %s", path.name)
         markdown = _parse_with_openai_vision(path)

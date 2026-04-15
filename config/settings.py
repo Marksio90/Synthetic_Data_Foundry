@@ -32,7 +32,16 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Local LLM (vLLM)
     # ------------------------------------------------------------------
-    vllm_base_url: str = Field("http://vllm:8000/v1")
+    vllm_base_url: str = Field(
+        "https://api.openai.com/v1",
+        description=(
+            "OpenAI-compatible endpoint. Opcje:\n"
+            "  OpenAI:  https://api.openai.com/v1 (model: gpt-4o-mini)\n"
+            "  Gemini:  https://generativelanguage.googleapis.com/v1beta/openai/ (model: gemini-2.0-flash-lite)\n"
+            "  Together: https://api.together.xyz/v1 (model: meta-llama/Llama-3.1-8B-Instruct-Turbo)\n"
+            "  Local:   http://ollama:11434/v1 (model: llama3.1:8b)"
+        ),
+    )
     vllm_model: str = Field("llama3")
     vllm_api_key: str = Field("not-needed", description="'not-needed' for local vLLM; set to openai_api_key when routing through OpenAI")
     vllm_temperature: float = Field(0.7)
