@@ -83,7 +83,7 @@ x-app-env: &app-env
   GROQ_API_KEY: ${GROQ_API_KEY:-}
   VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
   VLLM_MODEL: ${VLLM_MODEL:-gpt-4o-mini}
-  VLLM_API_KEY: ${VLLM_API_KEY:-${OPENAI_API_KEY}}
+  VLLM_API_KEY: ${OPENAI_API_KEY}
   LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
   OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
   DPO_OUTPUT_FILE: /app/output/dataset_esg_v1_dpo.jsonl
