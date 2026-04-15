@@ -40,18 +40,33 @@ class Settings(BaseSettings):
         description="Max tokens for expert generation (increased to accommodate CoT reasoning block)")
 
     # ------------------------------------------------------------------
-    # Groq (Llama 3.3 70B — primary question/answer generator)
+    # Groq (primary question/answer generator)
     # ------------------------------------------------------------------
     groq_api_key: str = Field("", description="Groq API key — https://console.groq.com")
     groq_base_url: str = Field("https://api.groq.com/openai/v1")
-    groq_model: str = Field("llama-3.3-70b-versatile")
+    groq_model: str = Field(
+        "llama-3.1-8b-instant",
+        description=(
+            "Model Groq do generowania Q&A. "
+            "llama-3.1-8b-instant: 200 000 TPM (free tier) — zalecany. "
+            "llama-3.3-70b-versatile: lepszy, ale tylko 12 000 TPM free tier. "
+            "mixtral-8x7b-32768: 20 000 TPM, dobry balans jakości/limitu."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # OpenAI (Judge + Embeddings)
     # ------------------------------------------------------------------
     openai_api_key: str = Field(..., description="OpenAI secret key")
     openai_primary_model: str = Field("gpt-4o-mini")
-    openai_fallback_model: str = Field("gpt-4o")
+    openai_fallback_model: str = Field(
+        "gpt-4o-mini",
+        description=(
+            "Fallback sędziego gdy pewność < próg. "
+            "gpt-4o-mini: ~15× taniej niż gpt-4o, wystarczający dla ewaluacji. "
+            "Zmień na gpt-4o tylko jeśli potrzebujesz najwyższej jakości ocen."
+        ),
+    )
     openai_embedding_model: str = Field("text-embedding-3-small")
     openai_embedding_dims: int = Field(1536)
 
@@ -104,10 +119,12 @@ class Settings(BaseSettings):
     # Rate-limit throttling
     # ------------------------------------------------------------------
     chunk_delay_seconds: float = Field(
-        2.0,
+        1.0,
         description=(
-            "Seconds to sleep between chunks to avoid Groq/OpenAI rate limits. "
-            "Groq free tier: 12k TPM — increase to 5+ if you see many 429s."
+            "Opóźnienie między chunkami (sekundy) by uniknąć limitów API. "
+            "llama-3.1-8b-instant: 200k TPM — 1s wystarczy. "
+            "llama-3.3-70b-versatile: 12k TPM — ustaw 5+. "
+            "Ustaw przez env: CHUNK_DELAY_SECONDS=2"
         ),
     )
 
