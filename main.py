@@ -25,11 +25,13 @@ import sys
 import uuid
 from pathlib import Path
 
+import openai
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from agents.chunker import chunk_document
 from agents.cross_doc import generate_cross_doc_samples
+from agents.expert import _is_tpd_limit
 from agents.ingestor import ingest_pdf
 from config.settings import settings
 from db.models import Base, DirectiveChunk
@@ -313,6 +315,14 @@ def main() -> None:
                     final_status = final_state.get("status", "unknown")
                     if final_status == "ready":
                         chunk_ready = True
+                except openai.RateLimitError as exc:
+                    if _is_tpd_limit(exc):
+                        logger.critical(
+                            "⛔ Groq dzienny limit TPD wyczerpany! Poczekaj do północy UTC "
+                            "lub zmień model (GROQ_API_KEY= + VLLM_MODEL=gpt-4o-mini). Błąd: %s", exc
+                        )
+                        sys.exit(1)
+                    logger.error("Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc)
                 except Exception as exc:
                     logger.error(
                         "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
