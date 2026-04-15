@@ -6,13 +6,13 @@ Graph topology (per chunk, multi-turn):
   START
     │
     ▼
-  [simulate_question]      ← Groq/Llama generates initial question (10% adversarial)
+  [simulate_question]      ← Ollama/secondary generates initial question (10% adversarial)
     │
     ▼
   [retrieve_context]       ← pgvector + BM25 hybrid search
     │
     ▼
-  [generate_answer]        ← Groq/Llama grounded answer with CoT reasoning
+  [generate_answer]        ← Ollama/secondary grounded answer with CoT reasoning
     │
     ▼
   [judge_answer]           ← gpt-4o-mini (cascade → gpt-4o if confidence < threshold)

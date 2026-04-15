@@ -3,7 +3,7 @@ agents/translator.py — Automatyczne tłumaczenie dokumentów na język polski.
 
 Strategia wyboru backendu (w kolejności priorytetu):
   1. DeepL API — jeśli DEEPL_API_KEY ustawiony (najwyższa jakość tłumaczenia)
-  2. Groq (Llama 3.3 70B) — jeśli GROQ_API_KEY ustawiony (szybkie, darmowe)
+  2. Cerebras/secondary — jeśli SECONDARY_API_KEY ustawiony (szybkie, tanie)
   3. OpenAI (gpt-4o-mini) — zawsze dostępny jako fallback
 
 Tłumaczenie odbywa się na poziomie chunków (nie całych PDF-ów), więc
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Maksymalna długość tekstu wysyłanego w jednym zapytaniu tłumaczącym
 _MAX_CHUNK_CHARS = 3000
 
-# Prompt systemowy dla Groq/OpenAI — tłumaczenie prawno-regulacyjne
+# Prompt systemowy dla secondary/OpenAI — tłumaczenie prawno-regulacyjne
 _TRANSLATE_SYSTEM = (
     "Jesteś profesjonalnym tłumaczem specjalizującym się w prawie korporacyjnym UE "
     "i dokumentach regulacyjnych.\n\n"
@@ -50,7 +50,7 @@ _TRANSLATE_SYSTEM = (
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator — obsługa rate limitów (DeepL / Groq / OpenAI)
+# Retry decorator — obsługa rate limitów (DeepL / secondary / OpenAI)
 # ---------------------------------------------------------------------------
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -110,12 +110,12 @@ def _translate_deepl(text: str, source_lang: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backend 2: Groq / OpenAI (LLM-based translation)
+# Backend 2: secondary (Cerebras/OpenRouter) lub OpenAI
 # ---------------------------------------------------------------------------
 
 @_retry
 def _translate_llm(text: str, source_lang: str) -> str:
-    """Tłumaczy przez Groq (Llama 3.3 70B) lub OpenAI gpt-4o-mini."""
+    """Tłumaczy przez secondary providera (Cerebras) lub OpenAI gpt-4o-mini."""
     lang_names = {
         "en": "angielskiego", "de": "niemieckiego",
         "fr": "francuskiego", "es": "hiszpańskiego",
@@ -127,12 +127,12 @@ def _translate_llm(text: str, source_lang: str) -> str:
         f"{text}"
     )
 
-    if settings.groq_api_key:
+    if settings.secondary_api_key:
         client = openai.OpenAI(
-            api_key=settings.groq_api_key,
-            base_url=settings.groq_base_url,
+            api_key=settings.secondary_api_key,
+            base_url=settings.secondary_base_url,
         )
-        model = settings.groq_model
+        model = settings.secondary_model
     else:
         client = openai.OpenAI(api_key=settings.openai_api_key)
         model = settings.openai_primary_model

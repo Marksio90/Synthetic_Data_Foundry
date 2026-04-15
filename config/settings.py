@@ -65,22 +65,21 @@ class Settings(BaseSettings):
     # WYBÓR: Cerebras (rekomendowany — 1M tokenów/dzień FREE, ultraszybki)
     #   Klucz: https://cloud.cerebras.ai → Sign up → API Keys
     #   Model: llama3.1-8b (identyczny z Ollama lokalnym = spójne wyniki)
-    #   Prędkość: 2000+ tokenów/sek (10× szybszy niż Groq)
+    #   Prędkość: 2000+ tokenów/sek
     #
     # Alternatywy (zmień tylko 3 zmienne w .env):
     #   OpenRouter free:  openrouter.ai/api/v1  | meta-llama/llama-3.1-8b-instruct:free
     #   Together AI paid: api.together.xyz/v1   | meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo ($0.18/1M)
-    #   Groq:             api.groq.com/openai/v1| llama-3.1-8b-instant (200k TPM free, za mało dla prod)
     # ------------------------------------------------------------------
-    groq_api_key: str = Field(
+    secondary_api_key: str = Field(
         "",
-        description="Klucz do secondary providera. Cerebras: https://cloud.cerebras.ai",
+        description="Klucz do secondary providera (SECONDARY_API_KEY). Cerebras: https://cloud.cerebras.ai",
     )
-    groq_base_url: str = Field(
+    secondary_base_url: str = Field(
         "https://api.cerebras.ai/v1",
         description="Base URL secondary providera. Default: Cerebras.",
     )
-    groq_model: str = Field(
+    secondary_model: str = Field(
         "llama3.1-8b",
         description=(
             "Model secondary providera. "
@@ -175,8 +174,8 @@ class Settings(BaseSettings):
         0.0,
         description=(
             "Opóźnienie między chunkami (sekundy). "
-            "OpenAI gpt-4o-mini: 10M TPM — ustaw 0. "
-            "Groq free tier: ustaw 1-5 w zależności od modelu."
+            "OpenAI/Ollama: ustaw 0. "
+            "Cerebras/OpenRouter free tier: ustaw 1-3 w razie 429."
         ),
     )
 
@@ -189,7 +188,7 @@ class Settings(BaseSettings):
     )
     deepl_api_key: str = Field(
         "",
-        description="DeepL API key for high-quality translation (optional; falls back to Groq)",
+        description="DeepL API key for high-quality translation (optional; falls back to secondary/OpenAI LLM)",
     )
 
     # ------------------------------------------------------------------

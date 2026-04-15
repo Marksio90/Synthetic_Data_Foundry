@@ -11,7 +11,7 @@ Adversarial prompting (Self-Check spec):
 
 Provider routing (priority order):
   1. Ollama (LOCAL, darmowy) — gdy OLLAMA_MODEL ustawiony i serwer dostępny
-  2. LLaMA API / Groq (CLOUD, tani) — gdy GROQ_API_KEY ustawiony
+  2. Cerebras/secondary (CLOUD, tani) — gdy SECONDARY_API_KEY ustawiony
   3. OpenAI / vLLM (FALLBACK) — zawsze dostępny przez OPENAI_API_KEY
 """
 
@@ -142,7 +142,7 @@ _FOLLOWUP_PROMPTS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator for Groq/vLLM calls (handles 429 and 5xx)
+# Retry decorator for secondary/vLLM calls (handles 429 and 5xx)
 # ---------------------------------------------------------------------------
 
 def _is_retryable_vllm(exc: BaseException) -> bool:
@@ -177,7 +177,7 @@ def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) ->
     """
     Routing 3-poziomowy:
       1. Ollama LOCAL  (darmowy, brak limitu)
-      2. LLaMA API     (Groq/Together — tani cloud)
+      2. Cerebras/secondary (tani cloud, SECONDARY_API_KEY)
       3. OpenAI/vLLM   (fallback — zawsze działa)
     """
     messages = [
@@ -199,15 +199,15 @@ def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) ->
         except Exception as e:
             logger.warning("Ollama niedostępny (%s), przełączam na LLaMA API / OpenAI", e)
 
-    # ── 2. LLaMA API (Groq / Together) ───────────────────────────────
-    if settings.groq_api_key:
+    # ── 2. Cerebras / secondary cloud ───────────────────────────────────
+    if settings.secondary_api_key:
         client = openai.OpenAI(
-            api_key=settings.groq_api_key,
-            base_url=settings.groq_base_url,
+            api_key=settings.secondary_api_key,
+            base_url=settings.secondary_base_url,
             max_retries=0,
         )
         resp = client.chat.completions.create(
-            model=settings.groq_model,
+            model=settings.secondary_model,
             messages=messages,
             temperature=settings.vllm_temperature,
             max_tokens=max_tokens,
