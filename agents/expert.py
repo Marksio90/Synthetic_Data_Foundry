@@ -19,6 +19,7 @@ Groq routing (primary when GROQ_API_KEY is set):
 from __future__ import annotations
 
 import logging
+import re as _re
 
 import openai
 from sqlalchemy.orm import Session
