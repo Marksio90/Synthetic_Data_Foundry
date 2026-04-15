@@ -282,7 +282,7 @@ export default function AutopilotPage() {
               <div className="flex items-center gap-2">
                 <span className="text-sm text-text-muted">Domena:</span>
                 <span className={`badge ${domainColor}`}>
-                  {analysis.domain_label} — {(analysis.domain_confidence * 100).toFixed(0)}%
+                  {analysis.domain_label} — {((analysis.domain_confidence ?? 0) * 100).toFixed(0)}%
                 </span>
               </div>
             </div>
@@ -317,9 +317,9 @@ export default function AutopilotPage() {
             <div>
               <p className="text-sm text-text-muted mb-2">Kalibracja:</p>
               <div className="grid grid-cols-3 gap-3">
-                <MetricCard label="Próg jakości" value={analysis.calibration.quality_threshold.toFixed(2)} />
-                <MetricCard label="Maks. tury" value={analysis.calibration.max_turns} />
-                <MetricCard label="Adwersarial" value={(analysis.calibration.adversarial_ratio * 100).toFixed(0) + '%'} />
+                <MetricCard label="Próg jakości" value={(analysis.calibration?.quality_threshold ?? 0).toFixed(2)} />
+                <MetricCard label="Maks. tury" value={analysis.calibration?.max_turns ?? '—'} />
+                <MetricCard label="Adwersarial" value={((analysis.calibration?.adversarial_ratio ?? 0) * 100).toFixed(0) + '%'} />
               </div>
             </div>
 
@@ -505,7 +505,7 @@ export default function AutopilotPage() {
                 />
                 <MetricCard
                   label="Postęp"
-                  value={`${run.progress_pct.toFixed(1)}%`}
+                  value={`${(run.progress_pct ?? 0).toFixed(1)}%`}
                 />
                 <MetricCard
                   label="Q&A gotowych"
@@ -523,7 +523,7 @@ export default function AutopilotPage() {
               <div className="space-y-1">
                 <div className="flex justify-between text-xs text-text-muted">
                   <span>Chunks: {run.chunks_done} / {run.chunks_total}</span>
-                  <span>{run.elapsed_seconds.toFixed(0)}s</span>
+                  <span>{(run.elapsed_seconds ?? 0).toFixed(0)}s</span>
                 </div>
                 <div className="w-full bg-bg-surface2 rounded-full h-2">
                   <div
