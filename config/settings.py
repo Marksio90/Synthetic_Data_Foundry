@@ -60,29 +60,47 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # LLaMA API — cloud LLaMA (secondary, tani)
-    # Groq: https://console.groq.com — do 200k TPM gratis (GROQ_API_KEY)
-    # Together: https://api.together.xyz — alternatywa
+    # SECONDARY provider — OpenAI-compatible cloud endpoint
+    # Używany gdy Ollama niedostępny. Obsługuje DOWOLNY OpenAI-compatible API:
+    #
+    #   OpenRouter (REKOMENDOWANE — darmowe modele LLaMA):
+    #     GROQ_API_KEY=sk-or-XXXX
+    #     GROQ_BASE_URL=https://openrouter.ai/api/v1
+    #     GROQ_MODEL=meta-llama/llama-3.1-8b-instruct:free   ← całkowicie darmowy
+    #     (lub: meta-llama/llama-3.3-70b-instruct:free)
+    #     Klucz: https://openrouter.ai/keys
+    #
+    #   Cerebras (1M tokenów/dzień FREE, ultraszybki):
+    #     GROQ_API_KEY=csk-XXXX
+    #     GROQ_BASE_URL=https://api.cerebras.ai/v1
+    #     GROQ_MODEL=llama3.1-8b
+    #     Klucz: https://cloud.cerebras.ai
+    #
+    #   Together AI (bardzo tani, $0.18/1M tokenów):
+    #     GROQ_API_KEY=XXXX
+    #     GROQ_BASE_URL=https://api.together.xyz/v1
+    #     GROQ_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo
+    #     Klucz: https://api.together.xyz
+    #
+    #   Groq (pierwotny, 200k TPM free — za mało dla prod):
+    #     GROQ_BASE_URL=https://api.groq.com/openai/v1
+    #     GROQ_MODEL=llama-3.1-8b-instant
     # ------------------------------------------------------------------
     groq_api_key: str = Field(
         "",
-        description=(
-            "Klucz do LLaMA API (Groq lub Together AI). "
-            "Groq: https://console.groq.com (darmowe 200k TPM). "
-            "Używany jako SECONDARY po Ollama, przed OpenAI."
-        ),
+        description="Klucz do secondary providera (OpenRouter/Cerebras/Together/Groq).",
     )
     groq_base_url: str = Field(
-        "https://api.groq.com/openai/v1",
-        description="Base URL dla LLaMA API. Groq: https://api.groq.com/openai/v1",
+        "https://openrouter.ai/api/v1",
+        description="Base URL dla secondary providera. Default: OpenRouter.",
     )
     groq_model: str = Field(
-        "llama-3.1-8b-instant",
+        "meta-llama/llama-3.1-8b-instruct:free",
         description=(
-            "Model LLaMA API. "
-            "Groq llama-3.1-8b-instant: 200k TPM free — zalecany. "
-            "Groq llama-3.3-70b-versatile: lepsza jakość (12k TPM free). "
-            "Together meta-llama/Llama-3.1-8B-Instruct-Turbo: alternatywa."
+            "Model secondary providera. "
+            "OpenRouter free: meta-llama/llama-3.1-8b-instruct:free. "
+            "Cerebras: llama3.1-8b. "
+            "Together: meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo."
         ),
     )
 
