@@ -113,11 +113,11 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(..., description="OpenAI secret key")
     openai_primary_model: str = Field("gpt-4o-mini")
     openai_fallback_model: str = Field(
-        "gpt-4o-mini",
+        "gpt-4o",
         description=(
-            "Fallback sędziego gdy pewność < próg. "
-            "gpt-4o-mini: ~15× taniej niż gpt-4o, wystarczający dla ewaluacji. "
-            "Zmień na gpt-4o tylko jeśli potrzebujesz najwyższej jakości ocen."
+            "Fallback sędziego gdy pewność < próg jakości (~5% przypadków). "
+            "gpt-4o: 15× droższy od mini, ale wywołany rzadko — wart dla jakości datasetu. "
+            "Ustaw gpt-4o-mini aby wyłączyć kaskadę i oszczędzać."
         ),
     )
     openai_embedding_model: str = Field("text-embedding-3-small")
