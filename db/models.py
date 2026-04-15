@@ -23,7 +23,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 
@@ -75,6 +75,8 @@ class DirectiveChunk(Base):
         UUID(as_uuid=True), ForeignKey("directive_chunks.id"), nullable=True
     )
     section_heading: Optional[str] = Column(Text)
+    # Full-text search vector (populated by trg_chunk_fts trigger)
+    fts_vector: Optional[str] = Column(TSVECTOR, nullable=True)
     # ACID status (Self-Check idempotency)
     status: str = Column(Text, nullable=False, default="new")
     retry_count: int = Column(SmallInteger, nullable=False, default=0)
