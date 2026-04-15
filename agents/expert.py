@@ -11,7 +11,8 @@ Two-phase operation:
     forces the refusal phrase "Brak danych w dyrektywie".
 
 Groq routing (primary when GROQ_API_KEY is set):
-  Uses Llama 3.3 70B via Groq API for answer generation.
+  Domyślnie llama-3.1-8b-instant (200k TPM free tier).
+  Zmień GROQ_MODEL=llama-3.3-70b-versatile dla wyższej jakości (12k TPM).
   Falls back to VLLM_BASE_URL / OpenAI when GROQ_API_KEY is empty.
 """
 
