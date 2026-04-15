@@ -324,7 +324,7 @@ export default function TreningPage() {
       {tab === 'trening' && (
         <div className="space-y-5">
           {!trainRunning && !trainRun ? (
-            <div className="card p-6 space-y-5 max-w-lg">
+            <div className="card p-6 space-y-5 max-w-2xl">
               <h3 className="font-semibold text-text">Konfiguracja treningu LoRA</h3>
 
               {trainError && <div className="alert-error">{trainError}</div>}

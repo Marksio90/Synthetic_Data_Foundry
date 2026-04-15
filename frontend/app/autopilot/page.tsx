@@ -189,7 +189,7 @@ export default function AutopilotPage() {
     : '';
 
   return (
-    <div className="space-y-8 max-w-4xl">
+    <div className="space-y-8 w-full">
       <div className="flex items-center gap-2">
         <Zap className="w-6 h-6 text-accent" />
         <h1 className="text-2xl font-bold text-text">AutoPilot</h1>

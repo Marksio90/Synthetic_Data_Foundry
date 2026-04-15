@@ -30,38 +30,79 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Local LLM (vLLM)
+    # Ollama — LOCAL model (primary, zero cost)
+    # Działa na 32 GB RAM. Zalecane modele:
+    #   llama3.2        (~2 GB)  — szybki, dobry do Q&A
+    #   llama3.1:8b     (~4.7 GB) — wyższa jakość
+    #   mistral         (~4.1 GB) — dobry do długich dokumentów
+    # Uruchom: ollama pull llama3.1:8b
+    # ------------------------------------------------------------------
+    ollama_model: str = Field(
+        "llama3.1:8b",
+        description=(
+            "Model Ollama do generowania Q&A (PRIMARY, darmowy, lokalny). "
+            "Ustaw pusty string '' aby pominąć Ollama i przejść do LLaMA API."
+        ),
+    )
+    ollama_embed_model: str = Field(
+        "nomic-embed-text",
+        description=(
+            "Model Ollama do embeddingów (darmowy, 0.3 GB RAM). "
+            "Ustaw '' aby używać OpenAI text-embedding-3-small."
+        ),
+    )
+    use_local_embeddings: bool = Field(
+        False,
+        description=(
+            "Gdy True: embeddingi przez Ollama nomic-embed-text (darmowe, lokalne). "
+            "Gdy False: embeddingi przez OpenAI (płatne, wyższa jakość)."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # LLaMA API — cloud LLaMA (secondary, tani)
+    # Groq: https://console.groq.com — do 200k TPM gratis (GROQ_API_KEY)
+    # Together: https://api.together.xyz — alternatywa
+    # ------------------------------------------------------------------
+    groq_api_key: str = Field(
+        "",
+        description=(
+            "Klucz do LLaMA API (Groq lub Together AI). "
+            "Groq: https://console.groq.com (darmowe 200k TPM). "
+            "Używany jako SECONDARY po Ollama, przed OpenAI."
+        ),
+    )
+    groq_base_url: str = Field(
+        "https://api.groq.com/openai/v1",
+        description="Base URL dla LLaMA API. Groq: https://api.groq.com/openai/v1",
+    )
+    groq_model: str = Field(
+        "llama-3.1-8b-instant",
+        description=(
+            "Model LLaMA API. "
+            "Groq llama-3.1-8b-instant: 200k TPM free — zalecany. "
+            "Groq llama-3.3-70b-versatile: lepsza jakość (12k TPM free). "
+            "Together meta-llama/Llama-3.1-8B-Instruct-Turbo: alternatywa."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Fallback endpoint (OpenAI-compatible, np. vLLM)
     # ------------------------------------------------------------------
     vllm_base_url: str = Field(
         "https://api.openai.com/v1",
         description=(
-            "OpenAI-compatible endpoint. Opcje:\n"
-            "  OpenAI:  https://api.openai.com/v1 (model: gpt-4o-mini)\n"
-            "  Gemini:  https://generativelanguage.googleapis.com/v1beta/openai/ (model: gemini-2.0-flash-lite)\n"
-            "  Together: https://api.together.xyz/v1 (model: meta-llama/Llama-3.1-8B-Instruct-Turbo)\n"
-            "  Local:   http://ollama:11434/v1 (model: llama3.1:8b)"
+            "OpenAI-compatible endpoint (fallback gdy Ollama i LLaMA API niedostępne).\n"
+            "  OpenAI:   https://api.openai.com/v1\n"
+            "  Together: https://api.together.xyz/v1\n"
+            "  Local:    http://ollama:11434/v1"
         ),
     )
-    vllm_model: str = Field("llama3")
-    vllm_api_key: str = Field("not-needed", description="'not-needed' for local vLLM; set to openai_api_key when routing through OpenAI")
+    vllm_model: str = Field("gpt-4o-mini")
+    vllm_api_key: str = Field("not-needed", description="'not-needed' dla lokalnego; ustaw openai_api_key gdy przez OpenAI")
     vllm_temperature: float = Field(0.7)
-    vllm_max_tokens: int = Field(1536,
-        description="Max tokens for expert generation (increased to accommodate CoT reasoning block)")
-
-    # ------------------------------------------------------------------
-    # Groq (primary question/answer generator)
-    # ------------------------------------------------------------------
-    groq_api_key: str = Field("", description="Groq API key — https://console.groq.com")
-    groq_base_url: str = Field("https://api.groq.com/openai/v1")
-    groq_model: str = Field(
-        "llama-3.1-8b-instant",
-        description=(
-            "Model Groq do generowania Q&A. "
-            "llama-3.1-8b-instant: 200 000 TPM (free tier) — zalecany. "
-            "llama-3.3-70b-versatile: lepszy, ale tylko 12 000 TPM free tier. "
-            "mixtral-8x7b-32768: 20 000 TPM, dobry balans jakości/limitu."
-        ),
-    )
+    vllm_max_tokens: int = Field(2048,
+        description="Max tokenów dla eksperta (zwiększone dla lepszego CoT)")
 
     # ------------------------------------------------------------------
     # OpenAI (Judge + Embeddings)
