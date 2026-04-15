@@ -60,46 +60,32 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # SECONDARY provider — OpenAI-compatible cloud endpoint
-    # Używany gdy Ollama niedostępny. Obsługuje DOWOLNY OpenAI-compatible API:
+    # SECONDARY provider — cloud fallback gdy Ollama niedostępny
     #
-    #   OpenRouter (REKOMENDOWANE — darmowe modele LLaMA):
-    #     GROQ_API_KEY=sk-or-XXXX
-    #     GROQ_BASE_URL=https://openrouter.ai/api/v1
-    #     GROQ_MODEL=meta-llama/llama-3.1-8b-instruct:free   ← całkowicie darmowy
-    #     (lub: meta-llama/llama-3.3-70b-instruct:free)
-    #     Klucz: https://openrouter.ai/keys
+    # WYBÓR: Cerebras (rekomendowany — 1M tokenów/dzień FREE, ultraszybki)
+    #   Klucz: https://cloud.cerebras.ai → Sign up → API Keys
+    #   Model: llama3.1-8b (identyczny z Ollama lokalnym = spójne wyniki)
+    #   Prędkość: 2000+ tokenów/sek (10× szybszy niż Groq)
     #
-    #   Cerebras (1M tokenów/dzień FREE, ultraszybki):
-    #     GROQ_API_KEY=csk-XXXX
-    #     GROQ_BASE_URL=https://api.cerebras.ai/v1
-    #     GROQ_MODEL=llama3.1-8b
-    #     Klucz: https://cloud.cerebras.ai
-    #
-    #   Together AI (bardzo tani, $0.18/1M tokenów):
-    #     GROQ_API_KEY=XXXX
-    #     GROQ_BASE_URL=https://api.together.xyz/v1
-    #     GROQ_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo
-    #     Klucz: https://api.together.xyz
-    #
-    #   Groq (pierwotny, 200k TPM free — za mało dla prod):
-    #     GROQ_BASE_URL=https://api.groq.com/openai/v1
-    #     GROQ_MODEL=llama-3.1-8b-instant
+    # Alternatywy (zmień tylko 3 zmienne w .env):
+    #   OpenRouter free:  openrouter.ai/api/v1  | meta-llama/llama-3.1-8b-instruct:free
+    #   Together AI paid: api.together.xyz/v1   | meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo ($0.18/1M)
+    #   Groq:             api.groq.com/openai/v1| llama-3.1-8b-instant (200k TPM free, za mało dla prod)
     # ------------------------------------------------------------------
     groq_api_key: str = Field(
         "",
-        description="Klucz do secondary providera (OpenRouter/Cerebras/Together/Groq).",
+        description="Klucz do secondary providera. Cerebras: https://cloud.cerebras.ai",
     )
     groq_base_url: str = Field(
-        "https://openrouter.ai/api/v1",
-        description="Base URL dla secondary providera. Default: OpenRouter.",
+        "https://api.cerebras.ai/v1",
+        description="Base URL secondary providera. Default: Cerebras.",
     )
     groq_model: str = Field(
-        "meta-llama/llama-3.1-8b-instruct:free",
+        "llama3.1-8b",
         description=(
             "Model secondary providera. "
+            "Cerebras: llama3.1-8b lub llama3.3-70b. "
             "OpenRouter free: meta-llama/llama-3.1-8b-instruct:free. "
-            "Cerebras: llama3.1-8b. "
             "Together: meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo."
         ),
     )
