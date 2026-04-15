@@ -24,6 +24,9 @@ const NAV_ITEMS = [
   { href: '/chatbot', icon: MessageSquare, label: 'Chatbot' },
 ];
 
+// Use absolute URL so the browser calls the API directly (avoids build-time proxy baking)
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
+
 export default function Sidebar() {
   const pathname = usePathname();
   const [expanded, setExpanded] = useState(false);
@@ -33,7 +36,7 @@ export default function Sidebar() {
     let cancelled = false;
     async function checkHealth() {
       try {
-        const res = await fetch('/health', { cache: 'no-store' });
+        const res = await fetch(`${API}/health`, { cache: 'no-store' });
         if (!cancelled) setHealthy(res.ok);
       } catch {
         if (!cancelled) setHealthy(false);
