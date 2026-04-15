@@ -140,7 +140,7 @@ export default function AutopilotPage() {
     try {
       const payload: Record<string, unknown> = {
         filenames: Array.from(selectedDocs),
-        chunk_limit: chunkLimit > 0 ? chunkLimit : null,
+        chunk_limit: chunkLimit > 0 ? chunkLimit : 0,
       };
       if (batchId.trim()) payload.batch_id = batchId.trim();
       if (overrideQuality) payload.quality_threshold = qualityThreshold;
