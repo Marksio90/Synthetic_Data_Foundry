@@ -60,29 +60,33 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # LLaMA API — cloud LLaMA (secondary, tani)
-    # Groq: https://console.groq.com — do 200k TPM gratis (GROQ_API_KEY)
-    # Together: https://api.together.xyz — alternatywa
+    # SECONDARY provider — cloud fallback gdy Ollama niedostępny
+    #
+    # WYBÓR: Cerebras (rekomendowany — 1M tokenów/dzień FREE, ultraszybki)
+    #   Klucz: https://cloud.cerebras.ai → Sign up → API Keys
+    #   Model: llama3.1-8b (identyczny z Ollama lokalnym = spójne wyniki)
+    #   Prędkość: 2000+ tokenów/sek (10× szybszy niż Groq)
+    #
+    # Alternatywy (zmień tylko 3 zmienne w .env):
+    #   OpenRouter free:  openrouter.ai/api/v1  | meta-llama/llama-3.1-8b-instruct:free
+    #   Together AI paid: api.together.xyz/v1   | meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo ($0.18/1M)
+    #   Groq:             api.groq.com/openai/v1| llama-3.1-8b-instant (200k TPM free, za mało dla prod)
     # ------------------------------------------------------------------
     groq_api_key: str = Field(
         "",
-        description=(
-            "Klucz do LLaMA API (Groq lub Together AI). "
-            "Groq: https://console.groq.com (darmowe 200k TPM). "
-            "Używany jako SECONDARY po Ollama, przed OpenAI."
-        ),
+        description="Klucz do secondary providera. Cerebras: https://cloud.cerebras.ai",
     )
     groq_base_url: str = Field(
-        "https://api.groq.com/openai/v1",
-        description="Base URL dla LLaMA API. Groq: https://api.groq.com/openai/v1",
+        "https://api.cerebras.ai/v1",
+        description="Base URL secondary providera. Default: Cerebras.",
     )
     groq_model: str = Field(
-        "llama-3.1-8b-instant",
+        "llama3.1-8b",
         description=(
-            "Model LLaMA API. "
-            "Groq llama-3.1-8b-instant: 200k TPM free — zalecany. "
-            "Groq llama-3.3-70b-versatile: lepsza jakość (12k TPM free). "
-            "Together meta-llama/Llama-3.1-8B-Instruct-Turbo: alternatywa."
+            "Model secondary providera. "
+            "Cerebras: llama3.1-8b lub llama3.3-70b. "
+            "OpenRouter free: meta-llama/llama-3.1-8b-instruct:free. "
+            "Together: meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo."
         ),
     )
 
