@@ -402,7 +402,7 @@ export default function TreningPage() {
               {trainRun && (
                 <div className="grid grid-cols-2 gap-3">
                   <div className="metric-card">
-                    <div className="metric-value">{trainRun.elapsed_seconds.toFixed(0)}s</div>
+                    <div className="metric-value">{(trainRun.elapsed_seconds ?? 0).toFixed(0)}s</div>
                     <div className="metric-label">Czas</div>
                   </div>
                   <div className="metric-card">
@@ -463,7 +463,7 @@ export default function TreningPage() {
                         <StatusBadge status={run.status} />
                       </td>
                       <td className="px-4 py-3 text-right text-text-muted text-xs">
-                        {run.elapsed_seconds.toFixed(0)}s
+                        {(run.elapsed_seconds ?? 0).toFixed(0)}s
                       </td>
                       <td className="px-4 py-3 text-center">
                         {run.status === 'done' && (

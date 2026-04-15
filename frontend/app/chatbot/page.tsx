@@ -211,7 +211,7 @@ export default function ChatbotPage() {
                   ? <option value="">Brak dostępnych modeli</option>
                   : models.map(m => (
                     <option key={m.name} value={m.name}>
-                      {m.name} ({m.size_gb.toFixed(1)} GB)
+                      {m.name} ({(m.size_gb ?? 0).toFixed(1)} GB)
                     </option>
                   ))
                 }

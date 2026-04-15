@@ -128,15 +128,15 @@ export default function DatasetPage() {
         <div className="space-y-3">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div className="metric-card">
-              <div className="metric-value">{stats.total.toLocaleString('pl-PL')}</div>
+              <div className="metric-value">{(stats.total ?? 0).toLocaleString('pl-PL')}</div>
               <div className="metric-label">Total próbek</div>
             </div>
             <div className="metric-card">
-              <div className="metric-value">{formatScore(stats.avg_quality_score)}</div>
+              <div className="metric-value">{formatScore(stats.avg_quality_score ?? 0)}</div>
               <div className="metric-label">Średni wynik</div>
             </div>
             <div className="metric-card">
-              <div className="metric-value">{stats.dpo_pairs.toLocaleString('pl-PL')}</div>
+              <div className="metric-value">{(stats.dpo_pairs ?? 0).toLocaleString('pl-PL')}</div>
               <div className="metric-label">Pary DPO</div>
             </div>
             <div className="metric-card">
