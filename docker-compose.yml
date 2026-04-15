@@ -226,24 +226,24 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # Streamlit UI — interfejs uzytkownika
+  # Next.js / React frontend — zastępuje Streamlit UI
   #
-  # Uruchomienie: docker compose up -d foundry-ui
-  # Dostep:       http://localhost:8501
+  # Uruchomienie: docker compose up -d frontend
+  # Dostep:       http://localhost:3000
   # ---------------------------------------------------------------------------
-  foundry-ui:
+  frontend:
     build:
-      context: .
-      dockerfile: docker/Dockerfile.ui
-    container_name: foundry_ui
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8080
+    container_name: foundry_frontend
     restart: unless-stopped
     environment:
+      NEXT_PUBLIC_API_URL: http://foundry-api:8080
       API_URL: http://foundry-api:8080
-      OLLAMA_URL: http://ollama:11434
     ports:
-      - "8501:8501"
-    volumes:
-      - ./ui:/app/ui:ro
+      - "3000:3000"
     mem_limit: 512m
     memswap_limit: 512m
     cpus: "1.0"
