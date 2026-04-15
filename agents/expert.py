@@ -12,7 +12,7 @@ Two-phase operation:
 
 Provider routing (priority order):
   1. Ollama LOCAL  (darmowy, ~4.7 GB RAM dla llama3.1:8b)
-  2. LLaMA API     (Groq/Together — tani cloud)
+  2. Cerebras/secondary (tani cloud, SECONDARY_API_KEY)
   3. OpenAI / vLLM (fallback — zawsze działa)
 
 Embeddings routing:
@@ -93,17 +93,17 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
 }
 
 # Max context chars — increased for local Ollama (no token cost) and larger context windows.
-# Ollama llama3.1:8b supports 128k context; Groq/OpenAI gpt-4o-mini supports 128k.
+# Ollama llama3.1:8b supports 128k context; Cerebras/OpenAI gpt-4o-mini supports 128k.
 # We cap at 6000 chars (~1500 tokens) to leave room for question + history + answer.
 _MAX_CONTEXT_CHARS = 6000
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator for Groq/vLLM calls (handles 429 and 5xx)
+# Retry decorator for secondary/vLLM calls (handles 429 and 5xx)
 # ---------------------------------------------------------------------------
 
 def _is_tpd_limit(exc: BaseException) -> bool:
-    """Zwraca True gdy Groq zwraca dzienny limit TPD (nie minutowy TPM)."""
+    """Zwraca True gdy secondary provider zwraca dzienny limit TPD (nie minutowy TPM)."""
     return isinstance(exc, openai.RateLimitError) and "tokens per day" in str(exc).lower()
 
 
@@ -118,9 +118,9 @@ def _is_retryable_vllm(exc: BaseException) -> bool:
     return False
 
 
-def _parse_groq_retry_after(exc: BaseException) -> float:
+def _parse_secondary_retry_after(exc: BaseException) -> float:
     """
-    Parsuje czas oczekiwania z komunikatu Groq 429.
+    Parsuje czas oczekiwania z komunikatu 429 (retry-after hint).
     Obsługuje formaty:
       - 'try again in 8.69s'      → 8.69s
       - 'try again in 21m17.856s' → 1277.856s
@@ -138,14 +138,14 @@ def _parse_groq_retry_after(exc: BaseException) -> float:
     return settings.tenacity_initial_wait
 
 
-def _groq_aware_wait(retry_state) -> float:  # type: ignore[return]
+def _secondary_aware_wait(retry_state) -> float:  # type: ignore[return]
     """
-    Respects Groq's 'retry-after' hint from 429 body.
+    Respects provider 'retry-after' hint from 429 body.
     Falls back to exponential backoff for other errors.
     """
     exc = retry_state.outcome.exception()
     if exc and isinstance(exc, openai.RateLimitError):
-        return _parse_groq_retry_after(exc)
+        return _parse_secondary_retry_after(exc)
     # Exponential for 5xx
     return min(
         settings.tenacity_initial_wait * (2 ** max(0, retry_state.attempt_number - 1)),
@@ -157,7 +157,7 @@ def _retry_vllm(func):
     return retry(
         reraise=True,
         retry=retry_if_exception(_is_retryable_vllm),
-        wait=_groq_aware_wait,
+        wait=_secondary_aware_wait,
         stop=stop_after_attempt(settings.tenacity_max_attempts),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )(func)
@@ -173,7 +173,7 @@ def _call_provider(messages: list[dict]) -> str:
     """
     Routing 3-poziomowy dla odpowiedzi (długich — max vllm_max_tokens):
       1. Ollama LOCAL  (darmowy, brak limitu)
-      2. LLaMA API     (Groq/Together — tani cloud)
+      2. Cerebras/secondary (tani cloud, SECONDARY_API_KEY)
       3. OpenAI/vLLM   (fallback — zawsze działa)
     """
     max_tok = settings.vllm_max_tokens
@@ -192,15 +192,15 @@ def _call_provider(messages: list[dict]) -> str:
         except Exception as e:
             logger.warning("Ollama niedostępny (%s), przełączam na LLaMA API / OpenAI", e)
 
-    # ── 2. LLaMA API (Groq / Together) ───────────────────────────────
-    if settings.groq_api_key:
+    # ── 2. Cerebras / secondary cloud ───────────────────────────────────
+    if settings.secondary_api_key:
         client = openai.OpenAI(
-            api_key=settings.groq_api_key,
-            base_url=settings.groq_base_url,
+            api_key=settings.secondary_api_key,
+            base_url=settings.secondary_base_url,
             max_retries=0,
         )
         resp = client.chat.completions.create(
-            model=settings.groq_model,
+            model=settings.secondary_model,
             messages=messages,
             temperature=settings.vllm_temperature,
             max_tokens=max_tok,
@@ -293,7 +293,7 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
 
 def generate_answer(state: FoundryState) -> dict:
     """
-    Phase 2: Generate grounded answer using Groq/vLLM.
+    Phase 2: Generate grounded answer using Ollama/secondary/OpenAI.
     Uses perspective-aware system prompt and conversation history for follow-up turns.
     Returns {"answer": ...}.
     """

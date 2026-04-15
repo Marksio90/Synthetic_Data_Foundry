@@ -43,11 +43,11 @@
 #       --sft-model  /app/output/models/sft \
 #       --output-dir /app/output/models
 #
-# --- CHATBOT ---
-#   docker compose --profile chatbot up -d               # uruchom Ollama + WebUI
-#   docker compose --profile chatbot down                # zatrzymaj
-#   docker exec foundry_ollama ollama pull llama3.2      # pobierz gotowy model
-#   docker exec foundry_ollama ollama create NAZWA -f /Modelfile  # zaladuj wlasny model
+# --- CHATBOT (Open WebUI) ---
+#   docker compose --profile chatbot up -d               # uruchom Open WebUI (Ollama już startuje domyślnie)
+#   docker compose --profile chatbot down                # zatrzymaj WebUI
+#   docker exec foundry_ollama ollama list               # lista pobranych modeli
+#   docker exec foundry_ollama ollama pull llama3.3:70b  # dodaj model ręcznie
 #
 # --- LOCAL GPU (vLLM zamiast OpenAI) ---
 #   docker compose --profile gpu up -d vllm
@@ -79,8 +79,15 @@ x-app-env: &app-env
   OPENAI_API_KEY: ${OPENAI_API_KEY:?Ustaw OPENAI_API_KEY w pliku .env}
   OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
   OPENAI_FALLBACK_MODEL: ${OPENAI_FALLBACK_MODEL:-gpt-4o-mini}
-  # Generacja Q&A: OpenAI gpt-4o-mini (domyślny — zero konfiguracji, bez limitów dobowych)
-  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  # Ollama LOCAL — primary generator (free, runs on laptop)
+  OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+  OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+  USE_LOCAL_EMBEDDINGS: ${USE_LOCAL_EMBEDDINGS:-false}
+  # Secondary provider — Cerebras/OpenRouter cloud fallback
+  SECONDARY_API_KEY: ${SECONDARY_API_KEY:-}
+  SECONDARY_BASE_URL: ${SECONDARY_BASE_URL:-https://api.cerebras.ai/v1}
+  SECONDARY_MODEL: ${SECONDARY_MODEL:-llama3.1-8b}
   VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
   VLLM_MODEL: ${VLLM_MODEL:-gpt-4o-mini}
   VLLM_API_KEY: ${OPENAI_API_KEY}
@@ -181,6 +188,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
     networks:
       - foundry_net
     logging: *default-logging
@@ -201,7 +210,6 @@ services:
     environment:
       <<: *app-env
       DEEPL_API_KEY: ${DEEPL_API_KEY:-}
-      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       DATA_DIR: /app/data
       POSTGRES_USER: ${POSTGRES_USER:-esg_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -250,7 +258,8 @@ services:
     memswap_limit: 512m
     cpus: "1.0"
     depends_on:
-      - foundry-api
+      foundry-api:
+        condition: service_started
     networks:
       - foundry_net
     logging: *default-logging
@@ -305,25 +314,18 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # Ollama — serwer modeli GGUF (profil chatbot)
+  # Ollama — lokalny serwer LLM (PRIMARY generator Q&A — darmowy)
   #
-  # Uruchomienie: docker compose --profile chatbot up -d
-  # Zatrzymanie:  docker compose --profile chatbot down
+  # Modele są pobierane automatycznie przez ollama-init przy pierwszym uruchomieniu.
+  # Ponowne uruchomienie sprawdza czy model już istnieje — NIE pobiera ponownie.
   #
-  # Zaladowanie gotowego modelu z internetu:
-  #   docker exec foundry_ollama ollama pull llama3.2
-  #   docker exec foundry_ollama ollama pull phi4-mini
-  #
-  # Zaladowanie wlasnego modelu (po eksporcie):
-  #   docker cp output/model.gguf foundry_ollama:/models/model.gguf
-  #   docker cp output/Modelfile  foundry_ollama:/Modelfile
-  #   docker exec foundry_ollama ollama create NAZWA-MODELU -f /Modelfile
-  #
-  # Lista zaladowanych modeli:
-  #   docker exec foundry_ollama ollama list
+  # Ręczne operacje:
+  #   docker exec foundry_ollama ollama list                        # lista modeli
+  #   docker exec foundry_ollama ollama pull llama3.3:70b           # dodaj model
+  #   docker cp output/model.gguf foundry_ollama:/tmp/model.gguf    # własny model
+  #   docker exec foundry_ollama ollama create my-model -f /tmp/Modelfile
   # ---------------------------------------------------------------------------
   ollama:
-    profiles: [chatbot]
     image: ollama/ollama:latest
     container_name: foundry_ollama
     restart: unless-stopped
@@ -331,15 +333,46 @@ services:
       - ollama_models:/root/.ollama
     ports:
       - "11434:11434"
-    mem_limit: 8g
-    memswap_limit: 8g
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    mem_limit: 10g
+    memswap_limit: 10g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # ollama-init — automatyczne pobranie modeli przy starcie (idempotentne)
+  #
+  # Uruchamia się RAZ przy każdym `docker compose up`.
+  # Sprawdza czy modele już istnieją — nie pobiera ponownie jeśli są aktualne.
+  # Modele do pobrania kontrolowane przez .env: OLLAMA_MODEL, OLLAMA_EMBED_MODEL
+  # ---------------------------------------------------------------------------
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: foundry_ollama_init
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+    entrypoint: ["/bin/sh", "-c", "
+      echo '=== Foundry: sprawdzam modele Ollama ===' &&
+      echo \"Model główny: $$OLLAMA_MODEL\" &&
+      ollama pull $$OLLAMA_MODEL &&
+      echo \"Model embeddingów: $$OLLAMA_EMBED_MODEL\" &&
+      ollama pull $$OLLAMA_EMBED_MODEL &&
+      echo '=== Modele gotowe. Foundry startuje! ==='
+    "]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_models:/root/.ollama
     networks:
       - foundry_net
     logging: *default-logging

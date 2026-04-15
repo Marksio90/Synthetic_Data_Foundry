@@ -395,10 +395,10 @@ def main() -> None:
                         chunk_ready = True
                 except openai.RateLimitError as exc:
                     if _is_tpd_limit(exc):
-                        # Groq dzienny limit wyczerpany — nie ma sensu kontynuować
+                        # Dzienny limit TPD wyczerpany — nie ma sensu kontynuować
                         logger.critical(
-                            "⛔ Groq dzienny limit TPD wyczerpany! Poczekaj do północy (UTC) "
-                            "lub zmień model: GROQ_MODEL=llama-3.1-8b-instant. Błąd: %s", exc
+                            "⛔ Dzienny limit TPD wyczerpany! Poczekaj do północy (UTC) "
+                            "lub zmień providera: SECONDARY_API_KEY / SECONDARY_MODEL. Błąd: %s", exc
                         )
                         sys.exit(1)
                     logger.error(
@@ -415,9 +415,9 @@ def main() -> None:
             else:
                 total_unresolvable += 1
 
-            # Throttle — prevents Groq/OpenAI 429 rate-limit storms.
-            # Groq free tier: 12k TPM. Each chunk uses ~2k tokens × 3 perspectives = 6k tokens.
-            # At 2s delay the effective throughput is ~30 chunks/min which stays under the limit.
+            # Throttle — prevents secondary/OpenAI 429 rate-limit storms.
+            # Cerebras: 1M tokens/day free. Each chunk uses ~2k tokens × 3 perspectives = 6k tokens.
+            # CHUNK_DELAY_SECONDS=0 for Ollama/OpenAI; set 1-3 if secondary provider rate-limits.
             if settings.chunk_delay_seconds > 0:
                 time.sleep(settings.chunk_delay_seconds)
 
