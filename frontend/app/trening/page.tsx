@@ -452,7 +452,7 @@ export default function TreningPage() {
               </div>
 
               {trainRun && (() => {
-                const tp = parseTrainProgress(trainLogs, trainRun.config?.epochs ?? epochs);
+                const tp = parseTrainProgress(trainLogs, epochs);
                 const barStatus = trainRun.status === 'error' ? 'error' : trainRun.status === 'done' ? 'done' : 'running';
                 const hasProgress = tp.pct !== undefined;
                 const progressLabel = tp.totalSteps
