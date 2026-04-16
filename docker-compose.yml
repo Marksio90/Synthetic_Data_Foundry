@@ -231,6 +231,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
     networks:
       - foundry_net
     logging: *default-logging
