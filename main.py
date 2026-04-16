@@ -421,13 +421,12 @@ def main() -> None:
             if settings.chunk_delay_seconds > 0:
                 time.sleep(settings.chunk_delay_seconds)
 
-            if total_processed % 10 == 0:
-                logger.info(
-                    "Progress: %d chunks | %d ready | %d unresolvable | "
-                    "%d records | %d DPO pairs",
-                    total_processed, total_ready, total_unresolvable,
-                    writer.record_count, dpo_writer.pair_count,
-                )
+            logger.info(
+                "Progress: %d chunks | %d ready | %d unresolvable | "
+                "%d records | %d DPO pairs",
+                total_processed, total_ready, total_unresolvable,
+                writer.record_count, dpo_writer.pair_count,
+            )
 
     # ── Phase 3: Cross-document synthesis pass ───────────────────────────────
     if settings.cross_doc_samples > 0:
