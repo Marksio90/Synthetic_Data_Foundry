@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FileText, Upload, Trash2, RefreshCw, Database, File } from 'lucide-react';
 import type { Document } from '@/lib/api';
+import ProgressBar from '@/components/ProgressBar';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
 
@@ -16,6 +17,8 @@ export default function DokumentyPage() {
   const [docs, setDocs] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadLabel, setUploadLabel] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [dragging, setDragging] = useState(false);
@@ -42,23 +45,55 @@ export default function DokumentyPage() {
     else { setError(msg); setTimeout(() => setError(''), 5000); }
   };
 
-  const upload = async (files: FileList | File[]) => {
+  const upload = (files: FileList | File[]) => {
     const pdfs = Array.from(files).filter(f => f.name.endsWith('.pdf'));
     if (!pdfs.length) { notify('Wybierz pliki PDF.', 'err'); return; }
+
+    const totalBytes = pdfs.reduce((s, f) => s + f.size, 0);
+    const names = pdfs.length === 1 ? pdfs[0].name : `${pdfs.length} pliki (${(totalBytes / 1024 / 1024).toFixed(1)} MB)`;
+
     setUploading(true);
-    try {
-      const fd = new FormData();
-      pdfs.forEach(f => fd.append('files', f));
-      const res = await fetch(`${API}/api/documents/upload`, { method: 'POST', body: fd });
-      if (!res.ok) throw new Error((await res.json()).detail ?? 'Błąd uploadu');
-      const data = await res.json();
-      notify(`Przesłano ${data.count} plik(ów).`, 'ok');
-      await load();
-    } catch (e: unknown) {
-      notify(e instanceof Error ? e.message : 'Błąd uploadu', 'err');
-    } finally {
+    setUploadProgress(0);
+    setUploadLabel(names);
+
+    const fd = new FormData();
+    pdfs.forEach(f => fd.append('files', f));
+
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable) {
+        setUploadProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    });
+
+    xhr.addEventListener('load', async () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          notify(`Przesłano ${data.count} plik(ów).`, 'ok');
+        } catch { notify('Przesłano.', 'ok'); }
+        await load();
+      } else {
+        try {
+          const err = JSON.parse(xhr.responseText);
+          notify(err.detail ?? 'Błąd uploadu', 'err');
+        } catch { notify('Błąd uploadu', 'err'); }
+      }
       setUploading(false);
-    }
+      setUploadProgress(null);
+      setUploadLabel('');
+    });
+
+    xhr.addEventListener('error', () => {
+      notify('Błąd połączenia', 'err');
+      setUploading(false);
+      setUploadProgress(null);
+      setUploadLabel('');
+    });
+
+    xhr.open('POST', `${API}/api/documents/upload`);
+    xhr.send(fd);
   };
 
   const deleteDoc = async (filename: string) => {
@@ -100,15 +135,31 @@ export default function DokumentyPage() {
         onDragOver={e => { e.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
-        onClick={() => inputRef.current?.click()}
+        onClick={() => !uploading && inputRef.current?.click()}
         className={`
-          border-2 border-dashed rounded-lg p-10 text-center cursor-pointer transition-colors
-          ${dragging ? 'border-accent bg-accent/10' : 'border-border hover:border-accent/60 hover:bg-bg-surface2'}
+          border-2 border-dashed rounded-lg p-8 text-center transition-colors
+          ${uploading ? 'border-accent/60 bg-accent/5 cursor-default' : dragging ? 'border-accent bg-accent/10 cursor-copy' : 'border-border hover:border-accent/60 hover:bg-bg-surface2 cursor-pointer'}
         `}
       >
-        <Upload className="w-8 h-8 mx-auto mb-2 text-text-muted" />
-        <p className="text-text font-medium">{uploading ? 'Przesyłanie...' : 'Przeciągnij pliki PDF lub kliknij'}</p>
-        <p className="text-text-muted text-sm mt-1">Obsługuje wiele plików jednocześnie</p>
+        <Upload className={`w-8 h-8 mx-auto mb-2 ${uploading ? 'text-accent animate-bounce' : 'text-text-muted'}`} />
+        <p className="text-text font-medium">
+          {uploading ? `Przesyłanie: ${uploadLabel}` : 'Przeciągnij pliki PDF lub kliknij'}
+        </p>
+        <p className="text-text-muted text-sm mt-1">
+          {uploading ? '' : 'Obsługuje wiele plików jednocześnie'}
+        </p>
+        {uploadProgress !== null && (
+          <div className="mt-4 px-4">
+            <ProgressBar
+              value={uploadProgress}
+              max={100}
+              label="Wysyłanie…"
+              valueLabel={`${uploadProgress}%`}
+              status="running"
+              size="md"
+            />
+          </div>
+        )}
         <input ref={inputRef} type="file" accept=".pdf" multiple className="hidden"
           onChange={e => e.target.files && upload(e.target.files)} />
       </div>

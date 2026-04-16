@@ -3,6 +3,29 @@
 import { useCallback, useEffect, useRef, useState, KeyboardEvent } from 'react';
 import { MessageSquare, Send, Trash2, RefreshCw } from 'lucide-react';
 import type { ChatMessage, OllamaModel } from '@/lib/api';
+import ProgressBar from '@/components/ProgressBar';
+
+function parseEvalProgress(logs: string[], total: number): { done: number; pct: number } | null {
+  for (let i = logs.length - 1; i >= Math.max(0, logs.length - 30); i--) {
+    const line = logs[i];
+    // "Sample 5/10", "Próbka 5 z 10", "5/10"
+    const m = line.match(/\b(\d+)\s*[\/z]\s*(\d+)\b/);
+    if (m) {
+      const done = parseInt(m[1]);
+      const max = parseInt(m[2]);
+      if (done <= max && max > 0)
+        return { done, pct: (done / max) * 100 };
+    }
+    // "Evaluated: 5" or "evaluated 5"
+    const m2 = line.match(/evaluat(?:ed|ing)[:\s]+(\d+)/i);
+    if (m2) {
+      const done = parseInt(m2[1]);
+      if (total > 0)
+        return { done, pct: (done / total) * 100 };
+    }
+  }
+  return null;
+}
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
 
@@ -289,32 +312,44 @@ export default function ChatbotPage() {
             ) : '▶ Uruchom ewaluację'}
           </button>
 
-          {(evalStatus || evalLogs.length > 0) && (
-            <div className="space-y-1.5">
-              {evalStatus && (
-                <div className="flex items-center gap-2 text-xs">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      evalStatus === 'done' ? 'bg-success' :
-                      evalStatus === 'error' ? 'bg-error' :
-                      'bg-accent animate-pulse'
-                    }`}
-                  />
-                  <span className="text-text-muted">{evalStatus}</span>
-                </div>
-              )}
-              {evalLogs.length > 0 && (
-                <div
-                  ref={evalLogRef}
-                  className="log-box bg-black rounded border border-border h-32 overflow-y-auto p-2 font-mono text-xs text-green-400"
-                >
-                  {evalLogs.map((l, i) => (
-                    <div key={i} className="whitespace-pre-wrap break-all">{l}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          {(evalStatus || evalLogs.length > 0) && (() => {
+            const ep = parseEvalProgress(evalLogs, evalSamples);
+            const barStatus = evalStatus === 'done' ? 'done' : evalStatus === 'error' ? 'error' : 'running';
+            return (
+              <div className="space-y-2">
+                {evalStatus && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        evalStatus === 'done' ? 'bg-success' :
+                        evalStatus === 'error' ? 'bg-error' :
+                        'bg-accent animate-pulse'
+                      }`}
+                    />
+                    <span className="text-text-muted">{evalStatus}</span>
+                  </div>
+                )}
+                <ProgressBar
+                  value={ep ? ep.pct : (evalStatus === 'done' ? 100 : 0)}
+                  max={100}
+                  label={ep ? `Próbka ${ep.done} / ${evalSamples}` : `0 / ${evalSamples}`}
+                  status={barStatus}
+                  size="sm"
+                  indeterminate={!ep && evalStatus !== 'done' && evalStatus !== 'error' && evalRunning}
+                />
+                {evalLogs.length > 0 && (
+                  <div
+                    ref={evalLogRef}
+                    className="log-box bg-black rounded border border-border h-32 overflow-y-auto p-2 font-mono text-xs text-green-400"
+                  >
+                    {evalLogs.map((l, i) => (
+                      <div key={i} className="whitespace-pre-wrap break-all">{l}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       </div>
 
