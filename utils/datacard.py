@@ -74,6 +74,12 @@ def generate_datacard(
     a_len_list: list[int] = []
     perspectives: dict[str, int] = {}
     has_reasoning: int = 0
+    judge_scores: list[float] = []
+    question_types: dict[str, int] = {}
+    difficulties: dict[str, int] = {}
+    cross_doc_count: int = 0
+    adversarial_count: int = 0
+    watermarked_count: int = 0
 
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -86,6 +92,7 @@ def generate_datacard(
                 continue
 
             messages = record.get("messages", [])
+            metadata = record.get("metadata", {})
             total += 1
 
             user_msgs = [m for m in messages if m["role"] == "user"]
@@ -109,13 +116,34 @@ def generate_datacard(
                 p = _extract_perspective(sys_msgs[0]["content"])
                 perspectives[p] = perspectives.get(p, 0) + 1
 
+            # Metryki z metadanych
+            if metadata:
+                qs = metadata.get("quality_score")
+                if qs is not None:
+                    try:
+                        judge_scores.append(float(qs))
+                    except (TypeError, ValueError):
+                        pass
+                qt = metadata.get("question_type", "")
+                if qt:
+                    question_types[qt] = question_types.get(qt, 0) + 1
+                diff = metadata.get("difficulty", "")
+                if diff:
+                    difficulties[diff] = difficulties.get(diff, 0) + 1
+                if metadata.get("perspective") == "cross_doc":
+                    cross_doc_count += 1
+                if metadata.get("is_adversarial"):
+                    adversarial_count += 1
+                if metadata.get("watermark_hash"):
+                    watermarked_count += 1
+
     def _pct(n: int) -> float:
         return round(100.0 * n / total, 1) if total else 0.0
 
     multi_turn_count = sum(1 for t in turns_list if t > 1)
 
     card: dict = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "batch_id": batch_id,
         "format": "ChatML JSONL (multi-turn)",
         "language": "Polish (pl)",
@@ -126,6 +154,11 @@ def generate_datacard(
         "refusal_count": refusals,
         "refusal_pct": _pct(refusals),
         "cot_reasoning_pct": _pct(has_reasoning),
+        "cross_doc_count": cross_doc_count,
+        "cross_doc_pct": _pct(cross_doc_count),
+        "adversarial_count": adversarial_count,
+        "adversarial_pct": _pct(adversarial_count),
+        "watermarked_count": watermarked_count,
         # ── Conversation structure ────────────────────────────────────────────
         "turns": {
             "distribution": _dist(turns_list),
@@ -138,6 +171,17 @@ def generate_datacard(
             k: {"count": v, "pct": _pct(v)}
             for k, v in sorted(perspectives.items(), key=lambda x: -x[1])
         },
+        # ── Question type & difficulty ────────────────────────────────────────
+        "question_type_distribution": {
+            k: {"count": v, "pct": _pct(v)}
+            for k, v in sorted(question_types.items(), key=lambda x: -x[1])
+        },
+        "difficulty_distribution": {
+            k: {"count": v, "pct": _pct(v)}
+            for k, v in sorted(difficulties.items(), key=lambda x: -x[1])
+        },
+        # ── Judge score distribution (kluczowa metryka jakości) ───────────────
+        "judge_score_distribution": _dist(judge_scores) if judge_scores else {},
         # ── Length statistics ─────────────────────────────────────────────────
         "question_length_chars": _dist(q_len_list),
         "answer_length_chars":   _dist(a_len_list),

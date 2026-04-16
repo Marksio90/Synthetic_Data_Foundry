@@ -36,6 +36,21 @@ logger = logging.getLogger(__name__)
 
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
+# Fuzzy refusal detection — akceptuje warianty lingwistyczne
+_REFUSAL_VARIANTS = (
+    "brak danych w dyrektywie",
+    "brak informacji w dyrektywie",
+    "nie ma danych w tekście",
+    "poza zakresem dyrektywy",
+    "brak danych w tekście",
+)
+
+
+def _is_refusal(text: str) -> bool:
+    """Rozmyte wykrywanie odmowy — obsługuje warianty językowe."""
+    lower = text.lower().strip()
+    return any(v in lower for v in _REFUSAL_VARIANTS)
+
 # Strip <reasoning>...</reasoning> blocks before quality evaluation so the
 # judge scores only the final answer, not the chain-of-thought scaffolding.
 _REASONING_RE = re.compile(r"<reasoning>.*?</reasoning>\s*", re.DOTALL | re.IGNORECASE)
@@ -145,7 +160,7 @@ def _build_messages(state: FoundryState) -> list[dict]:
     context_parts = state.get("retrieved_context", [state["chunk"]["content"]])
     context_raw = "\n---\n".join(context_parts)
     if len(context_raw) > 8000:
-        logger.debug("Judge context truncated from %d to 8000 chars", len(context_raw))
+        logger.warning("Judge context TRUNCATED from %d to 8000 chars — may affect verdict", len(context_raw))
         context_raw = context_raw[:8000]
     # Strip CoT reasoning block — judge evaluates the final answer only
     answer_for_eval = _strip_reasoning(state["answer"])
@@ -188,9 +203,9 @@ def judge_answer(state: FoundryState) -> dict:
             "judge_reasoning": f"Answer too short ({len(answer_eval)} chars < {_MIN_ANSWER_CHARS} minimum).",
         }
 
-    # Fast-path for adversarial samples: check refusal compliance
+    # Fast-path for adversarial samples: check refusal compliance (fuzzy)
     if is_adversarial:
-        if _REFUSAL_PHRASE in answer_eval:
+        if _is_refusal(answer_eval):
             logger.debug("Adversarial sample correctly refused → score=1.0")
             return {
                 "quality_score": 1.0,
@@ -214,11 +229,12 @@ def judge_answer(state: FoundryState) -> dict:
         confidence: float = _safe_score(result.get("confidence", 1.0))
         judge_model = settings.openai_primary_model
 
-        # Cascade: if confidence < threshold, escalate to fallback model (Self-Check 2.0)
-        if confidence < settings.quality_threshold:
+        # Cascade: eskaluj gdy pewność sędziego niska (judge_confidence_threshold),
+        # NIE gdy wynik jest poniżej progu akceptacji (quality_threshold) — to różne pojęcia.
+        if confidence < settings.judge_confidence_threshold:
             logger.info(
                 "Judge confidence %.2f < %.2f — escalating to %s",
-                confidence, settings.quality_threshold, settings.openai_fallback_model,
+                confidence, settings.judge_confidence_threshold, settings.openai_fallback_model,
             )
             raw2 = _call_judge_model(settings.openai_fallback_model, messages)
             result = _parse_judge_response(raw2)
@@ -231,11 +247,14 @@ def judge_answer(state: FoundryState) -> dict:
         result = {"reasoning": str(exc), "has_hallucination": True}
         judge_model = "error"
 
-    logger.debug(
-        "Judge [%s] → score=%.2f  reasoning=%s",
+    logger.info(
+        "JUDGE chunk=%s turn=%d perspective=%s model=%s score=%.3f halluc=%s",
+        state["chunk"]["id"][:8],
+        state.get("turn_count", 0),
+        state.get("perspective", "?"),
         judge_model,
         score,
-        result.get("reasoning", "")[:80],
+        result.get("has_hallucination", False),
     )
     return {
         "quality_score": score,

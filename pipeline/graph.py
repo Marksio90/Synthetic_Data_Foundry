@@ -321,10 +321,19 @@ def route_after_judge(state: FoundryState) -> str:
 
 def increment_retry(state: FoundryState) -> dict:
     """Increment retry counter and save the failed answer for DPO pairing."""
+    new_retry = state.get("retry_count", 0) + 1
+    logger.info(
+        "Retry %d for chunk=%s perspective=%s (last score=%.2f)",
+        new_retry,
+        state["chunk"]["id"][:8],
+        state.get("perspective", "?"),
+        state.get("quality_score", 0.0),
+    )
     return {
-        "retry_count": state.get("retry_count", 0) + 1,
+        "retry_count": new_retry,
         # Save the failed answer — if next retry succeeds, this becomes the DPO "rejected"
         "rejected_answer": state.get("answer", ""),
+        # Sygnał dla retrieve_context do użycia większego top_k (obsługiwane w expert.py)
     }
 
 

@@ -161,6 +161,53 @@ class Settings(BaseSettings):
         description="Number of cross-document Q&A pairs to generate after main pass (0 = skip)")
 
     # ------------------------------------------------------------------
+    # Judge cascade — oddzielony od quality_threshold (Self-Check fix)
+    # ------------------------------------------------------------------
+    judge_confidence_threshold: float = Field(
+        0.75, ge=0.0, le=1.0,
+        description=(
+            "Próg pewności sędziego (confidence) do eskalacji na model fallback. "
+            "RÓŻNY od quality_threshold (próg akceptacji odpowiedzi). "
+            "Domyślnie 0.75 — escalate gdy sędzia nie jest pewien swojej oceny."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Hybrid search weights — konfigurowalne dla domeny prawnej
+    # ------------------------------------------------------------------
+    hybrid_vector_weight: float = Field(
+        0.5, ge=0.0, le=1.0,
+        description=(
+            "Waga podobieństwa wektorowego w hybrid search. "
+            "0.7 = bardziej semantyczne; 0.5 = zbalansowane (rekomendowane dla prawa). "
+            "Suma z hybrid_bm25_weight powinna wynosić 1.0."
+        ),
+    )
+    hybrid_bm25_weight: float = Field(
+        0.5, ge=0.0, le=1.0,
+        description=(
+            "Waga BM25 (dopasowanie słów kluczowych) w hybrid search. "
+            "Wyższa wartość = lepsze dla precyzyjnych terminów prawnych (Art. 5, SFDR itd.)."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Automatyczne tłumaczenie chunków przed generowaniem Q&A
+    # ------------------------------------------------------------------
+    translate_chunks: bool = Field(
+        False,
+        description=(
+            "Gdy True: tłumaczy chunki z języka źródłowego na polski przed generowaniem Q&A. "
+            "Wymagane gdy dokumenty PDF są w języku innym niż polski (np. angielskie dyrektywy UE). "
+            "Używa DeepL (jeśli DEEPL_API_KEY ustawiony) lub secondary/OpenAI jako fallback."
+        ),
+    )
+    translate_source_lang: str = Field(
+        "en",
+        description="Kod języka źródłowego do tłumaczenia (ISO 639-1: 'en', 'de', 'fr', itp.).",
+    )
+
+    # ------------------------------------------------------------------
     # Tenacity (Self-Check 2.0 — API rate-limit backoff)
     # ------------------------------------------------------------------
     tenacity_max_attempts: int = Field(6)

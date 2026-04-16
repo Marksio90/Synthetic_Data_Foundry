@@ -274,11 +274,25 @@ def simulate_question(state: FoundryState) -> dict:
     return {"question": question, "is_adversarial": is_adversarial}
 
 
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Przybliżone podobieństwo Jaccard na bazie word bigrams."""
+    def bigrams(text: str) -> set[str]:
+        words = text.lower().split()
+        return {f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)} if len(words) >= 2 else {text.lower()}
+
+    set_a, set_b = bigrams(a), bigrams(b)
+    if not set_a and not set_b:
+        return 1.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
 def simulate_followup(state: FoundryState) -> dict:
     """
-    LangGraph node — generates a follow-up question based on conversation history.
-    Reads state["conversation_history"], state["chunk"], state["perspective"] →
-    returns {"question": ..., "is_adversarial": False}
+    LangGraph node — generuje pytanie uzupełniające na bazie historii konwersacji.
+    Sprawdza podobieństwo do poprzednich pytań (dedup) — zapobiega powtórkom.
     """
     chunk = state["chunk"]
     perspective = state.get("perspective", "cfo")
@@ -286,7 +300,6 @@ def simulate_followup(state: FoundryState) -> dict:
 
     system = _FOLLOWUP_PROMPTS.get(perspective, _FOLLOWUP_PROMPTS["cfo"])
 
-    # Format conversation history as readable text
     history_lines = []
     for msg in conversation_history:
         role_label = "Pytanie" if msg["role"] == "user" else "Odpowiedź"
@@ -299,11 +312,24 @@ def simulate_followup(state: FoundryState) -> dict:
         f"Dotychczasowa rozmowa:\n\n{history_text}"
     )
 
+    prev_questions = [
+        m["content"] for m in conversation_history if m["role"] == "user"
+    ]
+
     try:
         question = _call_vllm(system, prompt)
     except Exception as exc:
         logger.error("Simulator follow-up vLLM call failed: %s", exc)
         question = "Proszę o doprecyzowanie poprzedniej odpowiedzi."
+    else:
+        # Sprawdź duplikat względem poprzednich pytań (próg 0.75)
+        for prev in prev_questions:
+            if _jaccard_similarity(question, prev) >= 0.75:
+                logger.debug(
+                    "Follow-up duplicate detected (sim≥0.75) — using generic fallback"
+                )
+                question = "Proszę o doprecyzowanie poprzedniej odpowiedzi."
+                break
 
     logger.debug(
         "Simulator follow-up [%s] turn=%d: %s",

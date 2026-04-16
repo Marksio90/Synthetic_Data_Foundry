@@ -39,6 +39,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Mapa kompatybilnych par dokumentów — tylko powiązane akty prawne UE
+# ---------------------------------------------------------------------------
+# Klucze to fragmenty nazwy dyrektywy (case-insensitive substring match).
+# Wartość: lista fragmentów nazw, z którymi dana dyrektywa jest kompatybilna.
+_COMPATIBLE_DIRECTIVES: dict[str, list[str]] = {
+    "csrd":       ["sfdr", "taxonomy", "taksonomia", "csddd"],
+    "sfdr":       ["csrd", "taxonomy", "taksonomia"],
+    "taxonomy":   ["csrd", "sfdr", "csddd"],
+    "taksonomia": ["csrd", "sfdr", "csddd"],
+    "csddd":      ["csrd", "taxonomy", "taksonomia"],
+}
+
+
+def _are_compatible(name_a: str, name_b: str) -> bool:
+    """
+    Sprawdza, czy dwa dokumenty tworzą sensowną parę cross-doc.
+    Domyślnie akceptuje wszystkie pary, jeśli żaden dokument nie jest w mapie.
+    """
+    a_lower = name_a.lower()
+    b_lower = name_b.lower()
+
+    for key, compat_list in _COMPATIBLE_DIRECTIVES.items():
+        if key in a_lower:
+            return any(c in b_lower for c in compat_list)
+        if key in b_lower:
+            return any(c in a_lower for c in compat_list)
+
+    # Nieznana para — akceptuj (zachowanie wsteczne)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # System prompts
 # ---------------------------------------------------------------------------
 
@@ -147,7 +179,7 @@ def generate_cross_doc_samples(
     while written < n_samples and attempts < max_attempts:
         attempts += 1
 
-        # Sample 2 different source documents
+        # Sample 2 different source documents — tylko kompatybilne pary
         pair = random.sample(doc_ids, 2)
         chunk_a = random.choice(by_doc[pair[0]])
         chunk_b = random.choice(by_doc[pair[1]])
@@ -155,8 +187,13 @@ def generate_cross_doc_samples(
         # Resolve directive names
         doc_a = session.get(SourceDocument, chunk_a.source_doc_id)
         doc_b = session.get(SourceDocument, chunk_b.source_doc_id)
-        name_a = (doc_a.directive_name or "Dyrektywa A") if doc_a else "Dyrektywa A"
-        name_b = (doc_b.directive_name or "Dyrektywa B") if doc_b else "Dyrektywa B"
+        name_a = (doc_a.directive_name or doc_a.filename or "Dyrektywa A") if doc_a else "Dyrektywa A"
+        name_b = (doc_b.directive_name or doc_b.filename or "Dyrektywa B") if doc_b else "Dyrektywa B"
+
+        # Odrzuć pary niekompatybilne tematycznie (np. CSRD + dokument niezwiązany)
+        if not _are_compatible(name_a, name_b):
+            logger.debug("Cross-doc: para %s + %s jest niekompatybilna — pomijam", name_a, name_b)
+            continue
 
         context = (
             f"[Fragment z {name_a}]\n{chunk_a.content}\n\n"

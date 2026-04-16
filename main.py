@@ -30,10 +30,12 @@ import openai
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
+from agents.calibrator import calibrate
 from agents.chunker import chunk_document
 from agents.cross_doc import generate_cross_doc_samples
 from agents.expert import _is_tpd_limit
 from agents.ingestor import ingest_pdf
+from agents.translator import translate_chunks_in_db
 from config.settings import settings
 from db.models import Base, DirectiveChunk, SourceDocument
 from db.repository import claim_chunk, get_pending_chunks
@@ -317,6 +319,33 @@ def main() -> None:
                 )
                 logger.info("Chunked %s → %d chunks", pdf_path.name, len(chunk_ids))
 
+                # ── Opcjonalne tłumaczenie chunków (TRANSLATE_CHUNKS=true) ───
+                if settings.translate_chunks and chunk_ids:
+                    logger.info(
+                        "=== Translating %d chunks (%s → pl) for %s ===",
+                        len(chunk_ids), settings.translate_source_lang, pdf_path.name,
+                    )
+                    translated = translate_chunks_in_db(
+                        session, chunk_ids, source_lang=settings.translate_source_lang
+                    )
+                    session.commit()
+                    logger.info("Translated %d/%d chunks", translated, len(chunk_ids))
+
+    # ── Phase 1.5: Auto-kalibracja parametrów pipeline'u ────────────────────
+    with Session() as session:
+        cal_chunks = get_pending_chunks(session, limit=settings.calibration_samples)
+        if cal_chunks:
+            logger.info(
+                "=== Auto-calibrating pipeline on %d sample chunks ===",
+                len(cal_chunks),
+            )
+            cal = calibrate(cal_chunks)
+            logger.info("Calibration result:\n%s", cal.summary())
+            # Nadpisz ustawienia dynamicznie (bez restartu procesu)
+            settings.quality_threshold = cal.quality_threshold
+            settings.max_turns = cal.max_turns
+            settings.adversarial_ratio = cal.adversarial_ratio
+
     # ── Phase 2: Run swarm on pending chunks ────────────────────────────────
     logger.info("=== Starting swarm on pending chunks (batch=%s) ===", args.batch_id)
 
@@ -388,26 +417,38 @@ def main() -> None:
                     "record_index": writer.record_count,
                 }
 
-                try:
-                    final_state = graph.invoke(initial_state)
-                    final_status = final_state.get("status", "unknown")
-                    if final_status == "ready":
-                        chunk_ready = True
-                except openai.RateLimitError as exc:
-                    if _is_tpd_limit(exc):
-                        # Dzienny limit TPD wyczerpany — nie ma sensu kontynuować
-                        logger.critical(
-                            "⛔ Dzienny limit TPD wyczerpany! Poczekaj do północy (UTC) "
-                            "lub zmień providera: SECONDARY_API_KEY / SECONDARY_MODEL. Błąd: %s", exc
+                _GRAPH_RETRIES = 3
+                for attempt in range(_GRAPH_RETRIES):
+                    try:
+                        final_state = graph.invoke(initial_state)
+                        final_status = final_state.get("status", "unknown")
+                        if final_status == "ready":
+                            chunk_ready = True
+                        break
+                    except openai.RateLimitError as exc:
+                        if _is_tpd_limit(exc):
+                            logger.critical(
+                                "⛔ Dzienny limit TPD wyczerpany! Poczekaj do północy (UTC) "
+                                "lub zmień providera: SECONDARY_API_KEY / SECONDARY_MODEL. Błąd: %s", exc
+                            )
+                            sys.exit(1)
+                        if attempt < _GRAPH_RETRIES - 1:
+                            wait = 2 ** attempt * 4  # 4s, 8s, 16s
+                            logger.warning(
+                                "Rate-limit for chunk %s [%s] — retry %d/%d in %ds: %s",
+                                chunk.id, perspective, attempt + 1, _GRAPH_RETRIES, wait, exc,
+                            )
+                            time.sleep(wait)
+                        else:
+                            logger.error(
+                                "Graph failed (rate-limit, %d attempts) chunk %s [%s]: %s",
+                                _GRAPH_RETRIES, chunk.id, perspective, exc,
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
                         )
-                        sys.exit(1)
-                    logger.error(
-                        "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
-                    )
+                        break
 
             total_processed += 1
             if chunk_ready:
