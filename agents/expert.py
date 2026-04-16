@@ -270,21 +270,38 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
     """
     Phase 1: Run hybrid search.
     Returns {"retrieved_context": [...], "retrieved_ids": [...]}.
+
+    Adaptive top_k: Na retry używamy większego top_k (12 zamiast 8) żeby
+    dostarczyć bogatszy kontekst — często ratuje próbki z niskim score.
+    Diversify on retry: włącza diversyfikację sekcji żeby uniknąć monotonii.
     """
     question = state["question"]
+    retry_count = state.get("retry_count", 0)
+    conversation_history = state.get("conversation_history", [])
+
+    # Na retry lub przy dużej historii — użyj więcej chunków, diversify
+    is_retry = retry_count > 0
+    top_k = 12 if is_retry else 8
+
+    # Adaptive: zmniejsz top_k gdy historia konwersacji zajmuje dużo miejsca
+    history_chars = sum(len(m["content"]) for m in conversation_history)
+    available_chars = _MAX_CONTEXT_CHARS - history_chars
+    if available_chars < 2000:
+        top_k = max(3, top_k // 2)
+
     try:
         query_embedding = _embed_query(question)
         chunks = repo.hybrid_search(
             session,
             query_embedding=query_embedding,
             query_text=question,
-            top_k=8,  # zwiększone z 5 → bogatszy kontekst RAG
+            top_k=top_k,
+            diversify_by_section=is_retry,
         )
         context_texts = [c.content for c in chunks]
         context_ids = [str(c.id) for c in chunks]
     except Exception as exc:
         logger.error("RAG retrieval failed: %s", exc)
-        # Fallback: use the chunk itself as context
         context_texts = [state["chunk"]["content"]]
         context_ids = [state["chunk"]["id"]]
 

@@ -102,15 +102,24 @@ def hybrid_search(
     query_embedding: list[float],
     query_text: str,
     top_k: int = 5,
+    diversify_by_section: bool = False,
 ) -> list[DirectiveChunk]:
     """
     Hybrid retrieval: vector cosine similarity (pgvector) + BM25 ts_rank.
     Self-Check 3.0: WHERE is_superseded = FALSE hard-coded.
 
-    Scoring: 0.7 * vector_score + 0.3 * bm25_score  (Reciprocal Rank Fusion variant)
+    Wagi konfigurowane przez settings.hybrid_vector_weight / hybrid_bm25_weight.
+    Opcjonalna diversyfikacja: max 2 chunki z każdej sekcji dokumentu.
     """
+    from config.settings import settings as _s
+    vec_w = _s.hybrid_vector_weight
+    bm25_w = _s.hybrid_bm25_weight
+
+    # Przy diversyfikacji pobieramy więcej kandydatów przed filtrowaniem
+    fetch_k = top_k * 4 if diversify_by_section else top_k
+
     sql = text(
-        """
+        f"""
         WITH vec AS (
             SELECT id,
                    1 - (embedding <=> CAST(:emb AS vector)) AS vec_score
@@ -118,7 +127,7 @@ def hybrid_search(
             WHERE  is_superseded = FALSE
               AND  embedding IS NOT NULL
             ORDER  BY embedding <=> CAST(:emb AS vector)
-            LIMIT  :top_k * 3
+            LIMIT  :fetch_k
         ),
         fts AS (
             SELECT id,
@@ -126,12 +135,12 @@ def hybrid_search(
             FROM   directive_chunks
             WHERE  is_superseded = FALSE
               AND  fts_vector @@ plainto_tsquery('simple', :q)
-            LIMIT  :top_k * 3
+            LIMIT  :fetch_k
         ),
         combined AS (
-            SELECT COALESCE(v.id, f.id)                          AS id,
-                   COALESCE(v.vec_score, 0) * 0.7
-                   + COALESCE(f.bm25_score, 0) * 0.3            AS score
+            SELECT COALESCE(v.id, f.id)                                      AS id,
+                   COALESCE(v.vec_score, 0) * {vec_w}
+                   + COALESCE(f.bm25_score, 0) * {bm25_w}                   AS score
             FROM   vec v
             FULL   OUTER JOIN fts f ON v.id = f.id
         )
@@ -139,24 +148,38 @@ def hybrid_search(
         FROM   combined
         JOIN   directive_chunks ON directive_chunks.id = combined.id
         ORDER  BY combined.score DESC, directive_chunks.id ASC
-        LIMIT  :top_k
+        LIMIT  :fetch_k
         """
     )
     rows = session.execute(
         sql,
-        {"emb": str(query_embedding), "q": query_text, "top_k": top_k},
+        {"emb": str(query_embedding), "q": query_text, "fetch_k": fetch_k},
     ).fetchall()
 
-    # Re-fetch as ORM objects (columns → model)
     ids = [row[0] for row in rows]
     if not ids:
         return []
-    chunks = session.scalars(
+    chunks_unordered = session.scalars(
         select(DirectiveChunk).where(DirectiveChunk.id.in_(ids))
     ).all()
-    # Preserve ranking order
     id_order = {cid: i for i, cid in enumerate(ids)}
-    return sorted(chunks, key=lambda c: id_order.get(c.id, 999))
+    chunks = sorted(chunks_unordered, key=lambda c: id_order.get(c.id, 999))
+
+    if not diversify_by_section:
+        return chunks[:top_k]
+
+    # Diversyfikacja: max 2 chunki z każdej sekcji, zachowując ranking
+    by_section: dict[str, int] = {}
+    diversified: list[DirectiveChunk] = []
+    for chunk in chunks:
+        section_key = f"{chunk.source_doc_id}::{chunk.section_heading or '__none__'}"
+        count = by_section.get(section_key, 0)
+        if count < 2:
+            diversified.append(chunk)
+            by_section[section_key] = count + 1
+        if len(diversified) >= top_k:
+            break
+    return diversified
 
 
 # =============================================================================

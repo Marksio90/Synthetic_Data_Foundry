@@ -27,29 +27,62 @@ from db.models import DirectiveChunk
 logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
-_MIN_CHUNK_CHARS = 150   # discard degenerate micro-chunks (increased from 100)
-_MAX_CHUNK_CHARS = 3000  # hard cap; very long chunks split further
+_MIN_CHUNK_CHARS = 250   # zwiększone: dokumenty prawne mają min. sensowne sekcje
+_MAX_CHUNK_CHARS = 2200  # zmniejszone: zostawia ~800 tokenów na odpowiedź LLM
+
+# Detekcja artykułów prawnych jako naturalnych granic chunków.
+# Obsługuje formaty: "Article 5", "Art. 5", "Artykuł 5", "§ 3", "Section 12"
+_LEGAL_ARTICLE_RE = re.compile(
+    r"^(?:Article|Art(?:ykuł)?\.?|§|Section)\s+\d+\b.*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _split_by_legal_articles(text: str) -> list[tuple[str, str]]:
+    """
+    Dzieli tekst na sekcje wg nagłówków artykułów prawnych.
+    Zwraca pary (nagłówek_artykułu, treść).
+    Używane gdy tekst nie ma nagłówków Markdown, ale zawiera artykuły prawne.
+    """
+    matches = list(_LEGAL_ARTICLE_RE.finditer(text))
+    if not matches:
+        return []
+
+    sections: list[tuple[str, str]] = []
+    for i, m in enumerate(matches):
+        heading = m.group(0).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            sections.append((heading, body))
+    return sections
 
 
 def _split_by_headings(markdown: str) -> list[tuple[str, str]]:
     """
-    Return list of (heading, body) pairs.
-    If markdown has no headings, treat the entire text as one section.
+    Zwraca listę par (nagłówek, treść).
+    Priorytet: 1) nagłówki Markdown, 2) artykuły prawne, 3) cały tekst jako jedna sekcja.
     """
     sections: list[tuple[str, str]] = []
     matches = list(_HEADING_RE.finditer(markdown))
 
-    if not matches:
-        return [("", markdown.strip())]
+    if matches:
+        for i, m in enumerate(matches):
+            heading = m.group(2).strip()
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+            body = markdown[start:end].strip()
+            if body:
+                sections.append((heading, body))
+        return sections
 
-    for i, m in enumerate(matches):
-        heading = m.group(2).strip()
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
-        body = markdown[start:end].strip()
-        if body:
-            sections.append((heading, body))
-    return sections
+    # Brak nagłówków Markdown — spróbuj artykułów prawnych
+    legal_sections = _split_by_legal_articles(markdown)
+    if legal_sections:
+        return legal_sections
+
+    return [("", markdown.strip())]
 
 
 def _split_long_section(body: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:

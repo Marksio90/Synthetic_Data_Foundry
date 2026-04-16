@@ -20,6 +20,8 @@ import logging
 
 import httpx
 import openai
+from sqlalchemy import update
+from sqlalchemy.orm import Session
 from tenacity import (
     before_sleep_log,
     retry,
@@ -190,6 +192,55 @@ def translate_text(text: str, source_lang: str = "en") -> str:
     except Exception as exc:
         logger.error("Translation failed: %s — returning original text", exc)
         return text  # Bezpieczny fallback: nie blokuj pipeline'u
+
+
+def translate_chunks_in_db(
+    session: Session,
+    chunk_ids: list[str],
+    source_lang: str = "en",
+) -> int:
+    """
+    Tłumaczy zawartość chunków bezpośrednio w bazie danych (in-place).
+
+    Args:
+        session:     Aktywna sesja SQLAlchemy.
+        chunk_ids:   Lista UUIDs chunków do przetłumaczenia.
+        source_lang: Kod języka źródłowego.
+
+    Returns:
+        Liczba przetłumaczonych chunków.
+    """
+    from db.models import DirectiveChunk
+    from sqlalchemy import select
+    import uuid
+
+    if not chunk_ids or source_lang == "pl":
+        return 0
+
+    uuids = [uuid.UUID(cid) for cid in chunk_ids]
+    chunks = list(session.scalars(
+        select(DirectiveChunk).where(DirectiveChunk.id.in_(uuids))
+    ))
+
+    translated_count = 0
+    for chunk in chunks:
+        if not chunk.content:
+            continue
+        translated = translate_text(chunk.content, source_lang)
+        chunk.content = translated
+        if chunk.content_md and chunk.content_md != chunk.content:
+            chunk.content_md = translate_text(chunk.content_md, source_lang)
+        else:
+            chunk.content_md = translated
+        translated_count += 1
+
+    if translated_count:
+        session.flush()
+        logger.info(
+            "DB translator: %d/%d chunks translated (%s → pl) for %d chunk IDs",
+            translated_count, len(chunk_ids), source_lang, len(chunk_ids),
+        )
+    return translated_count
 
 
 def translate_chunks(
