@@ -319,14 +319,14 @@ services:
   # Ollama — lokalny serwer LLM (PRIMARY generator Q&A — darmowy)
   #
   # Modele pobierane AUTOMATYCZNIE przy `docker compose up` (idempotentne).
-  # Ponowny start: sprawdza czy model istnieje — NIE pobiera ponownie.
-  # Healthcheck pozytywny dopiero gdy MODEL jest gotowy (nie tylko serwer).
+  # Pasek postępu widoczny w logach kontenera (Docker Desktop → ollama → Logs).
+  # Healthcheck pozytywny dopiero gdy MODEL jest gotowy, nie tylko serwer.
+  # start_period: 30s — serwer startuje, potem do 150 min na pobieranie.
   #
   # Ręczne operacje:
-  #   docker exec foundry_ollama ollama list                        # lista modeli
-  #   docker exec foundry_ollama ollama pull llama3.3:70b           # dodaj model
-  #   docker cp output/model.gguf foundry_ollama:/tmp/model.gguf    # własny model
-  #   docker exec foundry_ollama ollama create my-model -f /tmp/Modelfile
+  #   docker logs foundry_ollama -f           # obserwuj pobieranie na żywo
+  #   docker exec foundry_ollama ollama list  # lista modeli
+  #   docker exec foundry_ollama ollama pull llama3.3:70b
   # ---------------------------------------------------------------------------
   ollama:
     image: ollama/ollama:latest
@@ -338,21 +338,66 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        ollama serve &
-        echo '[Foundry] Czekam na Ollama server...'
+        # Serwer Ollama w tle (logi do pliku — nie zalewają terminala)
+        ollama serve >> /tmp/ollama-server.log 2>&1 &
+
+        echo '[Foundry] ⏳ Uruchamiam serwer Ollama...'
         until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do sleep 2; done
-        echo "[Foundry] Pobieram $$OLLAMA_MODEL (idempotentne)..."
-        ollama pull $$OLLAMA_MODEL
-        echo "[Foundry] Pobieram $$OLLAMA_EMBED_MODEL..."
-        ollama pull $$OLLAMA_EMBED_MODEL
-        echo '[Foundry] ✓ Modele gotowe! Foundry moze startowac.'
+        echo '[Foundry] ✓ Serwer gotowy.'
+
+        # Pobieranie z paskiem postępu (co 5%)
+        pull_model() {
+          MODEL="$$1"
+          if curl -sf http://localhost:11434/api/tags | grep -qF "\"$$MODEL\""; then
+            echo "[Foundry] ✓ $$MODEL — już pobrany, pomijam"
+            return 0
+          fi
+          echo "[Foundry] ⬇  Pobieram: $$MODEL"
+          LAST_PCT=-1
+          curl -s -N -X POST http://localhost:11434/api/pull \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\": \"$$MODEL\", \"stream\": true}" | \
+          while IFS= read -r LINE; do
+            STATUS=$$(echo "$$LINE" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+            COMPLETED=$$(echo "$$LINE" | grep -o '"completed":[0-9]*' | cut -d: -f2)
+            TOTAL=$$(echo "$$LINE" | grep -o '"total":[0-9]*' | cut -d: -f2)
+            if [ -n "$$TOTAL" ] && [ "$$TOTAL" -gt 0 ] && [ -n "$$COMPLETED" ]; then
+              PCT=$$((COMPLETED * 100 / TOTAL))
+              if [ "$$PCT" -ne "$$LAST_PCT" ] && [ $$((PCT % 5)) -eq 0 ]; then
+                DONE_MB=$$((COMPLETED / 1024 / 1024))
+                TOTAL_MB=$$((TOTAL / 1024 / 1024))
+                FILLED=$$((PCT / 5))
+                BAR=""
+                N=0
+                while [ $$N -lt $$FILLED ]; do BAR="$${BAR}█"; N=$$((N+1)); done
+                while [ $$N -lt 20 ];     do BAR="$${BAR}░"; N=$$((N+1)); done
+                echo "[Foundry] [$$BAR] $${PCT}%  $${DONE_MB}MB / $${TOTAL_MB}MB  ($$MODEL)"
+                LAST_PCT=$$PCT
+              fi
+            elif [ "$$STATUS" = "success" ]; then
+              echo "[Foundry] ✅ $$MODEL — pobieranie zakończone!"
+            elif [ -n "$$STATUS" ] \
+              && [ "$$STATUS" != "pulling manifest" ] \
+              && [ "$$STATUS" != "verifying sha256 digest" ] \
+              && [ "$$STATUS" != "writing manifest" ]; then
+              echo "[Foundry] → $$STATUS"
+            fi
+          done
+        }
+
+        pull_model "$$OLLAMA_MODEL"
+        pull_model "$$OLLAMA_EMBED_MODEL"
+
+        echo '[Foundry] 🚀 Wszystkie modele gotowe — Foundry startuje!'
         wait
     healthcheck:
+      # Zielony dopiero gdy MODEL jest na liście (nie tylko serwer)
+      # retries × interval = 300 × 30s = 150 minut — wystarczy na ~1 MB/s
       test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -qF \"$OLLAMA_MODEL\" || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 40
-      start_period: 300s
+      retries: 300
+      start_period: 30s
     volumes:
       - ollama_models:/root/.ollama
     ports:
