@@ -5,6 +5,7 @@ import { Zap, ChevronDown, ChevronUp, Square, RotateCcw } from 'lucide-react';
 import type { Document, AnalysisResult, PipelineRun } from '@/lib/api';
 import LiveLog from '@/components/LiveLog';
 import StatusBadge from '@/components/StatusBadge';
+import ProgressBar from '@/components/ProgressBar';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
 
@@ -518,26 +519,33 @@ export default function AutopilotPage() {
               </div>
             )}
 
-            {/* Progress bar */}
-            {run && (
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs text-text-muted">
-                  <span>Chunks: {run.chunks_done} / {run.chunks_total}</span>
-                  <span>{(run.elapsed_seconds ?? 0).toFixed(0)}s</span>
-                </div>
-                <div className="w-full bg-bg-surface2 rounded-full h-2">
-                  <div
-                    className={`h-2 rounded-full transition-all duration-500 ${
-                      run.status === 'error' ? 'bg-error' :
-                      run.status === 'done' ? 'bg-success' :
-                      'bg-accent'
-                    }`}
-                    style={{ width: `${Math.min(100, run.progress_pct)}%` }}
+            {/* Progress bar + ETA */}
+            {run && (() => {
+              const elapsed = run.elapsed_seconds ?? 0;
+              const done = run.chunks_done ?? 0;
+              const total = run.chunks_total ?? 0;
+              const speed = elapsed > 0 && done > 0 ? done / elapsed : null; // chunks/s
+              const remaining = total - done;
+              const etaSec = speed && remaining > 0 ? Math.round(remaining / speed) : null;
+              const etaStr = etaSec == null ? null
+                : etaSec > 3600 ? `${Math.floor(etaSec / 3600)}h ${Math.floor((etaSec % 3600) / 60)}min`
+                : etaSec > 60  ? `${Math.floor(etaSec / 60)}min ${etaSec % 60}s`
+                : `${etaSec}s`;
+              const barStatus = run.status === 'error' ? 'error' : run.status === 'done' ? 'done' : 'running';
+              return (
+                <div className="space-y-1">
+                  <ProgressBar
+                    value={run.progress_pct ?? 0}
+                    max={100}
+                    label={`Chunk ${done} / ${total}`}
+                    valueLabel={`${(run.progress_pct ?? 0).toFixed(1)}%${etaStr ? ` · ETA: ${etaStr}` : ''} · ${elapsed.toFixed(0)}s`}
+                    status={barStatus}
+                    size="md"
                   />
+                  <p className="text-xs text-text-muted text-right">Batch: {run.batch_id}</p>
                 </div>
-                <p className="text-xs text-text-muted text-right">Batch: {run.batch_id}</p>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Live log */}
             {run && (

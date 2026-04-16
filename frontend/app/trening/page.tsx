@@ -4,6 +4,58 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Cpu, Download, RefreshCw } from 'lucide-react';
 import type { HardwareInfo, GateResult, TrainingRun } from '@/lib/api';
 import StatusBadge from '@/components/StatusBadge';
+import ProgressBar from '@/components/ProgressBar';
+
+interface TrainProgress {
+  step?: number;
+  totalSteps?: number;
+  epoch?: number;
+  totalEpochs?: number;
+  loss?: number;
+  pct?: number;
+}
+
+function parseTrainProgress(logs: string[], configEpochs?: number): TrainProgress {
+  for (let i = logs.length - 1; i >= Math.max(0, logs.length - 80); i--) {
+    const line = logs[i];
+
+    // tqdm: "50/500 [01:30<00:30"  — step-level
+    const tqdm = line.match(/\b(\d+)\s*\/\s*(\d+)\s+\[/);
+    if (tqdm) {
+      const step = parseInt(tqdm[1]);
+      const total = parseInt(tqdm[2]);
+      if (total > 0 && step <= total)
+        return { step, totalSteps: total, pct: (step / total) * 100 };
+    }
+
+    // HF Trainer JSON dict: "{'loss': 1.23, ..., 'epoch': 1.5}"
+    const epochF = line.match(/'epoch':\s*([\d.]+)/);
+    if (epochF) {
+      const epoch = parseFloat(epochF[1]);
+      const lossM = line.match(/'loss':\s*([\d.]+)/);
+      const loss = lossM ? parseFloat(lossM[1]) : undefined;
+      const total = configEpochs ?? undefined;
+      return { epoch, totalEpochs: total, loss, pct: total ? Math.min(100, (epoch / total) * 100) : undefined };
+    }
+
+    // "Epoch 2 / 3" or "epoch 2/3"
+    const epochNM = line.match(/epoch\s+(\d+)\s*[\/of]\s*(\d+)/i);
+    if (epochNM) {
+      const epoch = parseInt(epochNM[1]);
+      const total = parseInt(epochNM[2]);
+      return { epoch, totalEpochs: total, pct: total > 0 ? (epoch / total) * 100 : undefined };
+    }
+
+    // "Step 50 / 500" or "step 50/500"
+    const stepM = line.match(/steps?\s+(\d+)\s*[\/of]\s*(\d+)/i);
+    if (stepM) {
+      const step = parseInt(stepM[1]);
+      const total = parseInt(stepM[2]);
+      return { step, totalSteps: total, pct: total > 0 ? (step / total) * 100 : undefined };
+    }
+  }
+  return {};
+}
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
 
@@ -399,18 +451,54 @@ export default function TreningPage() {
                 )}
               </div>
 
-              {trainRun && (
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="metric-card">
-                    <div className="metric-value">{(trainRun.elapsed_seconds ?? 0).toFixed(0)}s</div>
-                    <div className="metric-label">Czas</div>
+              {trainRun && (() => {
+                const tp = parseTrainProgress(trainLogs, trainRun.config?.epochs ?? epochs);
+                const barStatus = trainRun.status === 'error' ? 'error' : trainRun.status === 'done' ? 'done' : 'running';
+                const hasProgress = tp.pct !== undefined;
+                const progressLabel = tp.totalSteps
+                  ? `Krok ${tp.step} / ${tp.totalSteps}`
+                  : tp.totalEpochs
+                  ? `Epoka ${tp.epoch?.toFixed(1)} / ${tp.totalEpochs}`
+                  : tp.epoch !== undefined
+                  ? `Epoka ${tp.epoch?.toFixed(2)}`
+                  : 'Trenowanie…';
+                const progressRight = tp.loss !== undefined
+                  ? `loss: ${tp.loss.toFixed(4)} · ${hasProgress ? (tp.pct!).toFixed(1) + '%' : ''}`
+                  : hasProgress ? `${tp.pct!.toFixed(1)}%` : undefined;
+
+                return (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="metric-card">
+                        <div className="metric-value">{(trainRun.elapsed_seconds ?? 0).toFixed(0)}s</div>
+                        <div className="metric-label">Czas</div>
+                      </div>
+                      {tp.loss !== undefined && (
+                        <div className="metric-card">
+                          <div className="metric-value text-lg">{tp.loss.toFixed(4)}</div>
+                          <div className="metric-label">Loss</div>
+                        </div>
+                      )}
+                      {tp.epoch !== undefined && (
+                        <div className="metric-card">
+                          <div className="metric-value text-lg">{typeof tp.epoch === 'number' ? tp.epoch.toFixed(2) : tp.epoch}</div>
+                          <div className="metric-label">Epoka</div>
+                        </div>
+                      )}
+                    </div>
+
+                    <ProgressBar
+                      value={tp.pct ?? 0}
+                      max={100}
+                      label={progressLabel}
+                      valueLabel={progressRight}
+                      status={barStatus}
+                      size="md"
+                      indeterminate={!hasProgress && trainRun.status === 'running'}
+                    />
                   </div>
-                  <div className="metric-card">
-                    <div className="metric-value font-mono text-sm">{trainRun.run_id.slice(0, 12)}…</div>
-                    <div className="metric-label">Run ID</div>
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               {trainError && <div className="alert-error">{trainError}</div>}
 

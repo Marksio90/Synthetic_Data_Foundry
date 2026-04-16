@@ -324,3 +324,48 @@ input[type='checkbox'] {
   color: #8b949e;
   margin-top: 0.25rem;
 }
+
+/* ── Progress bar animations ──────────────────────────────────────── */
+
+/* Shine sweep: moving highlight on a filled bar (running state) */
+@keyframes progress-shine {
+  from { transform: translateX(-100%) skewX(-20deg); }
+  to   { transform: translateX(500%)  skewX(-20deg); }
+}
+
+.progress-bar-running {
+  position: relative;
+  overflow: hidden;
+}
+.progress-bar-running::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 28%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.28), transparent);
+  animation: progress-shine 1.8s ease-in-out infinite;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* Indeterminate: bouncing bar (no known total) */
+@keyframes progress-indeterminate {
+  0%   { left: -45%; width: 45%; }
+  60%  { left: 100%; width: 45%; }
+  100% { left: 100%; width: 45%; }
+}
+
+.progress-bar-indeterminate {
+  position: relative;
+  overflow: hidden;
+  background-color: #21262d;
+}
+.progress-bar-indeterminate::after {
+  content: '';
+  position: absolute;
+  top: 0; height: 100%;
+  background-color: #58a6ff;
+  animation: progress-indeterminate 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  border-radius: inherit;
+}

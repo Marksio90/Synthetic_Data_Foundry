@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import ProgressBar from './ProgressBar';
 
 interface LiveLogProps {
   runId: string;
@@ -56,6 +57,8 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
   const [lines, setLines] = useState<string[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'polling' | 'disconnected'>('connecting');
   const [phaseLabel, setPhaseLabel] = useState<string | null>(null);
+  const [wsProgress, setWsProgress] = useState<{ pct: number; done: number; total: number } | null>(null);
+  const [wsStatus, setWsStatus] = useState<string>('');
   const logRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -168,6 +171,15 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
           if (data.status && onStatusChange) {
             onStatusChange(data.status);
           }
+          // Track progress from WS payload
+          if (data.progress_pct !== undefined && data.chunks_total > 0) {
+            setWsProgress({
+              pct: data.progress_pct,
+              done: data.chunks_done ?? 0,
+              total: data.chunks_total ?? 0,
+            });
+          }
+          if (data.status) setWsStatus(data.status);
         } catch {
           if (typeof event.data === 'string') {
             addLines([event.data]);
@@ -206,6 +218,8 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
     };
   }, [runId, apiBase, addLines, startPolling, stopPolling, onStatusChange]);
 
+  const barStatus = wsStatus === 'done' ? 'done' : wsStatus === 'error' ? 'error' : 'running';
+
   return (
     <div className="space-y-2">
       {/* Header row: connection status + live phase label */}
@@ -232,6 +246,18 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
         )}
         <span className="text-text-muted">{lines.length} linii</span>
       </div>
+
+      {/* Inline mini progress bar (populated from WS chunk data) */}
+      {wsProgress && (
+        <ProgressBar
+          value={wsProgress.pct}
+          max={100}
+          label={`Chunk ${wsProgress.done} / ${wsProgress.total}`}
+          valueLabel={`${wsProgress.pct.toFixed(1)}%`}
+          status={barStatus}
+          size="xs"
+        />
+      )}
 
       {/* Log terminal — taller, colour-coded lines */}
       <div
