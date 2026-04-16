@@ -342,47 +342,18 @@ services:
         ollama serve >> /tmp/ollama-server.log 2>&1 &
 
         echo '[Foundry] ⏳ Uruchamiam serwer Ollama...'
-        until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do sleep 2; done
+        until ollama list > /dev/null 2>&1; do sleep 2; done
         echo '[Foundry] ✓ Serwer gotowy.'
 
-        # Pobieranie z paskiem postępu (co 5%)
         pull_model() {
           MODEL="$$1"
-          if curl -sf http://localhost:11434/api/tags | grep -qF "\"$$MODEL\""; then
+          if ollama list 2>/dev/null | grep -qF "$$MODEL"; then
             echo "[Foundry] ✓ $$MODEL — już pobrany, pomijam"
             return 0
           fi
           echo "[Foundry] ⬇  Pobieram: $$MODEL"
-          LAST_PCT=-1
-          curl -s -N -X POST http://localhost:11434/api/pull \
-            -H 'Content-Type: application/json' \
-            -d "{\"name\": \"$$MODEL\", \"stream\": true}" | \
-          while IFS= read -r LINE; do
-            STATUS=$$(echo "$$LINE" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
-            COMPLETED=$$(echo "$$LINE" | grep -o '"completed":[0-9]*' | cut -d: -f2)
-            TOTAL=$$(echo "$$LINE" | grep -o '"total":[0-9]*' | cut -d: -f2)
-            if [ -n "$$TOTAL" ] && [ "$$TOTAL" -gt 0 ] && [ -n "$$COMPLETED" ]; then
-              PCT=$$((COMPLETED * 100 / TOTAL))
-              if [ "$$PCT" -ne "$$LAST_PCT" ] && [ $$((PCT % 5)) -eq 0 ]; then
-                DONE_MB=$$((COMPLETED / 1024 / 1024))
-                TOTAL_MB=$$((TOTAL / 1024 / 1024))
-                FILLED=$$((PCT / 5))
-                BAR=""
-                N=0
-                while [ $$N -lt $$FILLED ]; do BAR="$${BAR}█"; N=$$((N+1)); done
-                while [ $$N -lt 20 ];     do BAR="$${BAR}░"; N=$$((N+1)); done
-                echo "[Foundry] [$$BAR] $${PCT}%  $${DONE_MB}MB / $${TOTAL_MB}MB  ($$MODEL)"
-                LAST_PCT=$$PCT
-              fi
-            elif [ "$$STATUS" = "success" ]; then
-              echo "[Foundry] ✅ $$MODEL — pobieranie zakończone!"
-            elif [ -n "$$STATUS" ] \
-              && [ "$$STATUS" != "pulling manifest" ] \
-              && [ "$$STATUS" != "verifying sha256 digest" ] \
-              && [ "$$STATUS" != "writing manifest" ]; then
-              echo "[Foundry] → $$STATUS"
-            fi
-          done
+          ollama pull "$$MODEL"
+          echo "[Foundry] ✅ $$MODEL — gotowy!"
         }
 
         pull_model "$$OLLAMA_MODEL"
