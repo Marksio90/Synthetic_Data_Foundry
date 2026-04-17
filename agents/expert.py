@@ -11,12 +11,12 @@ Two-phase operation:
     phrase "Brak danych w dyrektywie".
 
 Provider routing (priority order):
-  1. Ollama LOCAL  (darmowy, ~4.7 GB RAM dla llama3.1:8b)
+  1. Ollama LOCAL  (darmowy, ~9 GB RAM dla qwen2.5:14b, 128k context)
   2. Cerebras/secondary (tani cloud, SECONDARY_API_KEY)
   3. OpenAI / vLLM (fallback — zawsze działa)
 
 Embeddings routing:
-  USE_LOCAL_EMBEDDINGS=true  → Ollama nomic-embed-text (darmowy, 0.3 GB RAM)
+  USE_LOCAL_EMBEDDINGS=true  → Ollama nomic-embed-text (darmowe, 0.3 GB RAM)
   USE_LOCAL_EMBEDDINGS=false → OpenAI text-embedding-3-small (domyślny)
 """
 
@@ -90,11 +90,60 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
         "5. Odpowiadaj po polsku, technicznie i precyzyjnie (2–8 zdań)."
         + _COT_FORMAT
     ),
+    "analityk": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy analityka finansowego.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: progach ilościowych, terminach wdrożenia, porównaniu wymogów, wpływie na wycenę.\n"
+        "5. Odpowiadaj po polsku, analitycznie i precyzyjnie (2–8 zdań)."
+        + _COT_FORMAT
+    ),
+    "regulator": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy regulatora/nadzorcy.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: obowiązkach regulacyjnych, sankcjach, zakresie nadzoru, wyjątkach podmiotowych.\n"
+        "5. Odpowiadaj po polsku, autorytatywnie i precyzyjnie (2–8 zdań)."
+        + _COT_FORMAT
+    ),
+    "akademik": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy badacza akademickiego.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: interpretacji przepisów, kontekście systemowym, spójności z innymi regulacjami.\n"
+        "5. Odpowiadaj po polsku, analitycznie i z dystansem naukowym (2–8 zdań)."
+        + _COT_FORMAT
+    ),
+    "dziennikarz": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, wyjaśniającym przepisy przystępnym językiem.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: praktycznym znaczeniu przepisów, kto jest dotknięty, od kiedy, jakie konsekwencje.\n"
+        "5. Odpowiadaj po polsku, przystępnie ale precyzyjnie (2–8 zdań)."
+        + _COT_FORMAT
+    ),
+    "inwestor": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy inwestora instytucjonalnego.\n\n"
+        "ZASADY:\n"
+        "1. Odpowiadasz WYŁĄCZNIE na podstawie fragmentów dyrektyw podanych w KONTEKST.\n"
+        "2. Jeśli pytanie wykracza poza kontekst, odpowiedz DOKŁADNIE: \"Brak danych w dyrektywie.\"\n"
+        "3. Cytuj numery artykułów i ustępów podane w tekście.\n"
+        "4. Skup się na: obowiązkach ujawnień, ryzyku compliance, due diligence, harmonogramie wymogów.\n"
+        "5. Odpowiadaj po polsku, z perspektywy ryzyka i wartości dla portfela (2–8 zdań)."
+        + _COT_FORMAT
+    ),
 }
 
-# Max context chars — increased for local Ollama (no token cost) and larger context windows.
-# Ollama llama3.1:8b supports 128k context; Cerebras/OpenAI gpt-4o-mini supports 128k.
-# We cap at 6000 chars (~1500 tokens) to leave room for question + history + answer.
+# Max context chars — qwen2.5:14b supports 128k context; Cerebras/OpenAI gpt-4o-mini 128k.
+# Cap at 6000 chars (~1500 tokens) to leave room for question + history + answer.
 _MAX_CONTEXT_CHARS = 6000
 
 
