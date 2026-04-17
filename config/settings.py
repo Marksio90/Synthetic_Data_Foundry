@@ -5,6 +5,8 @@ All values come from environment variables (see .env.example).
 
 from __future__ import annotations
 
+from typing import List
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -20,242 +22,232 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Database
     # ------------------------------------------------------------------
-    database_url: str = Field(
-        ...,
-        description="Sync SQLAlchemy URL (psycopg2)",
-    )
-    async_database_url: str = Field(
-        ...,
-        description="Async SQLAlchemy URL (asyncpg)",
-    )
+    database_url: str = Field(..., description="Sync SQLAlchemy URL (psycopg2)")
+    async_database_url: str = Field(..., description="Async SQLAlchemy URL (asyncpg)")
 
     # ------------------------------------------------------------------
     # Ollama — LOCAL model (primary, zero cost)
-    # Działa na 32 GB RAM. Zalecane modele:
-    #   llama3.2        (~2 GB)  — szybki, dobry do Q&A
-    #   llama3.1:8b     (~4.7 GB) — wyższa jakość
-    #   mistral         (~4.1 GB) — dobry do długich dokumentów
-    # Uruchom: ollama pull llama3.1:8b
     # ------------------------------------------------------------------
     ollama_model: str = Field(
-        "llama3.1:8b",
-        description=(
-            "Model Ollama do generowania Q&A (PRIMARY, darmowy, lokalny). "
-            "Ustaw pusty string '' aby pominąć Ollama i przejść do LLaMA API."
-        ),
+        "",
+        description="Model Ollama do generowania Q&A. Pusty = pomiń Ollama, użyj Cerebras.",
     )
     ollama_embed_model: str = Field(
         "nomic-embed-text",
-        description=(
-            "Model Ollama do embeddingów (darmowy, 0.3 GB RAM). "
-            "Ustaw '' aby używać OpenAI text-embedding-3-small."
-        ),
+        description="Model Ollama do embeddingów (darmowy). Pusty = używaj OpenAI.",
     )
     use_local_embeddings: bool = Field(
         False,
-        description=(
-            "Gdy True: embeddingi przez Ollama nomic-embed-text (darmowe, lokalne). "
-            "Gdy False: embeddingi przez OpenAI (płatne, wyższa jakość)."
-        ),
+        description="True = embeddingi Ollama (darmowe); False = OpenAI (wyższa jakość).",
     )
 
     # ------------------------------------------------------------------
-    # SECONDARY provider — cloud fallback gdy Ollama niedostępny
-    #
-    # WYBÓR: Cerebras (rekomendowany — 1M tokenów/dzień FREE, ultraszybki)
-    #   Klucz: https://cloud.cerebras.ai → Sign up → API Keys
-    #   Model: llama3.1-8b (identyczny z Ollama lokalnym = spójne wyniki)
-    #   Prędkość: 2000+ tokenów/sek
-    #
-    # Alternatywy (zmień tylko 3 zmienne w .env):
-    #   OpenRouter free:  openrouter.ai/api/v1  | meta-llama/llama-3.1-8b-instruct:free
-    #   Together AI paid: api.together.xyz/v1   | meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo ($0.18/1M)
+    # SECONDARY provider — Cerebras (rekomendowany: 2000 tok/s, 1M/dzień FREE)
     # ------------------------------------------------------------------
-    secondary_api_key: str = Field(
-        "",
-        description="Klucz do secondary providera (SECONDARY_API_KEY). Cerebras: https://cloud.cerebras.ai",
-    )
+    secondary_api_key: str = Field("", description="Klucz Cerebras/OpenRouter/Together")
     secondary_base_url: str = Field(
         "https://api.cerebras.ai/v1",
-        description="Base URL secondary providera. Default: Cerebras.",
+        description="Base URL secondary providera.",
     )
     secondary_model: str = Field(
-        "llama3.1-8b",
-        description=(
-            "Model secondary providera. "
-            "Cerebras: llama3.1-8b lub llama3.3-70b. "
-            "OpenRouter free: meta-llama/llama-3.1-8b-instruct:free. "
-            "Together: meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo."
-        ),
+        "llama3.3-70b",
+        description="Model secondary providera. Cerebras: llama3.3-70b (FREE, jakość ~GPT-4).",
     )
 
     # ------------------------------------------------------------------
-    # Fallback endpoint (OpenAI-compatible, np. vLLM)
+    # Fallback endpoint (OpenAI-compatible)
     # ------------------------------------------------------------------
-    vllm_base_url: str = Field(
-        "https://api.openai.com/v1",
-        description=(
-            "OpenAI-compatible endpoint (fallback gdy Ollama i LLaMA API niedostępne).\n"
-            "  OpenAI:   https://api.openai.com/v1\n"
-            "  Together: https://api.together.xyz/v1\n"
-            "  Local:    http://ollama:11434/v1"
-        ),
-    )
+    vllm_base_url: str = Field("https://api.openai.com/v1")
     vllm_model: str = Field("gpt-4o-mini")
-    vllm_api_key: str = Field("not-needed", description="'not-needed' dla lokalnego; ustaw openai_api_key gdy przez OpenAI")
+    vllm_api_key: str = Field("not-needed")
     vllm_temperature: float = Field(0.7)
-    vllm_max_tokens: int = Field(2048,
-        description="Max tokenów dla eksperta (zwiększone dla lepszego CoT)")
+    vllm_max_tokens: int = Field(2048, description="Max tokenów na odpowiedź eksperta")
 
     # ------------------------------------------------------------------
     # OpenAI (Judge + Embeddings)
     # ------------------------------------------------------------------
     openai_api_key: str = Field(..., description="OpenAI secret key")
-    openai_primary_model: str = Field("gpt-4o-mini")
+    openai_primary_model: str = Field("gpt-4o-mini", description="Primary judge model")
     openai_fallback_model: str = Field(
         "gpt-4o",
-        description=(
-            "Fallback sędziego gdy pewność < próg jakości (~5% przypadków). "
-            "gpt-4o: 15× droższy od mini, ale wywołany rzadko — wart dla jakości datasetu. "
-            "Ustaw gpt-4o-mini aby wyłączyć kaskadę i oszczędzać."
-        ),
+        description="Fallback judge model (cascade gdy confidence < próg). ~5% wywołań.",
     )
     openai_embedding_model: str = Field("text-embedding-3-small")
     openai_embedding_dims: int = Field(1536)
 
     # ------------------------------------------------------------------
-    # LlamaParse (Ingestor)
+    # LlamaParse — najlepsza jakość dla złożonych PDF z tabelami
     # ------------------------------------------------------------------
-    llama_parse_api_key: str = Field("", description="LlamaParse key (optional)")
+    llama_parse_api_key: str = Field("", description="LlamaParse API key ($0.003/str)")
+
+    # ------------------------------------------------------------------
+    # Replicate — audio transcription via Whisper large-v3
+    # ------------------------------------------------------------------
+    replicate_api_key: str = Field(
+        "",
+        description="Replicate API key — transkrypcja audio (nagrania konferencji ESG → dane treningowe).",
+    )
+
+    # ------------------------------------------------------------------
+    # HuggingFace Hub — auto-upload datasetu i modelu
+    # ------------------------------------------------------------------
+    hf_token: str = Field("", description="HuggingFace token (Write access)")
+    hf_dataset_repo: str = Field(
+        "",
+        description="HF Hub repo do auto-uploadu datasetu (np. 'org/esg-foundry-dataset'). Pusty = pomiń.",
+    )
+    hf_model_repo: str = Field(
+        "",
+        description="HF Hub repo do uploadu wytrenowanego modelu. Pusty = pomiń.",
+    )
+
+    # ------------------------------------------------------------------
+    # DeepL — tłumaczenie chunków
+    # ------------------------------------------------------------------
+    deepl_api_key: str = Field("", description="DeepL API key (opcjonalny)")
+    translate_chunks: bool = Field(False)
+    translate_source_lang: str = Field("en")
+
+    # ------------------------------------------------------------------
+    # Constitutional AI — self-critique + revision (darmowe pary DPO)
+    # ------------------------------------------------------------------
+    use_constitutional_ai: bool = Field(
+        True,
+        description=(
+            "Włącza Constitutional AI: każda odpowiedź przechodzi przez "
+            "self-critique + revision. Oryginalna odpowiedź staje się 'rejected' w DPO. "
+            "Używa tego samego providera co generacja — zero dodatkowego kosztu."
+        ),
+    )
+    constitutional_ai_threshold: float = Field(
+        1.01,  # always revise by default (threshold > 1.0 = only below 1.0 scores)
+        ge=0.0,
+        le=1.01,
+        description=(
+            "Uruchom rewizję gdy quality_score < próg (0.0 = zawsze, 1.01 = zawsze). "
+            "Domyślnie 1.01 = rewizja zawsze (maksymalna jakość)."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Pipeline perspectives — 8 ról eksperckich
+    # ------------------------------------------------------------------
+    perspectives: List[str] = Field(
+        default=["cfo", "prawnik", "audytor", "analityk", "regulator", "akademik", "dziennikarz", "inwestor"],
+        description=(
+            "Lista perspektyw do generowania Q&A. Każda perspektywa = osobna rozmowa per chunk. "
+            "8 perspektyw × N chunków = 8N rekordów. "
+            "Skróć listę dla szybszych testów: PERSPECTIVES=[\"cfo\",\"prawnik\",\"audytor\"]"
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Pipeline behaviour
     # ------------------------------------------------------------------
     adversarial_ratio: float = Field(0.10, ge=0.0, le=1.0)
-    quality_threshold: float = Field(0.90, ge=0.0, le=1.0)
+    quality_threshold: float = Field(0.75, ge=0.0, le=1.0)
     max_retries_per_chunk: int = Field(3, ge=1)
-    max_turns: int = Field(3, ge=1, le=5, description="Conversation turns per chunk")
-    max_refusal_ratio: float = Field(0.10, ge=0.0, le=1.0,
-        description="Max fraction of 'Brak danych' records in output (0.10 = 10%)")
+    max_turns: int = Field(3, ge=1, le=5)
+    max_refusal_ratio: float = Field(0.10, ge=0.0, le=1.0)
     chunk_overlap_chars: int = Field(150, ge=0)
     watermark_interval: int = Field(50, ge=1)
+    batch_size: int = Field(10, ge=1)
 
     # ------------------------------------------------------------------
-    # Output
+    # Output files — SFT + DPO + ORPO + KTO
     # ------------------------------------------------------------------
-    output_file: str = Field("/app/output/dataset_esg_v1.jsonl")
-    dpo_output_file: str = Field("/app/output/dataset_esg_v1_dpo.jsonl",
-        description="DPO preference pairs (TRL DPOTrainer format)")
-    client_id: str = Field("dev_client")
+    output_file: str = Field("/app/output/dataset_esg_v1.jsonl", description="SFT ChatML")
+    dpo_output_file: str = Field(
+        "/app/output/dataset_esg_v1_dpo.jsonl",
+        description="DPO preference pairs (TRL DPOTrainer)",
+    )
+    orpo_output_file: str = Field(
+        "/app/output/dataset_esg_v1_orpo.jsonl",
+        description="ORPO preference pairs (identyczny format co DPO, inny trainer)",
+    )
+    kto_output_file: str = Field(
+        "/app/output/dataset_esg_v1_kto.jsonl",
+        description="KTO pairs (Kahneman-Tversky Optimization — label: true/false)",
+    )
+    client_id: str = Field("dev_client", description="Unikalny ID klienta (B2B watermark)")
 
     # ------------------------------------------------------------------
-    # Near-duplicate detection (MinHash)
+    # Near-duplicate detection (MinHash LSH)
     # ------------------------------------------------------------------
-    dedup_threshold: float = Field(0.85, ge=0.0, le=1.0,
-        description="Jaccard similarity threshold for duplicate question detection")
+    dedup_threshold: float = Field(0.85, ge=0.0, le=1.0)
 
     # ------------------------------------------------------------------
-    # Cross-document synthesis pass
+    # Cross-document synthesis
     # ------------------------------------------------------------------
-    cross_doc_samples: int = Field(50, ge=0,
-        description="Number of cross-document Q&A pairs to generate after main pass (0 = skip)")
+    cross_doc_samples: int = Field(50, ge=0)
 
     # ------------------------------------------------------------------
-    # Judge cascade — oddzielony od quality_threshold (Self-Check fix)
+    # Judge cascade
     # ------------------------------------------------------------------
     judge_confidence_threshold: float = Field(
-        0.75, ge=0.0, le=1.0,
-        description=(
-            "Próg pewności sędziego (confidence) do eskalacji na model fallback. "
-            "RÓŻNY od quality_threshold (próg akceptacji odpowiedzi). "
-            "Domyślnie 0.75 — escalate gdy sędzia nie jest pewien swojej oceny."
-        ),
+        0.75,
+        ge=0.0,
+        le=1.0,
+        description="Próg pewności sędziego → eskalacja na model fallback. Różny od quality_threshold.",
     )
 
     # ------------------------------------------------------------------
-    # Hybrid search weights — konfigurowalne dla domeny prawnej
+    # Hybrid search weights
     # ------------------------------------------------------------------
-    hybrid_vector_weight: float = Field(
-        0.5, ge=0.0, le=1.0,
-        description=(
-            "Waga podobieństwa wektorowego w hybrid search. "
-            "0.7 = bardziej semantyczne; 0.5 = zbalansowane (rekomendowane dla prawa). "
-            "Suma z hybrid_bm25_weight powinna wynosić 1.0."
-        ),
-    )
-    hybrid_bm25_weight: float = Field(
-        0.5, ge=0.0, le=1.0,
-        description=(
-            "Waga BM25 (dopasowanie słów kluczowych) w hybrid search. "
-            "Wyższa wartość = lepsze dla precyzyjnych terminów prawnych (Art. 5, SFDR itd.)."
-        ),
-    )
+    hybrid_vector_weight: float = Field(0.5, ge=0.0, le=1.0)
+    hybrid_bm25_weight: float = Field(0.5, ge=0.0, le=1.0)
 
     # ------------------------------------------------------------------
-    # Automatyczne tłumaczenie chunków przed generowaniem Q&A
-    # ------------------------------------------------------------------
-    translate_chunks: bool = Field(
-        False,
-        description=(
-            "Gdy True: tłumaczy chunki z języka źródłowego na polski przed generowaniem Q&A. "
-            "Wymagane gdy dokumenty PDF są w języku innym niż polski (np. angielskie dyrektywy UE). "
-            "Używa DeepL (jeśli DEEPL_API_KEY ustawiony) lub secondary/OpenAI jako fallback."
-        ),
-    )
-    translate_source_lang: str = Field(
-        "en",
-        description="Kod języka źródłowego do tłumaczenia (ISO 639-1: 'en', 'de', 'fr', itp.).",
-    )
-
-    # ------------------------------------------------------------------
-    # Tenacity (Self-Check 2.0 — API rate-limit backoff)
+    # Tenacity — API backoff
     # ------------------------------------------------------------------
     tenacity_max_attempts: int = Field(6)
-    tenacity_initial_wait: float = Field(2.0)    # seconds
-    tenacity_max_wait: float = Field(64.0)       # seconds
+    tenacity_initial_wait: float = Field(2.0)
+    tenacity_max_wait: float = Field(64.0)
 
     # ------------------------------------------------------------------
     # Rate-limit throttling
     # ------------------------------------------------------------------
-    chunk_delay_seconds: float = Field(
-        0.0,
-        description=(
-            "Opóźnienie między chunkami (sekundy). "
-            "OpenAI/Ollama: ustaw 0. "
-            "Cerebras/OpenRouter free tier: ustaw 1-3 w razie 429."
-        ),
-    )
+    chunk_delay_seconds: float = Field(0.0)
 
     # ------------------------------------------------------------------
     # Auto-calibration
     # ------------------------------------------------------------------
-    calibration_samples: int = Field(
-        50, ge=10, le=500,
-        description="Number of chunks to analyse for auto-calibrating quality_threshold",
-    )
-    deepl_api_key: str = Field(
-        "",
-        description="DeepL API key for high-quality translation (optional; falls back to secondary/OpenAI LLM)",
-    )
+    calibration_samples: int = Field(50, ge=10, le=500)
 
     # ------------------------------------------------------------------
     # API / UI service
     # ------------------------------------------------------------------
-    data_dir: str = Field("/app/data", description="Directory where input PDFs are stored")
-    ollama_url: str = Field(
-        "http://localhost:11434",
-        description="Ollama API endpoint (override to http://ollama:11434 in Docker)",
-    )
+    data_dir: str = Field("/app/data")
+    ollama_url: str = Field("http://localhost:11434")
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     log_level: str = Field("INFO")
 
-    @field_validator("adversarial_ratio", "quality_threshold", "max_refusal_ratio", "dedup_threshold", mode="before")
+    # ------------------------------------------------------------------
+    # Batch ID (overridable from CLI; also readable from env)
+    # ------------------------------------------------------------------
+    batch_id: str = Field("esg-production-v1")
+
+    @field_validator(
+        "adversarial_ratio", "quality_threshold", "max_refusal_ratio", "dedup_threshold",
+        mode="before",
+    )
     @classmethod
     def parse_float(cls, v: object) -> float:
         return float(v)
+
+    @field_validator("perspectives", mode="before")
+    @classmethod
+    def parse_perspectives(cls, v: object) -> list:
+        if isinstance(v, str):
+            import json as _json
+            v = v.strip()
+            if v.startswith("["):
+                return _json.loads(v)
+            return [p.strip() for p in v.split(",") if p.strip()]
+        return list(v)  # type: ignore[arg-type]
 
 
 # Singleton — import this everywhere
