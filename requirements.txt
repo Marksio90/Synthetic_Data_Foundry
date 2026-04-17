@@ -1,6 +1,5 @@
 # =============================================================================
-# ESG Data Foundry — Python dependencies
-# Pinned to minor versions; patch bumps allowed.
+# ESG Data Foundry — Python dependencies (Gods Finger v2)
 # =============================================================================
 
 # ── LangGraph / LangChain ─────────────────────────────────────────────────
@@ -9,28 +8,42 @@ langchain>=0.2.0,<0.3
 langchain-openai>=0.1.0,<0.2
 langchain-community>=0.2.0,<0.3
 
-# ── OpenAI (Judge + Embeddings) ───────────────────────────────────────────
+# ── OpenAI (Judge + Embeddings + fallback) ────────────────────────────────
 openai>=1.40.0,<2.0
 
 # ── Database ──────────────────────────────────────────────────────────────
 psycopg2-binary>=2.9.9
 asyncpg>=0.29.0
 sqlalchemy>=2.0.30,<3.0
-pgvector>=0.3.0           # SQLAlchemy type + psycopg2 adapter
+pgvector>=0.3.0
 
 # ── Configuration ─────────────────────────────────────────────────────────
 pydantic>=2.7.0,<3.0
 pydantic-settings>=2.3.0,<3.0
 python-dotenv>=1.0.1
 
-# ── Resilience / Self-Check 2.0 ───────────────────────────────────────────
+# ── Resilience ────────────────────────────────────────────────────────────
 tenacity>=8.3.0,<9.0
 
 # ── PDF parsing ───────────────────────────────────────────────────────────
-llama-parse>=0.4.9          # LlamaParse cloud API
-pdf2image>=1.17.0           # OpenAI Vision fallback (needs poppler-utils)
-pymupdf>=1.24.0             # Local PDF parser (darmowy, bez limitów TPD/TPM)
-Pillow>=10.3.0              # Image handling for pdf2image
+llama-parse>=0.4.9          # LlamaParse cloud — najlepsza jakość tabel ($0.003/str)
+pdf2image>=1.17.0           # OpenAI Vision fallback (wymaga poppler-utils)
+pymupdf>=1.24.0             # Local PDF parser (darmowy, bez limitów)
+Pillow>=10.3.0
+
+# ── DOCX parsing ──────────────────────────────────────────────────────────
+python-docx>=1.1.0          # DOCX/DOC → Markdown (lokalny, darmowy)
+
+# ── HTML/XML parsing ──────────────────────────────────────────────────────
+beautifulsoup4>=4.12.0      # HTML/XML → Markdown (lokalny, darmowy)
+lxml>=5.2.0                 # szybki parser HTML/XML dla BeautifulSoup
+
+# ── Audio transcription ───────────────────────────────────────────────────
+replicate>=0.30.0           # Replicate Whisper large-v3 ($0.0002/min audio)
+
+# ── HuggingFace Hub — auto-upload dataset i modelu ────────────────────────
+huggingface_hub>=0.23.0     # upload datasetu i modelu do HF Hub
+datasets>=2.20.0            # HF datasets format (opcjonalny, dla konwersji)
 
 # ── HTTP / async ──────────────────────────────────────────────────────────
 httpx>=0.27.0
@@ -44,12 +57,10 @@ tqdm>=4.66.4
 rich>=13.7.1
 typer>=0.12.3
 
-# ── API / UI (pełny stack do lokalnego uruchomienia bez Dockera) ───────────
-# Te same paczki są w requirements.api.txt i requirements.ui.txt dla Dockera.
-# Tutaj zebrane razem, żeby `pip install -r requirements.txt` wystarczyło.
+# ── API / UI ──────────────────────────────────────────────────────────────
 fastapi>=0.111.0,<1.0
 uvicorn[standard]>=0.30.0,<1.0
-python-multipart>=0.0.9        # multipart file upload (POST /upload)
-websockets>=12.0,<14.0         # WebSocket support (live pipeline log)
+python-multipart>=0.0.9
+websockets>=12.0,<14.0
 streamlit>=1.36.0,<2.0
-requests>=2.32.0,<3.0          # używane przez UI do komunikacji z API
+requests>=2.32.0,<3.0

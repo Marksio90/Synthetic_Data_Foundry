@@ -1,20 +1,29 @@
 """
-main.py — ESG Data Foundry entry point.
+main.py — ESG Data Foundry entry point (Gods Finger v2).
 
 Usage:
-    python main.py --pdf data/csrd.pdf [--pdf data/sfdr.pdf ...] [--batch-id my-run-001]
+    python main.py --pdf data/csrd.pdf [--pdf data/sfdr.pdf ...]
+    python main.py --data-dir data/ [--batch-id my-run-001]
+    python main.py --data-dir data/ --formats pdf,docx,html,mp3
+
+Obsługiwane formaty dokumentów:
+    PDF, DOCX, HTML, XML, TXT, MD, MP3, WAV, M4A, MP4 (Replicate Whisper)
 
 Pipeline:
-    1. For each PDF: Ingestor → Chunker (stores chunks in PG)
-    2. For each pending chunk: run LangGraph swarm
-         Simulator → Expert (RAG + CoT) → Judge → write/retry/skip
-    3. Cross-document synthesis pass (chunks from different directives)
-    4. Output:
-         output/dataset_esg_v1.jsonl       — SFT ChatML (main dataset)
-         output/dataset_esg_v1_dpo.jsonl   — DPO preference pairs
-         output/dataset_esg_v1.datacard.json — statistics / quality report
+    1. Ingest & Chunk (PDF/DOCX/HTML/audio → chunks w DB)
+    2. Auto-kalibracja parametrów pipeline'u
+    3. Swarm: 8 perspektyw × każdy chunk
+         Simulator → RAG Expert → Constitutional AI → Judge → write/retry/skip
+    4. Cross-document synthesis (pary Q&A między dokumentami)
+    5. Datacard generation
+    6. HuggingFace Hub auto-upload (jeśli skonfigurowany)
 
-Idempotent: re-running after a crash skips already-processed chunks.
+Wyjście:
+    output/dataset_*.jsonl       — SFT ChatML
+    output/dataset_*_dpo.jsonl   — DPO preference pairs
+    output/dataset_*_orpo.jsonl  — ORPO preference pairs
+    output/dataset_*_kto.jsonl   — KTO labeled pairs
+    output/dataset_*.datacard.json — statystyki jakości
 """
 
 from __future__ import annotations
@@ -34,7 +43,8 @@ from agents.calibrator import calibrate
 from agents.chunker import chunk_document
 from agents.cross_doc import generate_cross_doc_samples
 from agents.expert import _is_tpd_limit
-from agents.ingestor import ingest_pdf
+from agents.hf_uploader import upload_dataset_to_hub
+from agents.ingestor import ingest_document
 from agents.translator import translate_chunks_in_db
 from config.settings import settings
 from db.models import Base, DirectiveChunk, SourceDocument
@@ -43,7 +53,7 @@ from pipeline.graph import build_graph
 from pipeline.state import FoundryState
 from utils.datacard import generate_datacard
 from utils.dedup import MinHashDeduplicator
-from utils.output import DPOWriter, JSONLWriter
+from utils.output import DPOWriter, JSONLWriter, KTOWriter, ORPOWriter
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -54,6 +64,14 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("foundry.main")
+
+# Wszystkie obsługiwane rozszerzenia plików
+_SUPPORTED_EXTENSIONS = {
+    ".pdf", ".docx", ".doc",
+    ".html", ".htm", ".xml",
+    ".txt", ".md", ".rst",
+    ".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -74,31 +92,14 @@ def create_tables(engine):
 
 
 def run_migrations(engine) -> None:
-    """
-    Idempotent schema patches applied on every startup.
-
-    Działa zarówno w Dockerze (gdzie init/01_schema.sql był uruchamiany przez
-    postgres entrypoint) jak i w lokalnym środowisku deweloperskim (gdzie
-    create_all tworzy tabele, ale nie uruchamia skryptów SQL).
-
-    Patch 0: Rozszerzenia PostgreSQL (pgvector, pg_trgm).
-    Patch 1: Kolumna fts_vector + trigger do automatycznej indeksacji FTS.
-    Patch 2: Stored procedure claim_chunk_for_processing (używana w repository.py).
-    Patch 3: Status-guarded finalize_chunk.
-    Patch 4-10: Nowe kolumny na generated_samples (IF NOT EXISTS).
-    """
     with engine.connect() as conn:
-        # ── Patch 0: Rozszerzenia ─────────────────────────────────────────────
         for ext in ("vector", "pg_trgm", '"uuid-ossp"'):
             conn.execute(text(f"CREATE EXTENSION IF NOT EXISTS {ext};"))
 
-        # ── Patch 1a: kolumna fts_vector ──────────────────────────────────────
         conn.execute(text(
-            "ALTER TABLE directive_chunks "
-            "ADD COLUMN IF NOT EXISTS fts_vector TSVECTOR;"
+            "ALTER TABLE directive_chunks ADD COLUMN IF NOT EXISTS fts_vector TSVECTOR;"
         ))
 
-        # ── Patch 1b: funkcja triggerowa update_chunk_fts ─────────────────────
         conn.execute(text("""
             CREATE OR REPLACE FUNCTION update_chunk_fts()
             RETURNS TRIGGER AS $$
@@ -110,105 +111,73 @@ def run_migrations(engine) -> None:
             $$ LANGUAGE plpgsql;
         """))
 
-        # ── Patch 1c: trigger (DROP + CREATE zamiast IF NOT EXISTS) ───────────
-        conn.execute(text(
-            "DROP TRIGGER IF EXISTS trg_chunk_fts ON directive_chunks;"
-        ))
+        conn.execute(text("DROP TRIGGER IF EXISTS trg_chunk_fts ON directive_chunks;"))
         conn.execute(text("""
             CREATE TRIGGER trg_chunk_fts
-                BEFORE INSERT OR UPDATE OF content
-                ON directive_chunks
+                BEFORE INSERT OR UPDATE OF content ON directive_chunks
                 FOR EACH ROW EXECUTE FUNCTION update_chunk_fts();
         """))
 
-        # ── Patch 1d: GIN index na fts_vector ────────────────────────────────
         conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_chunks_fts "
-            "ON directive_chunks USING gin (fts_vector);"
+            "CREATE INDEX IF NOT EXISTS idx_chunks_fts ON directive_chunks USING gin (fts_vector);"
         ))
 
-        # ── Patch 1e: IVFFlat ANN index (best-effort — może nie istnieć) ─────
         try:
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_chunks_embedding "
-                "ON directive_chunks "
-                "USING ivfflat (embedding vector_cosine_ops) "
-                "WITH (lists = 100);"
+                "ON directive_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);"
             ))
         except Exception as exc:
-            logger.warning(
-                "IVFFlat index creation skipped (insufficient data or pgvector missing): %s", exc
-            )
+            logger.warning("IVFFlat index skipped: %s", exc)
             conn.rollback()
-            # Ponownie otwórz transakcję po rollback
             conn.execute(text("SELECT 1"))
 
-        # ── Patch 2: claim_chunk_for_processing ───────────────────────────────
         conn.execute(text("""
             CREATE OR REPLACE FUNCTION claim_chunk_for_processing(p_chunk_id UUID)
             RETURNS BOOLEAN AS $$
-            DECLARE
-                rows_updated INTEGER;
+            DECLARE rows_updated INTEGER;
             BEGIN
-                UPDATE directive_chunks
-                SET    status = 'in_progress', updated_at = NOW()
-                WHERE  id = p_chunk_id
-                  AND  status = 'new'
-                  AND  retry_count < 3;
+                UPDATE directive_chunks SET status = 'in_progress', updated_at = NOW()
+                WHERE id = p_chunk_id AND status = 'new' AND retry_count < 3;
                 GET DIAGNOSTICS rows_updated = ROW_COUNT;
                 RETURN rows_updated = 1;
             END;
             $$ LANGUAGE plpgsql;
         """))
 
-        # ── Patch 3: status-guarded finalize_chunk ────────────────────────────
         conn.execute(text("""
             CREATE OR REPLACE FUNCTION finalize_chunk(
-                p_chunk_id  UUID,
-                p_success   BOOLEAN,
-                p_error     TEXT DEFAULT NULL
+                p_chunk_id UUID, p_success BOOLEAN, p_error TEXT DEFAULT NULL
             )
             RETURNS VOID AS $$
             BEGIN
                 IF p_success THEN
-                    UPDATE directive_chunks
-                    SET status = 'ready', updated_at = NOW()
-                    WHERE id = p_chunk_id
-                      AND status != 'ready';
+                    UPDATE directive_chunks SET status = 'ready', updated_at = NOW()
+                    WHERE id = p_chunk_id AND status != 'ready';
                 ELSE
-                    UPDATE directive_chunks
-                    SET
+                    UPDATE directive_chunks SET
                         retry_count = retry_count + 1,
-                        status = CASE
-                                    WHEN retry_count + 1 >= 3 THEN 'unresolvable'
-                                    ELSE 'new'
-                                 END,
-                        error_log = p_error,
-                        updated_at = NOW()
-                    WHERE id = p_chunk_id
-                      AND status NOT IN ('ready', 'unresolvable');
+                        status = CASE WHEN retry_count + 1 >= 3 THEN 'unresolvable' ELSE 'new' END,
+                        error_log = p_error, updated_at = NOW()
+                    WHERE id = p_chunk_id AND status NOT IN ('ready', 'unresolvable');
                 END IF;
             END;
             $$ LANGUAGE plpgsql;
         """))
 
-        # ── Patch 4–10: nowe kolumny na generated_samples ────────────────────
         for col_ddl in [
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS perspective TEXT",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS conversation_json JSONB",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS question_type TEXT",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS difficulty TEXT",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS rejected_answer TEXT",
-            # Sprint 2 — Auto-Reviewer
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS human_reviewed BOOLEAN",
             "ALTER TABLE generated_samples ADD COLUMN IF NOT EXISTS human_flag TEXT",
         ]:
             conn.execute(text(col_ddl + ";"))
 
         conn.commit()
-    logger.info(
-        "DB migrations applied: extensions + fts_vector + claim/finalize funcs + 7 schema patches"
-    )
+    logger.info("DB migrations applied.")
 
 
 # ---------------------------------------------------------------------------
@@ -216,47 +185,42 @@ def run_migrations(engine) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ESG Data Foundry pipeline")
-    p.add_argument(
-        "--pdf",
-        dest="pdfs",
-        action="append",
-        metavar="PATH",
-        default=[],
-        help="Path to a directive PDF (can be specified multiple times)",
-    )
-    p.add_argument(
-        "--data-dir",
-        dest="data_dir",
-        metavar="DIR",
-        default=None,
-        help="Process all *.pdf files in this directory (recursive)",
-    )
-    p.add_argument(
-        "--batch-id",
-        default=f"batch-{uuid.uuid4().hex[:8]}",
-        help="Logical batch identifier (default: random UUID prefix)",
-    )
-    p.add_argument(
-        "--chunk-limit",
-        type=int,
-        default=0,
-        help="Process at most N chunks (0 = unlimited; useful for testing)",
-    )
+    p = argparse.ArgumentParser(description="ESG Data Foundry — Gods Finger v2")
+    p.add_argument("--pdf", dest="files", action="append", metavar="PATH", default=[],
+                   help="Plik do przetworzenia (PDF/DOCX/HTML/audio). Można podać wielokrotnie.")
+    p.add_argument("--data-dir", dest="data_dir", metavar="DIR", default=None,
+                   help="Katalog z dokumentami (przetworzy wszystkie obsługiwane formaty)")
+    p.add_argument("--formats", dest="formats", default=None,
+                   help="Filtry rozszerzeń, np. pdf,docx,mp3 (domyślnie: wszystkie)")
+    p.add_argument("--batch-id", default=None,
+                   help="Identyfikator batchu (domyślnie: z .env lub losowy UUID)")
+    p.add_argument("--chunk-limit", type=int, default=0,
+                   help="Max chunków do przetworzenia (0 = bez limitu)")
+    p.add_argument("--perspectives", dest="perspectives", default=None,
+                   help="Perspektywy do użycia, np. cfo,prawnik,audytor (domyślnie: z .env)")
+    p.add_argument("--no-constitutional-ai", action="store_true",
+                   help="Wyłącz Constitutional AI (szybszy, niższa jakość)")
+    p.add_argument("--upload-hf", action="store_true",
+                   help="Wymuś upload do HuggingFace Hub po zakończeniu")
     args = p.parse_args()
 
-    # Collect PDFs from --data-dir
+    # Zbierz pliki z --data-dir
     if args.data_dir:
         dir_path = Path(args.data_dir)
         if not dir_path.is_dir():
-            p.error(f"--data-dir does not exist or is not a directory: {args.data_dir}")
-        found = sorted(dir_path.glob("*.pdf"))
-        if not found:
-            p.error(f"No *.pdf files found in: {args.data_dir}")
-        args.pdfs.extend(str(f) for f in found)
+            p.error(f"--data-dir nie istnieje: {args.data_dir}")
 
-    if not args.pdfs:
-        p.error("Provide at least one --pdf PATH or --data-dir DIR")
+        allowed_exts = _SUPPORTED_EXTENSIONS
+        if args.formats:
+            allowed_exts = {"." + ext.strip().lstrip(".") for ext in args.formats.split(",")}
+
+        found = sorted(f for f in dir_path.rglob("*") if f.suffix.lower() in allowed_exts)
+        if not found:
+            p.error(f"Brak obsługiwanych plików w: {args.data_dir}")
+        args.files.extend(str(f) for f in found)
+
+    if not args.files:
+        p.error("Podaj co najmniej --pdf PATH lub --data-dir DIR")
 
     return args
 
@@ -267,33 +231,57 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # Batch ID: CLI → .env → random
+    batch_id = args.batch_id or settings.batch_id or f"batch-{uuid.uuid4().hex[:8]}"
+
+    # Perspectives: CLI → .env
+    if args.perspectives:
+        perspectives = [p.strip() for p in args.perspectives.split(",") if p.strip()]
+    else:
+        perspectives = list(settings.perspectives)
+
+    # Constitutional AI override
+    if args.no_constitutional_ai:
+        settings.use_constitutional_ai = False
+
+    logger.info("=" * 60)
+    logger.info("ESG Data Foundry — Gods Finger v2")
+    logger.info("  Batch ID       : %s", batch_id)
+    logger.info("  Perspektywy    : %s", perspectives)
+    logger.info("  Constitutional : %s", settings.use_constitutional_ai)
+    logger.info("  Secondary LLM  : %s @ %s", settings.secondary_model, settings.secondary_base_url)
+    logger.info("  Pliki          : %d", len(args.files))
+    logger.info("=" * 60)
+
     engine = get_engine()
     create_tables(engine)
     run_migrations(engine)
     Session = sessionmaker(bind=engine)
 
-    # Writers & quality tools (shared across all chunks)
+    # Writers
     writer = JSONLWriter(
         output_path=settings.output_file,
         client_id=settings.client_id,
-        batch_id=args.batch_id,
+        batch_id=batch_id,
         watermark_interval=settings.watermark_interval,
     )
     dpo_writer = DPOWriter(output_path=settings.dpo_output_file)
+    orpo_writer = ORPOWriter(output_path=settings.orpo_output_file)
+    kto_writer = KTOWriter(output_path=settings.kto_output_file)
     deduplicator = MinHashDeduplicator(threshold=settings.dedup_threshold)
-    # Pre-load existing questions so resume runs don't generate duplicates
     deduplicator.load_from_jsonl(settings.output_file)
 
-    # ── Phase 1: Ingest & Chunk all PDFs ────────────────────────────────────
-    all_pdf_paths = [Path(p) for p in args.pdfs]
-    for pdf_path in all_pdf_paths:
-        if not pdf_path.exists():
-            logger.error("PDF not found: %s — skipping", pdf_path)
+    # ── Phase 1: Ingest & Chunk wszystkich plików ────────────────────────────
+    for file_path in args.files:
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Plik nie istnieje: %s — pomijam", path)
             continue
 
-        logger.info("=== Ingesting: %s ===", pdf_path.name)
+        logger.info("=== Ingesting: %s ===", path.name)
         with Session() as session:
-            source_doc_id, markdown = ingest_pdf(str(pdf_path), session)
+            source_doc_id, markdown = ingest_document(str(path), session)
 
             doc = session.scalar(
                 select(SourceDocument).where(SourceDocument.id == uuid.UUID(source_doc_id))
@@ -305,11 +293,8 @@ def main() -> None:
                     DirectiveChunk.source_doc_id == uuid.UUID(source_doc_id)
                 )
             )
-            if existing_count > 0:
-                logger.info(
-                    "Chunks already exist for %s (%d chunks) — skipping chunking",
-                    pdf_path.name, existing_count,
-                )
+            if existing_count and existing_count > 0:
+                logger.info("Chunks już istnieją dla %s (%d) — pomijam chunking", path.name, existing_count)
             else:
                 chunk_ids = chunk_document(
                     session,
@@ -317,81 +302,68 @@ def main() -> None:
                     markdown=markdown,
                     valid_from_date=valid_from,
                 )
-                logger.info("Chunked %s → %d chunks", pdf_path.name, len(chunk_ids))
+                logger.info("Podzielono %s → %d chunków", path.name, len(chunk_ids))
 
-                # ── Opcjonalne tłumaczenie chunków (TRANSLATE_CHUNKS=true) ───
                 if settings.translate_chunks and chunk_ids:
-                    logger.info(
-                        "=== Translating %d chunks (%s → pl) for %s ===",
-                        len(chunk_ids), settings.translate_source_lang, pdf_path.name,
-                    )
+                    logger.info("=== Tłumaczenie %d chunków (%s → pl) ===",
+                                len(chunk_ids), settings.translate_source_lang)
                     translated = translate_chunks_in_db(
                         session, chunk_ids, source_lang=settings.translate_source_lang
                     )
                     session.commit()
-                    logger.info("Translated %d/%d chunks", translated, len(chunk_ids))
+                    logger.info("Przetłumaczono %d/%d chunków", translated, len(chunk_ids))
 
-    # ── Phase 1.5: Auto-kalibracja parametrów pipeline'u ────────────────────
+    # ── Phase 1.5: Auto-kalibracja ────────────────────────────────────────────
     with Session() as session:
         cal_chunks = get_pending_chunks(session, limit=settings.calibration_samples)
         if cal_chunks:
-            logger.info(
-                "=== Auto-calibrating pipeline on %d sample chunks ===",
-                len(cal_chunks),
-            )
+            logger.info("=== Auto-kalibracja na %d próbkach ===", len(cal_chunks))
             cal = calibrate(cal_chunks)
-            logger.info("Calibration result:\n%s", cal.summary())
-            # Nadpisz ustawienia dynamicznie (bez restartu procesu)
+            logger.info("Kalibracja:\n%s", cal.summary())
             settings.quality_threshold = cal.quality_threshold
             settings.max_turns = cal.max_turns
             settings.adversarial_ratio = cal.adversarial_ratio
 
-    # ── Phase 2: Run swarm on pending chunks ────────────────────────────────
-    logger.info("=== Starting swarm on pending chunks (batch=%s) ===", args.batch_id)
+    # ── Phase 2: Swarm na pending chunks ─────────────────────────────────────
+    logger.info("=== Uruchamiam swarm (batch=%s, %d perspektyw) ===", batch_id, len(perspectives))
 
-    total_processed = 0
-    total_ready = 0
-    total_unresolvable = 0
+    total_processed = total_ready = total_unresolvable = 0
 
     with Session() as session:
-        graph = build_graph(session, writer, dpo_writer, deduplicator)
+        graph = build_graph(
+            session, writer,
+            dpo_writer=dpo_writer,
+            orpo_writer=orpo_writer,
+            kto_writer=kto_writer,
+            deduplicator=deduplicator,
+        )
 
         limit = args.chunk_limit if args.chunk_limit > 0 else 10_000
         pending = get_pending_chunks(session, limit=limit)
-        logger.info("Found %d pending chunks", len(pending))
-
-        perspectives = ["cfo", "prawnik", "audytor"]
+        logger.info("Znaleziono %d pending chunków", len(pending))
 
         for chunk in pending:
             chunk_meta = {
                 "id": str(chunk.id),
                 "content": chunk.content,
                 "content_md": chunk.content_md or chunk.content,
-                "source_document": (
-                    chunk.source_doc.filename if chunk.source_doc else "unknown"
-                ),
+                "source_document": (chunk.source_doc.filename if chunk.source_doc else "unknown"),
                 "chunk_index": chunk.chunk_index,
                 "section_heading": chunk.section_heading or "",
-                "valid_from_date": (
-                    chunk.valid_from_date.isoformat() if chunk.valid_from_date else ""
-                ),
+                "valid_from_date": (chunk.valid_from_date.isoformat() if chunk.valid_from_date else ""),
             }
 
-            # Atomically claim chunk (new → in_progress) before processing.
-            # Prevents concurrent workers from double-processing the same chunk.
-            # Also safe for re-runs: if chunk is already in_progress (crashed run),
-            # claim_chunk returns False but we still process it (recovery path).
             claimed = claim_chunk(session, chunk.id)
             if not claimed:
-                logger.debug("Chunk %s not freshly claimed (in_progress recovery)", chunk.id)
+                logger.debug("Chunk %s not freshly claimed (recovery)", chunk.id)
             try:
                 session.commit()
             except Exception:
                 session.rollback()
 
-            # Run pipeline once per perspective (CFO / prawnik / audytor).
-            # Each run produces one multi-turn conversation record (up to max_turns turns).
             chunk_ready = False
+            _GRAPH_RETRIES = 3
+
             for perspective in perspectives:
                 initial_state: FoundryState = {
                     "chunk": chunk_meta,
@@ -401,9 +373,11 @@ def main() -> None:
                     "retrieved_context": [],
                     "retrieved_ids": [],
                     "answer": "",
+                    "constitutional_critique": None,
                     "quality_score": 0.0,
                     "judge_model": "",
                     "judge_reasoning": "",
+                    "judge_details": {},
                     "retry_count": 0,
                     "status": "in_progress",
                     "error_message": None,
@@ -413,41 +387,32 @@ def main() -> None:
                     "question_type": "factual",
                     "difficulty": "medium",
                     "sample_id": None,
-                    "batch_id": args.batch_id,
+                    "batch_id": batch_id,
                     "record_index": writer.record_count,
                 }
 
-                _GRAPH_RETRIES = 3
                 for attempt in range(_GRAPH_RETRIES):
                     try:
                         final_state = graph.invoke(initial_state)
-                        final_status = final_state.get("status", "unknown")
-                        if final_status == "ready":
+                        if final_state.get("status") == "ready":
                             chunk_ready = True
                         break
                     except openai.RateLimitError as exc:
                         if _is_tpd_limit(exc):
                             logger.critical(
-                                "⛔ Dzienny limit TPD wyczerpany! Poczekaj do północy (UTC) "
-                                "lub zmień providera: SECONDARY_API_KEY / SECONDARY_MODEL. Błąd: %s", exc
+                                "⛔ Dzienny limit TPD wyczerpany! Zmień providera lub poczekaj. Błąd: %s", exc
                             )
                             sys.exit(1)
                         if attempt < _GRAPH_RETRIES - 1:
-                            wait = 2 ** attempt * 4  # 4s, 8s, 16s
-                            logger.warning(
-                                "Rate-limit for chunk %s [%s] — retry %d/%d in %ds: %s",
-                                chunk.id, perspective, attempt + 1, _GRAPH_RETRIES, wait, exc,
-                            )
+                            wait = 2 ** attempt * 4
+                            logger.warning("Rate-limit (chunk=%s, %s) — retry %d/%d za %ds",
+                                           chunk.id, perspective, attempt + 1, _GRAPH_RETRIES, wait)
                             time.sleep(wait)
                         else:
-                            logger.error(
-                                "Graph failed (rate-limit, %d attempts) chunk %s [%s]: %s",
-                                _GRAPH_RETRIES, chunk.id, perspective, exc,
-                            )
+                            logger.error("Graph failed (rate-limit, %d attempts) chunk=%s [%s]",
+                                         _GRAPH_RETRIES, chunk.id, perspective)
                     except Exception as exc:
-                        logger.error(
-                            "Graph failed for chunk %s [%s]: %s", chunk.id, perspective, exc
-                        )
+                        logger.error("Graph failed chunk=%s [%s]: %s", chunk.id, perspective, exc)
                         break
 
             total_processed += 1
@@ -456,63 +421,78 @@ def main() -> None:
             else:
                 total_unresolvable += 1
 
-            # Throttle — prevents secondary/OpenAI 429 rate-limit storms.
-            # Cerebras: 1M tokens/day free. Each chunk uses ~2k tokens × 3 perspectives = 6k tokens.
-            # CHUNK_DELAY_SECONDS=0 for Ollama/OpenAI; set 1-3 if secondary provider rate-limits.
             if settings.chunk_delay_seconds > 0:
                 time.sleep(settings.chunk_delay_seconds)
 
             logger.info(
                 "Progress: %d chunks | %d ready | %d unresolvable | "
-                "%d records | %d DPO pairs",
+                "%d SFT | %d DPO | %d ORPO | %d KTO",
                 total_processed, total_ready, total_unresolvable,
                 writer.record_count, dpo_writer.pair_count,
+                orpo_writer.pair_count, kto_writer.sample_count,
             )
 
-    # ── Phase 3: Cross-document synthesis pass ───────────────────────────────
+    # ── Phase 3: Cross-document synthesis ────────────────────────────────────
+    cross_written = 0
     if settings.cross_doc_samples > 0:
-        logger.info(
-            "=== Cross-document synthesis pass (target=%d samples) ===",
-            settings.cross_doc_samples,
-        )
+        logger.info("=== Cross-document synthesis (target=%d) ===", settings.cross_doc_samples)
         with Session() as session:
             cross_written = generate_cross_doc_samples(
                 session=session,
                 writer=writer,
                 dpo_writer=dpo_writer,
                 deduplicator=deduplicator,
-                batch_id=args.batch_id,
+                batch_id=batch_id,
                 n_samples=settings.cross_doc_samples,
             )
-        logger.info("Cross-doc pass: %d records written", cross_written)
-    else:
-        cross_written = 0
+        logger.info("Cross-doc: %d rekordów zapisanych", cross_written)
 
-    # ── Phase 4: Generate datacard ────────────────────────────────────────────
+    # ── Phase 4: Datacard ─────────────────────────────────────────────────────
     card = generate_datacard(
         jsonl_path=settings.output_file,
-        batch_id=args.batch_id,
+        batch_id=batch_id,
         extra_meta={
             "dpo_pairs_count": dpo_writer.pair_count,
-            "dpo_file": settings.dpo_output_file,
+            "orpo_pairs_count": orpo_writer.pair_count,
+            "kto_samples_count": kto_writer.sample_count,
             "cross_doc_records": cross_written,
             "dedup_index_size": deduplicator.size,
+            "perspectives_used": perspectives,
+            "constitutional_ai": settings.use_constitutional_ai,
         },
     )
 
+    # ── Phase 5: HuggingFace Hub upload ───────────────────────────────────────
+    if settings.hf_dataset_repo or args.upload_hf:
+        logger.info("=== Uploading dataset to HuggingFace Hub ===")
+        upload_dataset_to_hub(
+            sft_path=settings.output_file,
+            batch_id=batch_id,
+            dpo_path=settings.dpo_output_file,
+            orpo_path=settings.orpo_output_file,
+            kto_path=settings.kto_output_file,
+            datacard=card,
+        )
+
     # ── Summary ──────────────────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("ESG Data Foundry — Run Complete")
-    logger.info("  Batch ID           : %s", args.batch_id)
+    logger.info("ESG Data Foundry — Gods Finger v2 — Run Complete")
+    logger.info("  Batch ID           : %s", batch_id)
+    logger.info("  Perspektywy        : %s", perspectives)
+    logger.info("  Constitutional AI  : %s", settings.use_constitutional_ai)
     logger.info("  Chunks processed   : %d", total_processed)
     logger.info("  Records ready      : %d", total_ready)
     logger.info("  Unresolvable       : %d", total_unresolvable)
-    logger.info("  SFT records total  : %d", writer.record_count)
-    logger.info("  DPO pairs total    : %d", dpo_writer.pair_count)
+    logger.info("  SFT records        : %d", writer.record_count)
+    logger.info("  DPO pairs          : %d", dpo_writer.pair_count)
+    logger.info("  ORPO pairs         : %d", orpo_writer.pair_count)
+    logger.info("  KTO samples        : %d", kto_writer.sample_count)
     logger.info("  Cross-doc records  : %d", cross_written)
     logger.info("  Watermark hits     : %s", writer.watermark_positions)
     logger.info("  Output (SFT)       : %s", settings.output_file)
     logger.info("  Output (DPO)       : %s", settings.dpo_output_file)
+    logger.info("  Output (ORPO)      : %s", settings.orpo_output_file)
+    logger.info("  Output (KTO)       : %s", settings.kto_output_file)
     logger.info("  Datacard           : %s", Path(settings.output_file).with_suffix(".datacard.json"))
     logger.info("  Refusal %%          : %.1f%%", card.get("refusal_pct", 0))
     logger.info("  Multi-turn %%       : %.1f%%", card.get("turns", {}).get("multi_turn_pct", 0))

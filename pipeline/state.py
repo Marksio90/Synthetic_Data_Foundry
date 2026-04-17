@@ -8,20 +8,19 @@ returns a partial dict with only the keys it modified.
 
 from __future__ import annotations
 
-import uuid
 from typing import Optional
 from typing_extensions import TypedDict
 
 
 class ChunkMeta(TypedDict):
     """Minimal descriptor of the directive chunk being processed."""
-    id: str                  # UUID string
-    content: str             # plain-text chunk body
-    content_md: str          # markdown version (with tables)
-    source_document: str     # filename
+    id: str
+    content: str
+    content_md: str
+    source_document: str
     chunk_index: int
     section_heading: str
-    valid_from_date: str     # ISO date string or ""
+    valid_from_date: str
 
 
 class FoundryState(TypedDict):
@@ -30,36 +29,40 @@ class FoundryState(TypedDict):
 
     # ── Simulator output ───────────────────────────────────────────────────
     question: str
-    is_adversarial: bool     # True → question asks about something NOT in text
-    perspective: str         # "cfo" | "prawnik" | "audytor"
+    is_adversarial: bool
+    perspective: str        # cfo|prawnik|audytor|analityk|regulator|akademik|dziennikarz|inwestor
 
     # ── Expert RAG phase ───────────────────────────────────────────────────
-    retrieved_context: list[str]   # list of relevant chunk snippets
-    retrieved_ids: list[str]       # UUIDs of retrieved chunks (for audit)
+    retrieved_context: list[str]
+    retrieved_ids: list[str]
 
     # ── Expert generation phase ─────────────────────────────────────────────
     answer: str
 
+    # ── Constitutional AI (Gods Finger v2) ────────────────────────────────
+    constitutional_critique: Optional[str]  # wyniki audytu Constitutional AI
+
     # ── Judge output ───────────────────────────────────────────────────────
-    quality_score: float           # 0.0 – 1.0
-    judge_model: str               # which model was used
+    quality_score: float           # 0.0 – 1.0 (weighted avg)
+    judge_model: str
     judge_reasoning: str
+    judge_details: dict            # grounding/citation/completeness/language/hallucination
 
     # ── Control flow ───────────────────────────────────────────────────────
-    retry_count: int               # how many times this chunk was retried
+    retry_count: int
     status: str                    # new | in_progress | ready | unresolvable
     error_message: Optional[str]
 
     # ── Multi-turn conversation ────────────────────────────────────────────
-    conversation_history: list     # accumulates {"role": "user"|"assistant", "content": "..."} dicts
-    turn_count: int                # current turn number (0-based, incremented after each good Q&A)
+    conversation_history: list
+    turn_count: int
 
-    # ── DPO / quality metadata ─────────────────────────────────────────────
-    rejected_answer: Optional[str]   # first-attempt answer that scored below threshold
-    question_type: str               # factual | scope | process | compliance | comparative
-    difficulty: str                  # easy | medium | hard
+    # ── DPO / ORPO / KTO quality metadata ─────────────────────────────────
+    rejected_answer: Optional[str]
+    question_type: str             # factual | scope | process | compliance | comparative
+    difficulty: str                # easy | medium | hard
 
     # ── Output tracking ────────────────────────────────────────────────────
-    sample_id: Optional[str]       # UUID of GeneratedSample row
-    batch_id: str                  # logical batch identifier
-    record_index: int              # position in output JSONL (global counter)
+    sample_id: Optional[str]
+    batch_id: str
+    record_index: int

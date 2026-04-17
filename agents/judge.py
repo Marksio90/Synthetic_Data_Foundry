@@ -1,17 +1,24 @@
 """
-agents/judge.py — Agent Sędzia (Kaskadowy Weryfikator Jakości)
+agents/judge.py — Agent Sędzia (Wielowymiarowy Weryfikator Jakości)
 
 LangGraph node: judge_answer(state) → partial state update
 
-Cascade logic (Self-Check 2.0):
-  1. Send to gpt-4o-mini first (fast + cheap).
-  2. If returned confidence < QUALITY_THRESHOLD → fallback to o1-mini (reasoning).
-  3. All OpenAI calls wrapped in Tenacity exponential backoff (429, 5xx).
-  4. Optionally uses OpenAI Batch API (50% discount) when BATCH_MODE=true.
+Wielowymiarowa ocena (Gods Finger v2):
+  - grounding_score:    czy odpowiedź wynika z kontekstu? (0-1)
+  - citation_score:     czy artykuły/ustępy są cytowane? (0-1)
+  - completeness_score: czy odpowiedź wyczerpuje pytanie? (0-1)
+  - language_score:     jakość języka polskiego? (0-1)
+  - hallucination_flag: czy wykryto fakty spoza kontekstu? (bool)
+  - overall_score:      ważona średnia (finalna ocena)
+  - confidence:         pewność sędziego (→ eskalacja do gpt-4o)
 
-Grounding check for adversarial samples:
-  - If is_adversarial=True AND answer != refusal phrase → score = 0.0 (hallucination).
-  - If is_adversarial=True AND answer contains refusal phrase → score = 1.0 (correct).
+Cascade logic:
+  1. gpt-4o-mini (fast + cheap, ~95% przypadków)
+  2. gpt-4o (gdy confidence < judge_confidence_threshold, ~5% przypadków)
+
+Adversarial fast-path:
+  - is_adversarial + refusal → score=1.0 (reguła, bez API call)
+  - is_adversarial + answer  → score=0.0 (hallucynacja)
 """
 
 from __future__ import annotations
@@ -36,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
-# Fuzzy refusal detection — akceptuje warianty lingwistyczne
 _REFUSAL_VARIANTS = (
     "brak danych w dyrektywie",
     "brak informacji w dyrektywie",
@@ -47,35 +53,59 @@ _REFUSAL_VARIANTS = (
 
 
 def _is_refusal(text: str) -> bool:
-    """Rozmyte wykrywanie odmowy — obsługuje warianty językowe."""
     lower = text.lower().strip()
     return any(v in lower for v in _REFUSAL_VARIANTS)
 
-# Strip <reasoning>...</reasoning> blocks before quality evaluation so the
-# judge scores only the final answer, not the chain-of-thought scaffolding.
+
 _REASONING_RE = re.compile(r"<reasoning>.*?</reasoning>\s*", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_reasoning(text: str) -> str:
-    """Remove <reasoning>...</reasoning> block; return only the final answer."""
     return _REASONING_RE.sub("", text).strip()
 
 
+# ---------------------------------------------------------------------------
+# Wielowymiarowy system prompt sędziego
+# ---------------------------------------------------------------------------
+
 _JUDGE_SYSTEM = """Jesteś rygorystycznym audytorem jakości zestawów danych ESG.
 
-Oceniasz parę (pytanie, odpowiedź) pod kątem:
-1. UGRUNTOWANIE (Grounding): Czy odpowiedź wynika wyłącznie z dostarczonego kontekstu?
-   Halucynacja = dodane fakty spoza kontekstu.
-2. POPRAWNOŚĆ (Accuracy): Czy odpowiedź jest merytorycznie poprawna względem kontekstu?
-3. KOMPLETNOŚĆ (Completeness): Czy odpowiedź wyczerpuje temat pytania?
-4. FORMAT: Czy odpowiedź jest profesjonalna i po polsku?
+Oceniasz parę (pytanie, odpowiedź) pod kątem 5 wymiarów:
+
+1. UGRUNTOWANIE (grounding_score 0-1):
+   Czy każde twierdzenie w odpowiedzi wynika z dostarczonego kontekstu?
+   1.0 = w pełni ugruntowana | 0.0 = wymyślona/poza kontekstem
+
+2. CYTOWANIE (citation_score 0-1):
+   Czy odpowiedź cytuje numery artykułów/ustępów jako podstawę prawną?
+   1.0 = każde twierdzenie z artykułem | 0.0 = brak cytowań
+
+3. KOMPLETNOŚĆ (completeness_score 0-1):
+   Czy odpowiedź adresuje wszystkie aspekty pytania?
+   1.0 = pełna | 0.5 = częściowa | 0.0 = nie odpowiada na pytanie
+
+4. JAKOŚĆ JĘZYKOWA (language_score 0-1):
+   Czy odpowiedź jest po polsku, profesjonalna, 2-8 zdań?
+   1.0 = wzorowa | 0.5 = akceptowalna | 0.0 = nieczytelna/nie po polsku
+
+5. HALUCYNACJA (has_hallucination bool):
+   Czy wykryłeś fakty/liczby/daty spoza kontekstu?
+   true = tak (naruszenie) | false = czysta odpowiedź
+
+Oblicz overall_score jako: 0.40*grounding + 0.25*citation + 0.20*completeness + 0.15*language
+Jeśli has_hallucination=true, odejmij 0.3 od overall_score (min 0.0).
 
 Odpowiedz WYŁĄCZNIE w formacie JSON (bez żadnego innego tekstu):
 {
-  "score": <liczba od 0.0 do 1.0>,
-  "reasoning": "<1-2 zdania po angielsku>",
+  "grounding_score": <0.0-1.0>,
+  "citation_score": <0.0-1.0>,
+  "completeness_score": <0.0-1.0>,
+  "language_score": <0.0-1.0>,
   "has_hallucination": <true|false>,
-  "confidence": <liczba od 0.0 do 1.0 reprezentująca pewność tej oceny>
+  "hallucination_detail": "<co konkretnie jest halucynacją lub 'none'>",
+  "overall_score": <0.0-1.0>,
+  "reasoning": "<1-2 zdania po angielsku — główne uzasadnienie>",
+  "confidence": <0.0-1.0>
 }
 """
 
@@ -88,15 +118,14 @@ PYTANIE:
 ODPOWIEDŹ DO OCENY:
 {answer}
 
-Oceń powyższą parę zgodnie z instrukcją systemową."""
+Oceń zgodnie z instrukcją systemową."""
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator (Self-Check 2.0)
+# Retry decorator
 # ---------------------------------------------------------------------------
 
 def _is_retryable(exc: BaseException) -> bool:
-    """Retry only on 429 (rate limit) and 5xx (server errors). Never on 4xx."""
     if isinstance(exc, openai.RateLimitError):
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
@@ -121,48 +150,64 @@ def _retry_openai(func):
 @_retry_openai
 def _call_judge_model(model: str, messages: list[dict]) -> str:
     client = openai.OpenAI(api_key=settings.openai_api_key)
-    kwargs: dict = dict(
-        model=model,
-        messages=messages,
-        temperature=0.0,
-    )
-    # o1-mini uses max_completion_tokens instead of max_tokens
+    kwargs: dict = dict(model=model, messages=messages, temperature=0.0)
     if "o1" in model:
         kwargs["max_completion_tokens"] = 512
     else:
         kwargs["max_tokens"] = 512
-
     response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content.strip()
 
 
 def _parse_judge_response(raw: str) -> dict:
-    """Extract JSON from model response, robust to markdown fences."""
-    # Strip ```json ... ``` fences if present
     cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to find first {...} block
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
-            data = json.loads(match.group())
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                logger.error("Failed to parse judge response: %s", raw[:200])
+                return _fallback_parse_result()
         else:
-            logger.error("Failed to parse judge response: %s", raw[:200])
-            return {"score": 0.0, "reasoning": "parse error", "has_hallucination": True, "confidence": 0.0}
+            logger.error("No JSON found in judge response: %s", raw[:200])
+            return _fallback_parse_result()
     return data
 
 
-_MIN_ANSWER_CHARS = 30  # answers shorter than this are rejected without calling the LLM
+def _fallback_parse_result() -> dict:
+    return {
+        "grounding_score": 0.0,
+        "citation_score": 0.0,
+        "completeness_score": 0.0,
+        "language_score": 0.0,
+        "has_hallucination": True,
+        "hallucination_detail": "parse error",
+        "overall_score": 0.0,
+        "reasoning": "parse error",
+        "confidence": 0.0,
+    }
+
+
+def _safe_score(raw_score: object) -> float:
+    try:
+        s = float(raw_score)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, s))
+
+
+_MIN_ANSWER_CHARS = 30
 
 
 def _build_messages(state: FoundryState) -> list[dict]:
     context_parts = state.get("retrieved_context", [state["chunk"]["content"]])
     context_raw = "\n---\n".join(context_parts)
     if len(context_raw) > 8000:
-        logger.warning("Judge context TRUNCATED from %d to 8000 chars — may affect verdict", len(context_raw))
+        logger.warning("Judge context TRUNCATED from %d to 8000 chars", len(context_raw))
         context_raw = context_raw[:8000]
-    # Strip CoT reasoning block — judge evaluates the final answer only
     answer_for_eval = _strip_reasoning(state["answer"])
     user_content = _JUDGE_USER_TEMPLATE.format(
         context=context_raw,
@@ -175,62 +220,63 @@ def _build_messages(state: FoundryState) -> list[dict]:
     ]
 
 
-def _safe_score(raw_score: object) -> float:
-    """Clamp and validate judge score to [0.0, 1.0]."""
-    try:
-        s = float(raw_score)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, s))
-
+# ---------------------------------------------------------------------------
+# Public node
+# ---------------------------------------------------------------------------
 
 def judge_answer(state: FoundryState) -> dict:
     """
     LangGraph node.
-    Returns {"quality_score": ..., "judge_model": ..., "judge_reasoning": ...}
+    Returns {
+      "quality_score": float,
+      "judge_model": str,
+      "judge_reasoning": str,
+      "judge_details": dict  ← nowe: grounding/citation/completeness/language/hallucination
+    }
     """
     is_adversarial = state.get("is_adversarial", False)
     answer = state.get("answer", "")
-    # Strip CoT block for all rule-based checks — evaluate final answer only
     answer_eval = _strip_reasoning(answer)
 
-    # Fast-path: reject trivially short non-adversarial answers immediately
+    # Fast-path: trivially short non-adversarial answers
     if not is_adversarial and len(answer_eval) < _MIN_ANSWER_CHARS:
-        logger.warning("Answer too short (%d chars) — rejecting without LLM call", len(answer_eval))
+        logger.warning("Answer too short (%d chars) — rejecting", len(answer_eval))
         return {
             "quality_score": 0.0,
             "judge_model": "rule-based",
-            "judge_reasoning": f"Answer too short ({len(answer_eval)} chars < {_MIN_ANSWER_CHARS} minimum).",
+            "judge_reasoning": f"Answer too short ({len(answer_eval)} chars < {_MIN_ANSWER_CHARS}).",
+            "judge_details": {},
         }
 
-    # Fast-path for adversarial samples: check refusal compliance (fuzzy)
+    # Fast-path: adversarial samples
     if is_adversarial:
         if _is_refusal(answer_eval):
-            logger.debug("Adversarial sample correctly refused → score=1.0")
+            logger.debug("Adversarial: correct refusal → score=1.0")
             return {
                 "quality_score": 1.0,
                 "judge_model": "rule-based",
                 "judge_reasoning": "Correct refusal for adversarial question.",
+                "judge_details": {"adversarial": True, "refused": True},
             }
         else:
-            logger.warning("Adversarial question was answered (possible hallucination) → score=0.0")
+            logger.warning("Adversarial: answered instead of refused → score=0.0 (hallucination)")
             return {
                 "quality_score": 0.0,
                 "judge_model": "rule-based",
                 "judge_reasoning": "Adversarial question answered instead of refused — hallucination.",
+                "judge_details": {"adversarial": True, "refused": False},
             }
 
-    # Normal path: call gpt-4o-mini
+    # Normal path: wywołaj gpt-4o-mini z wielowymiarowym promptem
     messages = _build_messages(state)
     try:
         raw = _call_judge_model(settings.openai_primary_model, messages)
         result = _parse_judge_response(raw)
-        score: float = _safe_score(result.get("score", 0.0))
+        score: float = _safe_score(result.get("overall_score", 0.0))
         confidence: float = _safe_score(result.get("confidence", 1.0))
         judge_model = settings.openai_primary_model
 
-        # Cascade: eskaluj gdy pewność sędziego niska (judge_confidence_threshold),
-        # NIE gdy wynik jest poniżej progu akceptacji (quality_threshold) — to różne pojęcia.
+        # Cascade: eskaluj gdy pewność sędziego niska
         if confidence < settings.judge_confidence_threshold:
             logger.info(
                 "Judge confidence %.2f < %.2f — escalating to %s",
@@ -238,26 +284,44 @@ def judge_answer(state: FoundryState) -> dict:
             )
             raw2 = _call_judge_model(settings.openai_fallback_model, messages)
             result = _parse_judge_response(raw2)
-            score = _safe_score(result.get("score", 0.0))
+            score = _safe_score(result.get("overall_score", 0.0))
             judge_model = settings.openai_fallback_model
 
     except Exception as exc:
         logger.error("Judge failed for chunk %s: %s", state["chunk"]["id"], exc)
         score = 0.0
-        result = {"reasoning": str(exc), "has_hallucination": True}
+        result = _fallback_parse_result()
+        result["reasoning"] = str(exc)
         judge_model = "error"
 
+    # Structured log z wszystkimi wymiarami
     logger.info(
-        "JUDGE chunk=%s turn=%d perspective=%s model=%s score=%.3f halluc=%s",
+        "JUDGE chunk=%s turn=%d perspective=%s model=%s "
+        "score=%.3f grnd=%.2f cite=%.2f comp=%.2f lang=%.2f halluc=%s",
         state["chunk"]["id"][:8],
         state.get("turn_count", 0),
         state.get("perspective", "?"),
         judge_model,
         score,
+        _safe_score(result.get("grounding_score", 0)),
+        _safe_score(result.get("citation_score", 0)),
+        _safe_score(result.get("completeness_score", 0)),
+        _safe_score(result.get("language_score", 0)),
         result.get("has_hallucination", False),
     )
+
+    judge_details = {
+        "grounding_score": _safe_score(result.get("grounding_score", 0)),
+        "citation_score": _safe_score(result.get("citation_score", 0)),
+        "completeness_score": _safe_score(result.get("completeness_score", 0)),
+        "language_score": _safe_score(result.get("language_score", 0)),
+        "has_hallucination": bool(result.get("has_hallucination", False)),
+        "hallucination_detail": result.get("hallucination_detail", ""),
+    }
+
     return {
         "quality_score": score,
         "judge_model": judge_model,
         "judge_reasoning": result.get("reasoning", ""),
+        "judge_details": judge_details,
     }

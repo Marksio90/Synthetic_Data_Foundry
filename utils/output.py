@@ -1,14 +1,14 @@
 """
-utils/output.py — JSONL writer with ACID guarantees + B2B watermarking.
+utils/output.py — JSONL writers: SFT + DPO + ORPO + KTO + watermarking.
 
-Design:
-  - The file is opened in append mode; each record is a single JSON line.
-  - Writing is guarded by a threading.Lock so concurrent callers don't
-    interleave partial lines.
-  - A record is written inside the same DB transaction as the sample status
-    update — if either fails, neither persists (ACID idempotency).
-  - Every WATERMARK_INTERVAL-th record has its assistant turn modified with
-    the linguistic watermark before writing.
+Formaty treningowe:
+  JSONLWriter  — SFT ChatML (OpenAI fine-tuning, HF TRL SFTTrainer)
+  DPOWriter    — DPO preference pairs (TRL DPOTrainer)
+  ORPOWriter   — ORPO preference pairs (TRL ORPOTrainer) — identyczny format co DPO
+  KTOWriter    — KTO labeled completions (TRL KTOTrainer)
+
+Wszystkie writery są thread-safe (threading.Lock) i ACID (round-trip JSON validation).
+Watermarking: co N rekordów → B2B linguistic watermark w ostatniej turze asystenta.
 """
 
 from __future__ import annotations
@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
+
+# ---------------------------------------------------------------------------
+# SFT Writer
+# ---------------------------------------------------------------------------
 
 class JSONLWriter:
     """Thread-safe, append-only JSONL writer with watermark injection."""
@@ -53,11 +57,9 @@ class JSONLWriter:
         self._watermark_positions: list[int] = []
 
     def _count_existing_records(self) -> tuple[int, int]:
-        """Resume from the last written line; also count existing refusals."""
         if not self.output_path.exists():
             return 0, 0
-        total = 0
-        refusals = 0
+        total = refusals = 0
         with self.output_path.open("r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
@@ -72,39 +74,31 @@ class JSONLWriter:
         return total, refusals
 
     def should_skip(self, messages: list[dict]) -> bool:
-        """
-        Thread-safe pre-check: would write_conversation skip this record?
-        Call this BEFORE DB commit to avoid committing a record we won't write.
-        """
         with self._lock:
             return self._is_refusal_capped(messages)
 
     def _is_refusal_capped(self, messages: list[dict]) -> bool:
-        """Check if record is a refusal and cap has been reached (not thread-safe, call under lock)."""
         assistant_turns = [m for m in messages if m["role"] == "assistant"]
         if not assistant_turns:
             return False
         refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
-        # Count as refusal if majority of turns are "Brak danych"
         is_mostly_refusals = refusal_turns / len(assistant_turns) > 0.5
         if is_mostly_refusals and self._record_count > 0:
             return (self._refusal_count / self._record_count) >= self.max_refusal_ratio
         return False
 
-    def write_conversation(self, messages: list[dict], metadata: Optional[dict] = None) -> tuple[int, Optional[str]]:
+    def write_conversation(
+        self, messages: list[dict], metadata: Optional[dict] = None
+    ) -> tuple[int, Optional[str]]:
         """
-        Write a multi-turn conversation as a single JSONL record.
-        messages includes system + user/assistant turns.
-        metadata: optional dict written as a "metadata" field (non-standard but
-                  ignored by OpenAI fine-tuning; usable by HuggingFace TRL).
-        Returns (record_index, watermark_hash).
-        Returns (-1, None) when skipped due to refusal cap.
+        Write multi-turn conversation as single JSONL record.
+        Returns (record_index, watermark_hash). Returns (-1, None) when skipped.
         """
         with self._lock:
-            # Check refusal cap (majority-based: >50% refusal turns = refusal record)
             if self._is_refusal_capped(messages):
-                logger.debug("Refusal cap reached — skipping multi-turn record")
+                logger.debug("Refusal cap reached — skipping record")
                 return -1, None
+
             assistant_turns = [m for m in messages if m["role"] == "assistant"]
             refusal_turns = sum(1 for m in assistant_turns if _REFUSAL_PHRASE in m["content"])
             is_mostly_refusals = len(assistant_turns) > 0 and refusal_turns / len(assistant_turns) > 0.5
@@ -112,11 +106,9 @@ class JSONLWriter:
             idx = self._record_count
             watermark_hash: Optional[str] = None
 
-            # Apply watermark to last assistant turn every N records
             if self.watermark_interval > 0 and idx % self.watermark_interval == 0 and idx > 0:
                 technique = idx // self.watermark_interval
-                # Find last assistant message and inject watermark
-                messages = list(messages)  # copy to avoid mutating caller's list
+                messages = list(messages)
                 for i in range(len(messages) - 1, -1, -1):
                     if messages[i]["role"] == "assistant":
                         messages[i] = {
@@ -127,10 +119,8 @@ class JSONLWriter:
                 watermark_hash = compute_watermark_hash(self.client_id, self.batch_id, idx)
                 self._watermark_positions.append(idx)
                 logger.debug(
-                    "Watermark injected at record %d (technique=%s, hash=%s)",
-                    idx,
-                    build_watermark_description(technique),
-                    watermark_hash[:8] + "...",
+                    "Watermark injected at record %d (technique=%s, hash=%s…)",
+                    idx, build_watermark_description(technique), watermark_hash[:8],
                 )
 
             record: dict = {"messages": messages}
@@ -138,8 +128,7 @@ class JSONLWriter:
                 record["metadata"] = metadata
 
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-            # Validate round-trip before appending (no truncated JSON)
-            json.loads(line)
+            json.loads(line)  # round-trip validation
 
             with self.output_path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -159,22 +148,20 @@ class JSONLWriter:
         return self._record_count
 
 
+# ---------------------------------------------------------------------------
+# DPO Writer (also used as ORPO — same format, different trainer)
+# ---------------------------------------------------------------------------
+
 class DPOWriter:
     """
-    Thread-safe writer for DPO (Direct Preference Optimization) preference pairs.
+    Thread-safe DPO/ORPO preference pair writer.
 
-    Output format — one JSON line per pair, compatible with HuggingFace TRL
-    DPOTrainer (https://huggingface.co/docs/trl/dpo_trainer):
-
-        {
-          "prompt":   [system_msg, user_msg],
-          "chosen":   [{"role": "assistant", "content": "<good answer>"}],
-          "rejected": [{"role": "assistant", "content": "<bad answer>"}]
-        }
-
-    Pairs are generated whenever an initial answer scores below the quality
-    threshold and a retry succeeds — the failed answer becomes "rejected",
-    the successful one becomes "chosen".
+    Format (HuggingFace TRL DPOTrainer / ORPOTrainer):
+    {
+      "prompt":   [system_msg, user_msg],
+      "chosen":   [{"role": "assistant", "content": "<good answer>"}],
+      "rejected": [{"role": "assistant", "content": "<bad answer>"}]
+    }
     """
 
     def __init__(self, output_path: str) -> None:
@@ -197,13 +184,7 @@ class DPOWriter:
         chosen_answer: str,
         rejected_answer: str,
     ) -> int:
-        """
-        Write one DPO preference pair.  Returns pair index, or -1 if skipped.
-
-        prompt_messages: [system_msg, user_msg] without the assistant turn.
-        chosen_answer:   the higher-quality answer (score >= threshold).
-        rejected_answer: the lower-quality answer (score < threshold).
-        """
+        """Write one DPO/ORPO preference pair. Returns pair index, or -1 if skipped."""
         if not chosen_answer.strip() or not rejected_answer.strip():
             return -1
         if chosen_answer.strip() == rejected_answer.strip():
@@ -211,12 +192,11 @@ class DPOWriter:
 
         record = {
             "prompt": prompt_messages,
-            "chosen":   [{"role": "assistant", "content": chosen_answer}],
+            "chosen": [{"role": "assistant", "content": chosen_answer}],
             "rejected": [{"role": "assistant", "content": rejected_answer}],
         }
-
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        json.loads(line)  # validate round-trip
+        json.loads(line)
 
         with self._lock:
             with self.output_path.open("a", encoding="utf-8") as f:
@@ -230,4 +210,89 @@ class DPOWriter:
 
     @property
     def pair_count(self) -> int:
+        return self._count
+
+
+# ORPO format = DPO format (różny tylko trainer)
+ORPOWriter = DPOWriter
+
+
+# ---------------------------------------------------------------------------
+# KTO Writer (Kahneman-Tversky Optimization)
+# ---------------------------------------------------------------------------
+
+class KTOWriter:
+    """
+    Thread-safe KTO labeled completion writer.
+
+    Format (HuggingFace TRL KTOTrainer):
+    {
+      "prompt":     [system_msg, user_msg],
+      "completion": [{"role": "assistant", "content": "..."}],
+      "label":      true   ← true=dobre, false=złe
+    }
+
+    KTO nie wymaga par — każda próbka jest niezależna.
+    Generuje 2 rekordy na parę DPO: jeden chosen(true) + jeden rejected(false).
+    """
+
+    def __init__(self, output_path: str) -> None:
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._count = self._count_existing()
+
+    def _count_existing(self) -> int:
+        if not self.output_path.exists():
+            return 0
+        count = sum(1 for line in self.output_path.open("r", encoding="utf-8") if line.strip())
+        if count:
+            logger.info("KTOWriter: resuming from %d existing records in %s", count, self.output_path.name)
+        return count
+
+    def write_sample(
+        self,
+        prompt_messages: list[dict],
+        completion: str,
+        label: bool,
+    ) -> int:
+        """Write one KTO labeled sample. Returns index, or -1 if skipped."""
+        if not completion.strip():
+            return -1
+
+        record = {
+            "prompt": prompt_messages,
+            "completion": [{"role": "assistant", "content": completion}],
+            "label": label,
+        }
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        json.loads(line)
+
+        with self._lock:
+            with self.output_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+            idx = self._count
+            self._count += 1
+
+        return idx
+
+    def write_pair(
+        self,
+        prompt_messages: list[dict],
+        chosen_answer: str,
+        rejected_answer: str,
+    ) -> tuple[int, int]:
+        """
+        Write DPO pair as 2 KTO records: chosen(true) + rejected(false).
+        Returns (chosen_idx, rejected_idx).
+        """
+        chosen_idx = self.write_sample(prompt_messages, chosen_answer, label=True)
+        rejected_idx = self.write_sample(prompt_messages, rejected_answer, label=False)
+        if chosen_idx >= 0 and rejected_idx >= 0:
+            logger.debug("KTO pair written: #%d (true) + #%d (false)", chosen_idx, rejected_idx)
+        return chosen_idx, rejected_idx
+
+    @property
+    def sample_count(self) -> int:
         return self._count

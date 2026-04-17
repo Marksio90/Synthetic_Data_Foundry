@@ -1,17 +1,19 @@
 """
-agents/ingestor.py — Agent Ingestor (Poborca & Parser)
+agents/ingestor.py — Agent Ingestor (Multi-format Parser)
 
-Responsibilities:
-  1. Accept a PDF file path.
-  2. Convert it to Markdown using (in order of preference):
-       a) LlamaParse (cloud, best table support — requires API key)
-       b) PyMuPDF   (local, free, no limits — default fallback)
-       c) OpenAI Vision API (last resort for scans/image-only PDFs)
-  3. Extract directive metadata (name, year, valid_from_date).
-  4. Detect supersession relationships (e.g. amendment replaces old article)
-     and set is_superseded=True on any previously stored chunks of the same
-     document family (Self-Check 3.0 patch).
-  5. Persist the SourceDocument row and return raw markdown for the Chunker.
+Obsługiwane formaty:
+  PDF  → LlamaParse (cloud, tabele) → PyMuPDF (local) → OpenAI Vision (skany)
+  DOCX → python-docx (local, darmowy)
+  HTML → BeautifulSoup (local, darmowy)
+  XML  → BeautifulSoup (local, darmowy)
+  TXT  → plain text (local, darmowy)
+  MD   → Markdown as-is (local, darmowy)
+  MP3/WAV/M4A/MP4 → Replicate Whisper large-v3 (transkrypcja audio → markdown)
+
+Wymagania:
+  python-docx   — pip install python-docx
+  beautifulsoup4 — pip install beautifulsoup4 lxml
+  replicate     — pip install replicate (do audio)
 """
 
 from __future__ import annotations
@@ -30,7 +32,13 @@ from db import repository as repo
 
 logger = logging.getLogger(__name__)
 
-# Regex: find ISO dates near keywords like "wchodzi w życie", "applicable from"
+# Obsługiwane rozszerzenia
+_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm"}
+_PDF_EXTENSIONS = {".pdf"}
+_DOCX_EXTENSIONS = {".docx", ".doc"}
+_HTML_EXTENSIONS = {".html", ".htm", ".xml"}
+_TEXT_EXTENSIONS = {".txt", ".md", ".rst"}
+
 _DATE_RE = re.compile(
     r"(?:wchodzi w życie|applicable from|valid from|effective|od dnia)\s*:?\s*"
     r"(\d{1,2}[\./\-]\d{1,2}[\./\-]\d{4}|\d{4}[\./\-]\d{2}[\./\-]\d{2})",
@@ -38,12 +46,12 @@ _DATE_RE = re.compile(
 )
 _YEAR_RE = re.compile(r"\b(20\d{2})\b")
 
+
 # ---------------------------------------------------------------------------
-# LlamaParse client (lazy import — not installed in unit-test environments)
+# Parsery — PDF
 # ---------------------------------------------------------------------------
 
 def _parse_with_llamaparse(pdf_path: Path) -> str:
-    """Use LlamaParse cloud API to convert PDF → Markdown (table-aware)."""
     from llama_parse import LlamaParse  # type: ignore
 
     parser = LlamaParse(
@@ -57,12 +65,7 @@ def _parse_with_llamaparse(pdf_path: Path) -> str:
 
 
 def _parse_with_pymupdf(pdf_path: Path) -> str:
-    """
-    Parse PDF locally using PyMuPDF (fitz) — free, no API limits.
-    Builds a Markdown representation: headings for large font sizes,
-    plain paragraphs otherwise; inserts <!-- Page N --> markers between pages.
-    """
-    import fitz  # type: ignore  # pymupdf
+    import fitz  # type: ignore
 
     doc = fitz.open(str(pdf_path))
     pages_md: list[str] = []
@@ -72,7 +75,7 @@ def _parse_with_pymupdf(pdf_path: Path) -> str:
         lines: list[str] = []
 
         for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:  # 0 = text block
+            if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
                 line_parts: list[str] = []
@@ -96,16 +99,12 @@ def _parse_with_pymupdf(pdf_path: Path) -> str:
 
 
 def _parse_with_openai_vision(pdf_path: Path) -> str:
-    """
-    Fallback: convert each PDF page to an image and send to GPT-4o vision.
-    Requires 'pdf2image' and 'Pillow' packages + poppler utilities.
-    """
     import base64
     import io
 
     import openai
     from pdf2image import convert_from_path  # type: ignore
-    from PIL import Image  # type: ignore
+    from PIL import Image  # type: ignore  # noqa: F401
 
     client = openai.OpenAI(api_key=settings.openai_api_key)
     pages = convert_from_path(str(pdf_path), dpi=150)
@@ -117,31 +116,168 @@ def _parse_with_openai_vision(pdf_path: Path) -> str:
         b64 = base64.b64encode(buf.getvalue()).decode()
         response = client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Convert this EU directive page to Markdown. "
-                                "Reproduce all tables using Markdown table syntax. "
-                                "Preserve all article numbers and headings exactly."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"},
-                        },
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Convert this document page to Markdown. "
+                            "Reproduce all tables using Markdown table syntax. "
+                            "Preserve all article numbers, headings, and structure exactly."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }],
             max_tokens=4096,
         )
         full_markdown.append(f"<!-- Page {i+1} -->\n{response.choices[0].message.content}")
 
     return "\n\n".join(full_markdown)
 
+
+# ---------------------------------------------------------------------------
+# Parsery — DOCX
+# ---------------------------------------------------------------------------
+
+def _parse_with_docx(docx_path: Path) -> str:
+    """Parse DOCX → Markdown using python-docx."""
+    try:
+        import docx  # type: ignore
+    except ImportError:
+        raise ImportError("python-docx not installed: pip install python-docx")
+
+    doc = docx.Document(str(docx_path))
+    lines: list[str] = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        style_name = para.style.name.lower() if para.style else ""
+        if "heading 1" in style_name:
+            lines.append(f"# {text}")
+        elif "heading 2" in style_name:
+            lines.append(f"## {text}")
+        elif "heading 3" in style_name:
+            lines.append(f"### {text}")
+        else:
+            lines.append(text)
+
+    # Tables
+    for table in doc.tables:
+        headers = [cell.text.strip() for cell in table.rows[0].cells]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in table.rows[1:]:
+            cells = [cell.text.strip() for cell in row.cells]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Parsery — HTML / XML
+# ---------------------------------------------------------------------------
+
+def _parse_with_html(html_path: Path) -> str:
+    """Parse HTML/XML → Markdown using BeautifulSoup."""
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+    except ImportError:
+        raise ImportError("beautifulsoup4 not installed: pip install beautifulsoup4 lxml")
+
+    with html_path.open("r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    soup = BeautifulSoup(content, "lxml")
+
+    # Remove script/style
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
+
+    lines: list[str] = []
+    for element in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "table", "tr"]):
+        tag = element.name
+        text = element.get_text(separator=" ").strip()
+        if not text:
+            continue
+        if tag == "h1":
+            lines.append(f"# {text}")
+        elif tag == "h2":
+            lines.append(f"## {text}")
+        elif tag == "h3":
+            lines.append(f"### {text}")
+        elif tag == "h4":
+            lines.append(f"#### {text}")
+        elif tag == "li":
+            lines.append(f"- {text}")
+        elif tag in ("p", "tr"):
+            lines.append(text)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Parsery — Plain text / Markdown
+# ---------------------------------------------------------------------------
+
+def _parse_plain_text(path: Path) -> str:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+# ---------------------------------------------------------------------------
+# Parsery — Audio via Replicate Whisper large-v3
+# ---------------------------------------------------------------------------
+
+def _parse_with_whisper(audio_path: Path) -> str:
+    """
+    Transkrypcja audio → Markdown za pomocą Replicate Whisper large-v3.
+    Koszt: ~$0.0002/min audio (nagrania konferencji ESG → dane treningowe).
+    """
+    if not settings.replicate_api_key:
+        raise ValueError(
+            "REPLICATE_API_KEY not set — audio transcription unavailable. "
+            "Get your key at https://replicate.com"
+        )
+
+    try:
+        import replicate  # type: ignore
+    except ImportError:
+        raise ImportError("replicate not installed: pip install replicate")
+
+    import os
+    os.environ.setdefault("REPLICATE_API_TOKEN", settings.replicate_api_key)
+
+    logger.info("Transcribing audio with Whisper large-v3: %s", audio_path.name)
+
+    with audio_path.open("rb") as audio_file:
+        output = replicate.run(
+            "openai/whisper:4d50797290df275329f202e48c76360b3f22b08d28c196cbc54600319435f8d2",
+            input={
+                "audio": audio_file,
+                "model": "large-v3",
+                "language": "auto",
+                "transcription": "plain text",
+                "word_timestamps": False,
+            },
+        )
+
+    transcript = output.get("transcription", "") if isinstance(output, dict) else str(output)
+
+    # Format jako Markdown z nagłówkiem
+    return f"# Transkrypcja: {audio_path.name}\n\n{transcript}"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _extract_valid_from_date(markdown: str) -> Optional[date]:
     match = _DATE_RE.search(markdown)
@@ -174,53 +310,87 @@ def _sha256(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Routing — wybór parsera na podstawie rozszerzenia
+# ---------------------------------------------------------------------------
+
+def _parse_document(path: Path) -> str:
+    """Route file to appropriate parser based on extension."""
+    ext = path.suffix.lower()
+
+    # ── PDF ──────────────────────────────────────────────────────────────────
+    if ext in _PDF_EXTENSIONS:
+        markdown = ""
+        if settings.llama_parse_api_key:
+            logger.info("Parsing PDF with LlamaParse: %s", path.name)
+            try:
+                markdown = _parse_with_llamaparse(path)
+            except Exception as exc:
+                logger.warning("LlamaParse failed (%s), falling back to PyMuPDF", exc)
+        if not markdown:
+            logger.info("Parsing PDF with PyMuPDF: %s", path.name)
+            try:
+                markdown = _parse_with_pymupdf(path)
+            except Exception as exc:
+                logger.warning("PyMuPDF failed (%s), falling back to OpenAI Vision", exc)
+        if not markdown:
+            logger.info("Parsing PDF with OpenAI Vision: %s", path.name)
+            markdown = _parse_with_openai_vision(path)
+        return markdown
+
+    # ── DOCX ─────────────────────────────────────────────────────────────────
+    if ext in _DOCX_EXTENSIONS:
+        logger.info("Parsing DOCX: %s", path.name)
+        return _parse_with_docx(path)
+
+    # ── HTML / XML ────────────────────────────────────────────────────────────
+    if ext in _HTML_EXTENSIONS:
+        logger.info("Parsing HTML/XML: %s", path.name)
+        return _parse_with_html(path)
+
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    if ext in _AUDIO_EXTENSIONS:
+        logger.info("Parsing audio with Replicate Whisper: %s", path.name)
+        return _parse_with_whisper(path)
+
+    # ── Plain text / Markdown ─────────────────────────────────────────────────
+    if ext in _TEXT_EXTENSIONS:
+        logger.info("Reading text file: %s", path.name)
+        return _parse_plain_text(path)
+
+    # ── Unknown — try plain text as last resort ───────────────────────────────
+    logger.warning("Unknown file type '%s' — treating as plain text: %s", ext, path.name)
+    return _parse_plain_text(path)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def ingest_pdf(pdf_path: str, session: Session) -> tuple[str, str]:
+def ingest_document(file_path: str, session: Session) -> tuple[str, str]:
     """
-    Parse *pdf_path* and persist a SourceDocument.
+    Parse *file_path* (PDF/DOCX/HTML/TXT/audio) and persist a SourceDocument.
 
     Returns (source_doc_id, raw_markdown).
+    Backward-compatible alias: ingest_pdf() still works for PDF files.
     """
-    path = Path(pdf_path)
+    path = Path(file_path)
     if not path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+        raise FileNotFoundError(f"File not found: {file_path}")
 
     file_hash = _sha256(path)
 
-    # Dedup check — skip re-parsing if already in DB
+    # Dedup check
     from sqlalchemy import select
     from db.models import SourceDocument
     existing = session.scalar(
         select(SourceDocument).where(SourceDocument.file_hash == file_hash)
     )
     if existing:
-        logger.info("Document already ingested: %s — skipping parse", path.name)
+        logger.info("Document already ingested: %s — skipping", path.name)
         return str(existing.id), existing.raw_markdown or ""
 
-    # Parse PDF → Markdown
-    # 1. LlamaParse (jeśli API key) — najlepsza jakość tabel
-    markdown = ""
-    if settings.llama_parse_api_key:
-        logger.info("Parsing with LlamaParse: %s", path.name)
-        try:
-            markdown = _parse_with_llamaparse(path)
-        except Exception as exc:
-            logger.warning("LlamaParse failed (%s), falling back to PyMuPDF", exc)
-
-    # 2. PyMuPDF (lokalnie, bezpłatnie) — domyślny fallback
-    if not markdown:
-        logger.info("Parsing with PyMuPDF (local, free): %s", path.name)
-        try:
-            markdown = _parse_with_pymupdf(path)
-        except Exception as exc:
-            logger.warning("PyMuPDF failed (%s), falling back to OpenAI Vision", exc)
-
-    # 3. OpenAI Vision (ostateczny fallback dla skanów/obrazów)
-    if not markdown:
-        logger.info("Parsing with OpenAI Vision: %s", path.name)
-        markdown = _parse_with_openai_vision(path)
+    # Parse
+    markdown = _parse_document(path)
 
     valid_from = _extract_valid_from_date(markdown)
     directive_year = _extract_directive_year(markdown, path.stem)
@@ -236,6 +406,16 @@ def ingest_pdf(pdf_path: str, session: Session) -> tuple[str, str]:
     )
     session.commit()
     logger.info(
-        "Ingested '%s' → doc_id=%s  valid_from=%s", path.name, doc.id, valid_from
+        "Ingested '%s' [%s] → doc_id=%s valid_from=%s chars=%d",
+        path.name,
+        path.suffix.upper(),
+        doc.id,
+        valid_from,
+        len(markdown),
     )
     return str(doc.id), markdown
+
+
+# Backward-compatible alias
+def ingest_pdf(pdf_path: str, session: Session) -> tuple[str, str]:
+    return ingest_document(pdf_path, session)

@@ -1,42 +1,37 @@
 """
-pipeline/graph.py — LangGraph swarm definition.
+pipeline/graph.py — LangGraph swarm definition (Gods Finger v2).
 
 Graph topology (per chunk, multi-turn):
 
   START
     │
     ▼
-  [simulate_question]      ← Ollama/secondary generates initial question (10% adversarial)
+  [simulate_question]      ← 8 perspektyw, 10% adversarial
     │
     ▼
   [retrieve_context]       ← pgvector + BM25 hybrid search
     │
     ▼
-  [generate_answer]        ← Ollama/secondary grounded answer with CoT reasoning
+  [generate_answer]        ← Cerebras llama3.3-70b / Ollama / OpenAI
     │
     ▼
-  [judge_answer]           ← gpt-4o-mini (cascade → gpt-4o if confidence < threshold)
+  [constitutional_revision] ← self-critique + revision; original → rejected (DPO/ORPO/KTO)
+    │
+    ▼
+  [judge_answer]           ← gpt-4o-mini wielowymiarowy (cascade → gpt-4o)
     │
     ├── score >= threshold ──► [append_turn]
     │                              │
     │                              ├── turn < MAX_TURNS ──► [simulate_followup]
     │                              │                              │
-    │                              │                   (loops back to retrieve_context)
+    │                              │                   (→ retrieve_context)
     │                              │
     │                              └── turn >= MAX_TURNS ──► [write_output] ──► END
     │
     └── score < threshold ───► (turn==0) retry_count < MAX_RETRIES?
                                   │ yes → [increment_retry] → [retrieve_context]
-                                  │       ↑ saves rejected_answer for DPO
                                   │ no  → [mark_unresolvable] → END
-                               (turn>0) → [write_output] (write partial conversation) → END
-
-write_output:
-  1. Near-duplicate check (MinHash) — skip if too similar to existing question
-  2. Classify question (type + difficulty)
-  3. DB commit BEFORE JSONL write (ACID)
-  4. Write JSONL with metadata field
-  5. Write DPO pair if rejected_answer is available
+                               (turn>0) → [write_output] → END
 """
 
 from __future__ import annotations
@@ -48,6 +43,7 @@ from typing import Optional
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
+from agents.constitutional import constitutional_revision
 from agents.expert import generate_answer, retrieve_context
 from agents.judge import judge_answer
 from agents.simulator import simulate_followup, simulate_question
@@ -57,33 +53,50 @@ from pipeline.state import FoundryState
 from pipeline.watermark import build_watermark_description, compute_watermark_hash
 from utils.classifier import classify_question
 from utils.dedup import MinHashDeduplicator
-from utils.output import DPOWriter, JSONLWriter
+from utils.output import DPOWriter, JSONLWriter, KTOWriter, ORPOWriter
 
 logger = logging.getLogger(__name__)
 
-# Perspective-aware system prompts for the JSONL output.
-# These are what the fine-tuned model will see in production.
 _SYSTEM_PROMPTS: dict[str, str] = {
     "cfo": (
-        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
-        "z perspektywy CFO dużej spółki notowanej na giełdzie. "
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy CFO. "
         "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
-        "Jeśli informacja nie wynika z tekstu, odpowiedz: "
-        "\"Brak danych w dyrektywie.\""
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
     ),
     "prawnik": (
-        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
-        "z perspektywy radcy prawnego specjalizującego się w prawie korporacyjnym UE. "
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy radcy prawnego. "
         "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
-        "Jeśli informacja nie wynika z tekstu, odpowiedz: "
-        "\"Brak danych w dyrektywie.\""
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
     ),
     "audytor": (
-        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym "
-        "z perspektywy biegłego rewidenta przeprowadzającego audit ESG. "
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy biegłego rewidenta ESG. "
         "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
-        "Jeśli informacja nie wynika z tekstu, odpowiedz: "
-        "\"Brak danych w dyrektywie.\""
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
+    ),
+    "analityk": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy analityka finansowego. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
+    ),
+    "regulator": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy regulatora/nadzorcy. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
+    ),
+    "akademik": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy badacza akademickiego. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
+    ),
+    "dziennikarz": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, wyjaśniającym przepisy przystępnym językiem. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
+    ),
+    "inwestor": (
+        "Jesteś ekspertem ds. ESG i prawa korporacyjnego UE, odpowiadającym z perspektywy inwestora instytucjonalnego. "
+        "Odpowiadasz wyłącznie na podstawie dostarczonych fragmentów dyrektyw. "
+        "Jeśli informacja nie wynika z tekstu, odpowiedz: \"Brak danych w dyrektywie.\""
     ),
 }
 _DEFAULT_SYSTEM_PROMPT = (
@@ -104,23 +117,21 @@ def make_retrieve_node(session: Session):
 
 
 def append_turn(state: FoundryState) -> dict:
-    """Accumulate the current Q&A turn into conversation_history."""
     history = list(state.get("conversation_history", []))
     history.append({"role": "user", "content": state["question"]})
     history.append({"role": "assistant", "content": state["answer"]})
     return {
         "conversation_history": history,
         "turn_count": state.get("turn_count", 0) + 1,
-        # Reset per-turn fields for the next turn
         "question": "",
         "answer": "",
         "quality_score": 0.0,
         "retry_count": 0,
+        "constitutional_critique": None,
     }
 
 
 def route_after_append(state: FoundryState) -> str:
-    """After appending a turn: continue if budget allows, else write."""
     if state.get("turn_count", 0) < settings.max_turns:
         return "simulate_followup"
     return "write_output"
@@ -130,6 +141,8 @@ def make_write_node(
     session: Session,
     writer: JSONLWriter,
     dpo_writer: Optional[DPOWriter] = None,
+    orpo_writer: Optional[ORPOWriter] = None,
+    kto_writer: Optional[KTOWriter] = None,
     deduplicator: Optional[MinHashDeduplicator] = None,
 ):
     def _write(state: FoundryState) -> dict:
@@ -137,7 +150,6 @@ def make_write_node(
         perspective = state.get("perspective", "cfo")
         system_prompt = _SYSTEM_PROMPTS.get(perspective, _DEFAULT_SYSTEM_PROMPT)
 
-        # Build full ChatML messages from accumulated conversation_history
         history = state.get("conversation_history", [])
         if history:
             messages = [{"role": "system", "content": system_prompt}] + list(history)
@@ -148,7 +160,7 @@ def make_write_node(
                 {"role": "assistant", "content": state["answer"]},
             ]
 
-        # ── Pre-check 1: Refusal cap ──────────────────────────────────────────
+        # Refusal cap
         if writer.should_skip(messages):
             try:
                 repo.finalize_chunk(session, chunk_id=chunk_id, success=True)
@@ -156,10 +168,10 @@ def make_write_node(
             except Exception as exc:
                 session.rollback()
                 logger.error("Failed to finalize capped chunk %s: %s", chunk_id, exc)
-            logger.info("⊘ Refusal capped — chunk=%s not written", state["chunk"]["id"][:8])
+            logger.info("⊘ Refusal capped — chunk=%s", state["chunk"]["id"][:8])
             return {"status": "ready", "record_index": -1}
 
-        # ── Pre-check 2: Near-duplicate detection ─────────────────────────────
+        # Near-duplicate detection
         first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
         if deduplicator and first_user and deduplicator.is_duplicate(first_user):
             try:
@@ -167,14 +179,13 @@ def make_write_node(
                 session.commit()
             except Exception as exc:
                 session.rollback()
-                logger.error("Failed to finalize dedup-skipped chunk %s: %s", chunk_id, exc)
-            logger.info("⊘ Near-duplicate question — chunk=%s not written", state["chunk"]["id"][:8])
+                logger.error("Failed to finalize dedup chunk %s: %s", chunk_id, exc)
+            logger.info("⊘ Near-duplicate — chunk=%s", state["chunk"]["id"][:8])
             return {"status": "ready", "record_index": -1}
 
-        # ── Classify question ─────────────────────────────────────────────────
         q_type, difficulty = classify_question(first_user) if first_user else ("factual", "medium")
 
-        # ── Phase 1: DB commit first (ACID) ───────────────────────────────────
+        # Phase 1: DB commit (ACID)
         first_asst = next((m["content"] for m in messages if m["role"] == "assistant"), "")
         rejected = state.get("rejected_answer") or ""
         try:
@@ -202,30 +213,28 @@ def make_write_node(
             logger.error("Failed to persist sample for chunk %s: %s", chunk_id, exc)
             raise
 
-        # ── Phase 2: Write JSONL with metadata ───────────────────────────────
+        # Phase 2: Write SFT JSONL
         metadata = {
             "perspective": perspective,
             "question_type": q_type,
             "difficulty": difficulty,
             "source_document": state["chunk"].get("source_document", ""),
             "batch_id": state.get("batch_id", ""),
+            "judge_details": state.get("judge_details", {}),
         }
         record_index, watermark_hash = writer.write_conversation(messages, metadata=metadata)
 
-        # ── Phase 3: Write DPO pair (if a rejected answer is available) ───────
-        if dpo_writer and rejected and record_index >= 0:
+        # Phase 3: Write preference pairs (DPO / ORPO / KTO)
+        if rejected and record_index >= 0:
             prompt_msgs = [m for m in messages if m["role"] in ("system", "user")][:2]
-            pair_idx = dpo_writer.write_pair(
-                prompt_messages=prompt_msgs,
-                chosen_answer=first_asst,
-                rejected_answer=rejected,
-            )
-            if pair_idx >= 0:
-                logger.debug(
-                    "DPO pair #%d written for chunk=%s", pair_idx, state["chunk"]["id"][:8]
-                )
+            if dpo_writer:
+                dpo_writer.write_pair(prompt_msgs, first_asst, rejected)
+            if orpo_writer:
+                orpo_writer.write_pair(prompt_msgs, first_asst, rejected)
+            if kto_writer:
+                kto_writer.write_pair(prompt_msgs, first_asst, rejected)
 
-        # ── Phase 4: Update record_index (best-effort) ────────────────────────
+        # Phase 4: Update DB + watermark registry
         try:
             repo.mark_sample_written(session, sample.id, record_index, watermark_hash)
             if watermark_hash:
@@ -244,15 +253,10 @@ def make_write_node(
             session.rollback()
             logger.warning("Could not update record_index for sample %s: %s", sample.id, exc)
 
-        turns = state.get("turn_count", 0)
         logger.info(
-            "✓ Record %d written (chunk=%s turns=%d score=%.2f type=%s difficulty=%s%s)",
-            record_index,
-            state["chunk"]["id"][:8],
-            turns,
-            state.get("quality_score", 0.0),
-            q_type,
-            difficulty,
+            "✓ Record %d (chunk=%s turns=%d score=%.2f type=%s diff=%s persp=%s%s)",
+            record_index, state["chunk"]["id"][:8], state.get("turn_count", 0),
+            state.get("quality_score", 0.0), q_type, difficulty, perspective,
             " [watermarked]" if watermark_hash else "",
         )
         return {"status": "ready", "record_index": record_index, "question_type": q_type, "difficulty": difficulty}
@@ -265,23 +269,15 @@ def make_unresolvable_node(session: Session):
         chunk_id = uuid.UUID(state["chunk"]["id"])
         try:
             repo.finalize_chunk(
-                session,
-                chunk_id=chunk_id,
-                success=False,
-                error=f"Max retries reached. Last judge score: {state.get('quality_score', 0):.2f}",
+                session, chunk_id=chunk_id, success=False,
+                error=f"Max retries. Last score: {state.get('quality_score', 0):.2f}",
             )
             session.commit()
         except Exception as exc:
             session.rollback()
             logger.error("Failed to mark chunk unresolvable: %s", exc)
-
-        logger.warning(
-            "✗ Chunk %s marked unresolvable after %d retries",
-            state["chunk"]["id"][:8],
-            state.get("retry_count", 0),
-        )
+        logger.warning("✗ Chunk %s unresolvable after %d retries", state["chunk"]["id"][:8], state.get("retry_count", 0))
         return {"status": "unresolvable"}
-
     return _unresolvable
 
 
@@ -297,21 +293,17 @@ def route_after_judge(state: FoundryState) -> str:
     if score >= settings.quality_threshold:
         return "append_turn"
 
-    # Follow-up turn failed quality check → write partial conversation (still valuable)
     if turn > 0:
         logger.info(
-            "Follow-up score %.2f < %.2f at turn %d — writing partial conversation for chunk %s",
+            "Follow-up score %.2f < %.2f at turn %d — writing partial (chunk=%s)",
             score, settings.quality_threshold, turn, state["chunk"]["id"][:8],
         )
         return "write_output"
 
-    # First turn: retry answer (NOT question) if budget allows.
-    # Keeps the same question for DPO pair alignment.
     if retries < settings.max_retries_per_chunk:
         logger.info(
-            "Score %.2f < %.2f — retry answer %d/%d for chunk %s",
-            score, settings.quality_threshold,
-            retries + 1, settings.max_retries_per_chunk,
+            "Score %.2f < %.2f — retry %d/%d (chunk=%s)",
+            score, settings.quality_threshold, retries + 1, settings.max_retries_per_chunk,
             state["chunk"]["id"][:8],
         )
         return "retry"
@@ -320,21 +312,12 @@ def route_after_judge(state: FoundryState) -> str:
 
 
 def increment_retry(state: FoundryState) -> dict:
-    """Increment retry counter and save the failed answer for DPO pairing."""
     new_retry = state.get("retry_count", 0) + 1
     logger.info(
         "Retry %d for chunk=%s perspective=%s (last score=%.2f)",
-        new_retry,
-        state["chunk"]["id"][:8],
-        state.get("perspective", "?"),
-        state.get("quality_score", 0.0),
+        new_retry, state["chunk"]["id"][:8], state.get("perspective", "?"), state.get("quality_score", 0.0),
     )
-    return {
-        "retry_count": new_retry,
-        # Save the failed answer — if next retry succeeds, this becomes the DPO "rejected"
-        "rejected_answer": state.get("answer", ""),
-        # Sygnał dla retrieve_context do użycia większego top_k (obsługiwane w expert.py)
-    }
+    return {"retry_count": new_retry, "rejected_answer": state.get("answer", "")}
 
 
 # ---------------------------------------------------------------------------
@@ -345,58 +328,44 @@ def build_graph(
     session: Session,
     writer: JSONLWriter,
     dpo_writer: Optional[DPOWriter] = None,
+    orpo_writer: Optional[ORPOWriter] = None,
+    kto_writer: Optional[KTOWriter] = None,
     deduplicator: Optional[MinHashDeduplicator] = None,
 ) -> StateGraph:
     graph = StateGraph(FoundryState)
 
-    # Nodes
-    graph.add_node("simulate_question",  simulate_question)
-    graph.add_node("simulate_followup",  simulate_followup)
-    graph.add_node("retrieve_context",   make_retrieve_node(session))
-    graph.add_node("generate_answer",    generate_answer)
-    graph.add_node("judge_answer",       judge_answer)
-    graph.add_node("append_turn",        append_turn)
-    graph.add_node("write_output",       make_write_node(session, writer, dpo_writer, deduplicator))
-    graph.add_node("mark_unresolvable",  make_unresolvable_node(session))
-    graph.add_node("increment_retry",    increment_retry)
+    graph.add_node("simulate_question",       simulate_question)
+    graph.add_node("simulate_followup",       simulate_followup)
+    graph.add_node("retrieve_context",        make_retrieve_node(session))
+    graph.add_node("generate_answer",         generate_answer)
+    graph.add_node("constitutional_revision", constitutional_revision)
+    graph.add_node("judge_answer",            judge_answer)
+    graph.add_node("append_turn",             append_turn)
+    graph.add_node("write_output",            make_write_node(session, writer, dpo_writer, orpo_writer, kto_writer, deduplicator))
+    graph.add_node("mark_unresolvable",       make_unresolvable_node(session))
+    graph.add_node("increment_retry",         increment_retry)
 
-    # Main pipeline (turn 0)
-    graph.add_edge(START,                "simulate_question")
-    graph.add_edge("simulate_question",  "retrieve_context")
-    graph.add_edge("retrieve_context",   "generate_answer")
-    graph.add_edge("generate_answer",    "judge_answer")
+    graph.add_edge(START,                       "simulate_question")
+    graph.add_edge("simulate_question",         "retrieve_context")
+    graph.add_edge("retrieve_context",          "generate_answer")
+    graph.add_edge("generate_answer",           "constitutional_revision")
+    graph.add_edge("constitutional_revision",   "judge_answer")
 
-    # After judge: route to append_turn, retry, write_output, or unresolvable
     graph.add_conditional_edges(
-        "judge_answer",
-        route_after_judge,
-        {
-            "append_turn":       "append_turn",
-            "retry":             "increment_retry",
-            "write_output":      "write_output",
-            "mark_unresolvable": "mark_unresolvable",
-        },
+        "judge_answer", route_after_judge,
+        {"append_turn": "append_turn", "retry": "increment_retry",
+         "write_output": "write_output", "mark_unresolvable": "mark_unresolvable"},
     )
 
-    # Retry loop: re-retrieve context and re-generate answer for the SAME question.
-    # This keeps the question stable for DPO pair alignment (same Q, good/bad A).
     graph.add_edge("increment_retry",   "retrieve_context")
 
-    # After appending: continue to follow-up or write
     graph.add_conditional_edges(
-        "append_turn",
-        route_after_append,
-        {
-            "simulate_followup": "simulate_followup",
-            "write_output":      "write_output",
-        },
+        "append_turn", route_after_append,
+        {"simulate_followup": "simulate_followup", "write_output": "write_output"},
     )
 
-    # Follow-up loop: simulate → retrieve → generate → judge (reuses shared nodes)
-    graph.add_edge("simulate_followup", "retrieve_context")
-
-    # Terminal edges
-    graph.add_edge("write_output",       END)
-    graph.add_edge("mark_unresolvable",  END)
+    graph.add_edge("simulate_followup",   "retrieve_context")
+    graph.add_edge("write_output",        END)
+    graph.add_edge("mark_unresolvable",   END)
 
     return graph.compile()
