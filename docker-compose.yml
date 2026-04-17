@@ -370,7 +370,7 @@ services:
       retries: 300
       start_period: 30s
     volumes:
-      - ollama_models:/root/.ollama
+      - ./ollama_models:/root/.ollama   # lokalny folder — widoczny w Eksploratorze, odporny na "down -v"
     ports:
       - "11434:11434"
     mem_limit: 10g
@@ -471,8 +471,7 @@ volumes:
     driver: local
   hf_cache:
     driver: local
-  ollama_models:
-    driver: local
+  # ollama_models przeniesiony na bind mount (./ollama_models/) — bezpieczniejszy na Windows
   webui_data:
     driver: local
 

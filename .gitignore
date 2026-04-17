@@ -16,6 +16,7 @@ build/
 
 # Docker
 *.log
+ollama_models/
 
 # IDE
 .vscode/
