@@ -3,8 +3,7 @@ agents/translator.py — Automatyczne tłumaczenie dokumentów na język polski.
 
 Strategia wyboru backendu (w kolejności priorytetu):
   1. DeepL API — jeśli DEEPL_API_KEY ustawiony (najwyższa jakość tłumaczenia)
-  2. Cerebras/secondary — jeśli SECONDARY_API_KEY ustawiony (szybkie, tanie)
-  3. OpenAI (gpt-4o-mini) — zawsze dostępny jako fallback
+  2. OpenAI (gpt-4o-mini) — fallback gdy brak DeepL
 
 Tłumaczenie odbywa się na poziomie chunków (nie całych PDF-ów), więc
 można je wpiąć do pipeline'u PRZED generowaniem Q&A bez zmiany struktury kodu.
@@ -37,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Maksymalna długość tekstu wysyłanego w jednym zapytaniu tłumaczącym
 _MAX_CHUNK_CHARS = 3000
 
-# Prompt systemowy dla secondary/OpenAI — tłumaczenie prawno-regulacyjne
+# Prompt systemowy dla OpenAI — tłumaczenie prawno-regulacyjne
 _TRANSLATE_SYSTEM = (
     "Jesteś profesjonalnym tłumaczem specjalizującym się w prawie korporacyjnym UE "
     "i dokumentach regulacyjnych.\n\n"
@@ -52,7 +51,7 @@ _TRANSLATE_SYSTEM = (
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator — obsługa rate limitów (DeepL / secondary / OpenAI)
+# Retry decorator — obsługa rate limitów (DeepL / OpenAI)
 # ---------------------------------------------------------------------------
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -112,12 +111,12 @@ def _translate_deepl(text: str, source_lang: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backend 2: secondary (Cerebras/OpenRouter) lub OpenAI
+# Backend 2: OpenAI
 # ---------------------------------------------------------------------------
 
 @_retry
-def _translate_llm(text: str, source_lang: str) -> str:
-    """Tłumaczy przez secondary providera (Cerebras) lub OpenAI gpt-4o-mini."""
+def _translate_openai(text: str, source_lang: str) -> str:
+    """Tłumaczy przez OpenAI gpt-4o-mini."""
     lang_names = {
         "en": "angielskiego", "de": "niemieckiego",
         "fr": "francuskiego", "es": "hiszpańskiego",
@@ -129,24 +128,15 @@ def _translate_llm(text: str, source_lang: str) -> str:
         f"{text}"
     )
 
-    if settings.secondary_api_key:
-        client = openai.OpenAI(
-            api_key=settings.secondary_api_key,
-            base_url=settings.secondary_base_url,
-        )
-        model = settings.secondary_model
-    else:
-        client = openai.OpenAI(api_key=settings.openai_api_key)
-        model = settings.openai_primary_model
-
+    client = openai.OpenAI(api_key=settings.openai_api_key)
     response = client.chat.completions.create(
-        model=model,
+        model=settings.openai_primary_model,
         messages=[
             {"role": "system", "content": _TRANSLATE_SYSTEM},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.1,  # deterministyczne tłumaczenie
-        max_tokens=settings.vllm_max_tokens,
+        temperature=0.1,
+        max_tokens=settings.generation_max_tokens,
     )
     return response.choices[0].message.content.strip()
 
@@ -186,8 +176,8 @@ def translate_text(text: str, source_lang: str = "en") -> str:
             translated = _translate_deepl(text, source_lang)
             logger.debug("Translated via DeepL (%d → %d chars)", len(text), len(translated))
         else:
-            translated = _translate_llm(text, source_lang)
-            logger.debug("Translated via LLM (%d → %d chars)", len(text), len(translated))
+            translated = _translate_openai(text, source_lang)
+            logger.debug("Translated via OpenAI (%d → %d chars)", len(text), len(translated))
         return translated
     except Exception as exc:
         logger.error("Translation failed: %s — returning original text", exc)

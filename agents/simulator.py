@@ -18,9 +18,8 @@ Adversarial prompting (Self-Check):
   - 10% pytań-pułapek o rzeczy NIEOBECNE w tekście → model musi odmówić
 
 Provider routing (priorytet):
-  1. Ollama LOCAL (darmowy)
-  2. Cerebras llama3.3-70b (FREE 1M/dzień, 2000 tok/s — REKOMENDOWANY)
-  3. OpenAI / vLLM (fallback)
+  1. Ollama LOCAL (darmowy — qwen2.5:14b)
+  2. OpenAI (fallback gdy Ollama niedostępny)
 """
 
 from __future__ import annotations
@@ -247,7 +246,7 @@ ALL_PERSPECTIVES = list(_NORMAL_PROMPTS.keys())
 # Retry decorator
 # ---------------------------------------------------------------------------
 
-def _is_retryable_vllm(exc: BaseException) -> bool:
+def _is_retryable_openai(exc: BaseException) -> bool:
     if isinstance(exc, openai.RateLimitError):
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
@@ -255,10 +254,10 @@ def _is_retryable_vllm(exc: BaseException) -> bool:
     return False
 
 
-def _retry_vllm(func):
+def _retry_api(func):
     return retry(
         reraise=True,
-        retry=retry_if_exception(_is_retryable_vllm),
+        retry=retry_if_exception(_is_retryable_openai),
         wait=wait_exponential(
             multiplier=1,
             min=settings.tenacity_initial_wait,
@@ -275,7 +274,7 @@ def _make_ollama_client() -> openai.OpenAI:
 
 
 def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) -> str:
-    """3-poziomowy routing: Ollama → Cerebras → OpenAI/vLLM."""
+    """2-poziomowy routing: Ollama → OpenAI."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text},
@@ -287,43 +286,24 @@ def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) ->
             resp = client.chat.completions.create(
                 model=settings.ollama_model,
                 messages=messages,
-                temperature=settings.vllm_temperature,
+                temperature=settings.generation_temperature,
                 max_tokens=max_tokens,
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
-            logger.warning("Ollama niedostępny (%s), przełączam na secondary", e)
+            logger.warning("Ollama niedostępny (%s), przełączam na OpenAI", e)
 
-    if settings.secondary_api_key:
-        client = openai.OpenAI(
-            api_key=settings.secondary_api_key,
-            base_url=settings.secondary_base_url,
-            max_retries=0,
-        )
-        resp = client.chat.completions.create(
-            model=settings.secondary_model,
-            messages=messages,
-            temperature=settings.vllm_temperature,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content.strip()
-
-    is_openai = "openai.com" in settings.vllm_base_url
-    client = openai.OpenAI(
-        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
-        base_url=None if is_openai else settings.vllm_base_url,
-        max_retries=0,
-    )
+    client = openai.OpenAI(api_key=settings.openai_api_key, max_retries=0)
     resp = client.chat.completions.create(
-        model=settings.openai_primary_model if is_openai else settings.vllm_model,
+        model=settings.openai_primary_model,
         messages=messages,
-        temperature=settings.vllm_temperature,
+        temperature=settings.generation_temperature,
         max_tokens=max_tokens,
     )
     return resp.choices[0].message.content.strip()
 
 
-@_retry_vllm
+@_retry_api
 def _call_vllm(system_prompt: str, user_text: str) -> str:
     return _call_provider(system_prompt, user_text, max_tokens=256)
 

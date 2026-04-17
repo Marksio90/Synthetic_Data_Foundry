@@ -10,10 +10,9 @@ Two-phase operation:
     If question is adversarial, the grounding prompt forces the refusal
     phrase "Brak danych w dyrektywie".
 
-Provider routing (priority order):
+Provider routing (priorytet):
   1. Ollama LOCAL  (darmowy, ~9 GB RAM dla qwen2.5:14b, 128k context)
-  2. Cerebras/secondary (tani cloud, SECONDARY_API_KEY)
-  3. OpenAI / vLLM (fallback — zawsze działa)
+  2. OpenAI        (fallback gdy Ollama niedostępny)
 
 Embeddings routing:
   USE_LOCAL_EMBEDDINGS=true  → Ollama nomic-embed-text (darmowe, 0.3 GB RAM)
@@ -23,8 +22,6 @@ Embeddings routing:
 from __future__ import annotations
 
 import logging
-import re as _re
-
 import openai
 from sqlalchemy.orm import Session
 from tenacity import (
@@ -33,7 +30,6 @@ from tenacity import (
     retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    wait_fixed,
 )
 
 from config.settings import settings
@@ -142,71 +138,32 @@ _EXPERT_SYSTEM_BY_PERSPECTIVE: dict[str, str] = {
     ),
 }
 
-# Max context chars — qwen2.5:14b supports 128k context; Cerebras/OpenAI gpt-4o-mini 128k.
+# Max context chars — qwen2.5:14b supports 128k context; OpenAI gpt-4o-mini supports 128k.
 # Cap at 6000 chars (~1500 tokens) to leave room for question + history + answer.
 _MAX_CONTEXT_CHARS = 6000
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator for secondary/vLLM calls (handles 429 and 5xx)
+# Retry decorator — obsługa 429/5xx dla Ollama i OpenAI
 # ---------------------------------------------------------------------------
 
-def _is_tpd_limit(exc: BaseException) -> bool:
-    """Zwraca True gdy secondary provider zwraca dzienny limit TPD (nie minutowy TPM)."""
-    return isinstance(exc, openai.RateLimitError) and "tokens per day" in str(exc).lower()
-
-
-def _is_retryable_vllm(exc: BaseException) -> bool:
+def _is_retryable_openai(exc: BaseException) -> bool:
     if isinstance(exc, openai.RateLimitError):
-        # TPD (daily limit) — nie ma sensu retry, poczekać trzeba 20+ minut
-        if _is_tpd_limit(exc):
-            return False
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
         return True
     return False
 
 
-def _parse_secondary_retry_after(exc: BaseException) -> float:
-    """
-    Parsuje czas oczekiwania z komunikatu 429 (retry-after hint).
-    Obsługuje formaty:
-      - 'try again in 8.69s'      → 8.69s
-      - 'try again in 21m17.856s' → 1277.856s
-    Dodaje 2s buforu.
-    """
-    body = str(exc)
-    # Format minuty + sekundy: "21m17.856s"
-    m = _re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", body, _re.IGNORECASE)
-    if m:
-        return int(m.group(1)) * 60 + float(m.group(2)) + 2.0
-    # Format same sekundy: "8.69s"
-    m = _re.search(r"try again in (\d+(?:\.\d+)?)s", body, _re.IGNORECASE)
-    if m:
-        return float(m.group(1)) + 2.0
-    return settings.tenacity_initial_wait
-
-
-def _secondary_aware_wait(retry_state) -> float:  # type: ignore[return]
-    """
-    Respects provider 'retry-after' hint from 429 body.
-    Falls back to exponential backoff for other errors.
-    """
-    exc = retry_state.outcome.exception()
-    if exc and isinstance(exc, openai.RateLimitError):
-        return _parse_secondary_retry_after(exc)
-    # Exponential for 5xx
-    return min(
-        settings.tenacity_initial_wait * (2 ** max(0, retry_state.attempt_number - 1)),
-        settings.tenacity_max_wait,
-    )
-
-
-def _retry_vllm(func):
+def _retry_api(func):
     return retry(
         reraise=True,
-        retry=retry_if_exception(_is_retryable_vllm),
-        wait=_secondary_aware_wait,
+        retry=retry_if_exception(_is_retryable_openai),
+        wait=wait_exponential(
+            multiplier=1,
+            min=settings.tenacity_initial_wait,
+            max=settings.tenacity_max_wait,
+        ),
         stop=stop_after_attempt(settings.tenacity_max_attempts),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )(func)
@@ -220,12 +177,11 @@ def _make_ollama_client() -> openai.OpenAI:
 
 def _call_provider(messages: list[dict]) -> str:
     """
-    Routing 3-poziomowy dla odpowiedzi (długich — max vllm_max_tokens):
-      1. Ollama LOCAL  (darmowy, brak limitu)
-      2. Cerebras/secondary (tani cloud, SECONDARY_API_KEY)
-      3. OpenAI/vLLM   (fallback — zawsze działa)
+    Routing 2-poziomowy:
+      1. Ollama LOCAL  (darmowy — qwen2.5:14b)
+      2. OpenAI        (fallback gdy Ollama niedostępny)
     """
-    max_tok = settings.vllm_max_tokens
+    max_tok = settings.generation_max_tokens
 
     # ── 1. Ollama LOCAL ──────────────────────────────────────────────
     if settings.ollama_model:
@@ -234,45 +190,25 @@ def _call_provider(messages: list[dict]) -> str:
             resp = client.chat.completions.create(
                 model=settings.ollama_model,
                 messages=messages,
-                temperature=settings.vllm_temperature,
+                temperature=settings.generation_temperature,
                 max_tokens=max_tok,
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
-            logger.warning("Ollama niedostępny (%s), przełączam na LLaMA API / OpenAI", e)
+            logger.warning("Ollama niedostępny (%s), przełączam na OpenAI", e)
 
-    # ── 2. Cerebras / secondary cloud ───────────────────────────────────
-    if settings.secondary_api_key:
-        client = openai.OpenAI(
-            api_key=settings.secondary_api_key,
-            base_url=settings.secondary_base_url,
-            max_retries=0,
-        )
-        resp = client.chat.completions.create(
-            model=settings.secondary_model,
-            messages=messages,
-            temperature=settings.vllm_temperature,
-            max_tokens=max_tok,
-        )
-        return resp.choices[0].message.content.strip()
-
-    # ── 3. OpenAI / vLLM fallback ────────────────────────────────────
-    is_openai = "openai.com" in settings.vllm_base_url
-    client = openai.OpenAI(
-        api_key=settings.openai_api_key if is_openai else (settings.vllm_api_key or "not-needed"),
-        base_url=None if is_openai else settings.vllm_base_url,
-        max_retries=0,
-    )
+    # ── 2. OpenAI fallback ────────────────────────────────────────────
+    client = openai.OpenAI(api_key=settings.openai_api_key, max_retries=0)
     resp = client.chat.completions.create(
-        model=settings.openai_primary_model if is_openai else settings.vllm_model,
+        model=settings.openai_primary_model,
         messages=messages,
-        temperature=settings.vllm_temperature,
+        temperature=settings.generation_temperature,
         max_tokens=max_tok,
     )
     return resp.choices[0].message.content.strip()
 
 
-@_retry_vllm
+@_retry_api
 def _call_vllm(system: str, user: str) -> str:
     """Wrapper z retry — buduje messages i wywołuje _call_provider."""
     return _call_provider([
@@ -281,7 +217,7 @@ def _call_vllm(system: str, user: str) -> str:
     ])
 
 
-@_retry_vllm
+@_retry_api
 def _call_vllm_messages(messages: list[dict]) -> str:
     """Wrapper z retry dla multi-turn context."""
     return _call_provider(messages)
@@ -359,7 +295,7 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
 
 def generate_answer(state: FoundryState) -> dict:
     """
-    Phase 2: Generate grounded answer using Ollama/secondary/OpenAI.
+    Phase 2: Generate grounded answer using Ollama (primary) or OpenAI (fallback).
     Uses perspective-aware system prompt and conversation history for follow-up turns.
     Returns {"answer": ...}.
     """

@@ -12,7 +12,7 @@ Graph topology (per chunk, multi-turn):
   [retrieve_context]       ← pgvector + BM25 hybrid search
     │
     ▼
-  [generate_answer]        ← Cerebras llama3.3-70b / Ollama / OpenAI
+  [generate_answer]        ← Ollama qwen2.5:14b / OpenAI (fallback)
     │
     ▼
   [constitutional_revision] ← self-critique + revision; original → rejected (DPO/ORPO/KTO)

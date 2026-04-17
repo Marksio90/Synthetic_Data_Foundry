@@ -79,18 +79,11 @@ x-app-env: &app-env
   OPENAI_API_KEY: ${OPENAI_API_KEY:?Ustaw OPENAI_API_KEY w pliku .env}
   OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-4o-mini}
   OPENAI_FALLBACK_MODEL: ${OPENAI_FALLBACK_MODEL:-gpt-4o}
-  # Ollama LOCAL — primary generator (free, runs on laptop)
+  # Ollama LOCAL — primary generator (qwen2.5:14b, free, zero cost)
   OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-  OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
   OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
-  USE_LOCAL_EMBEDDINGS: ${USE_LOCAL_EMBEDDINGS:-false}
-  # Secondary provider — Cerebras/OpenRouter cloud fallback
-  SECONDARY_API_KEY: ${SECONDARY_API_KEY:-}
-  SECONDARY_BASE_URL: ${SECONDARY_BASE_URL:-https://api.cerebras.ai/v1}
-  SECONDARY_MODEL: ${SECONDARY_MODEL:-llama3.1-8b}
-  VLLM_BASE_URL: ${VLLM_BASE_URL:-https://api.openai.com/v1}
-  VLLM_MODEL: ${VLLM_MODEL:-gpt-4o-mini}
-  VLLM_API_KEY: ${OPENAI_API_KEY}
+  USE_LOCAL_EMBEDDINGS: ${USE_LOCAL_EMBEDDINGS:-true}
   LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
   OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
   DPO_OUTPUT_FILE: /app/output/dataset_esg_v1_dpo.jsonl
@@ -266,54 +259,6 @@ services:
       - foundry_net
     logging: *default-logging
 
-  # ---------------------------------------------------------------------------
-  # vLLM — lokalny serwer inference (opcjonalny, tylko GPU)
-  #
-  # Uruchomienie: docker compose --profile gpu up -d vllm
-  # Po uruchomieniu zmien w .env:
-  #   VLLM_BASE_URL=http://vllm:8000/v1
-  #   VLLM_API_KEY=not-needed
-  # ---------------------------------------------------------------------------
-  vllm:
-    profiles: [gpu]
-    image: vllm/vllm-openai:latest
-    container_name: esg_vllm
-    restart: unless-stopped
-    command: >
-      --model ${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
-      --dtype half
-      --gpu-memory-utilization 0.80
-      --max-model-len 8192
-      --enforce-eager
-      --host 0.0.0.0
-      --port 8000
-      --served-model-name llama3
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-    volumes:
-      - hf_cache:/root/.cache/huggingface
-    mem_limit: 10g
-    memswap_limit: 10g
-    shm_size: 2g
-    ipc: host
-    ulimits:
-      memlock: { soft: -1, hard: -1 }
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
-      interval: 30s
-      timeout: 15s
-      retries: 15
-      start_period: 180s
-    networks:
-      - foundry_net
-    logging: *default-logging
 
   # ---------------------------------------------------------------------------
   # Ollama — lokalny serwer LLM (PRIMARY generator Q&A — darmowy)

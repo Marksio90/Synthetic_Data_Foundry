@@ -9,7 +9,7 @@ Korzyści:
   - Drastyczna poprawa jakości bez ludzkich etykiet
   - Redukcja halucynacji przez self-correction
   - DARMOWE pary DPO: oryginalna odpowiedź (rejected) vs poprawiona (chosen)
-  - Używa tego samego providera co generacja (Ollama/Cerebras) — zero dodatkowego kosztu
+  - Używa tego samego providera co generacja (Ollama/OpenAI) — zero dodatkowego kosztu
 
 Integracja z pipeline:
   generate_answer → constitutional_revision → judge_answer
