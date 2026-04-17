@@ -42,7 +42,6 @@ from sqlalchemy.orm import sessionmaker
 from agents.calibrator import calibrate
 from agents.chunker import chunk_document
 from agents.cross_doc import generate_cross_doc_samples
-from agents.expert import _is_tpd_limit
 from agents.hf_uploader import upload_dataset_to_hub
 from agents.ingestor import ingest_document
 from agents.translator import translate_chunks_in_db
@@ -250,7 +249,6 @@ def main() -> None:
     logger.info("  Batch ID       : %s", batch_id)
     logger.info("  Perspektywy    : %s", perspectives)
     logger.info("  Constitutional : %s", settings.use_constitutional_ai)
-    logger.info("  Secondary LLM  : %s @ %s", settings.secondary_model, settings.secondary_base_url)
     logger.info("  Pliki          : %d", len(args.files))
     logger.info("=" * 60)
 
@@ -398,11 +396,6 @@ def main() -> None:
                             chunk_ready = True
                         break
                     except openai.RateLimitError as exc:
-                        if _is_tpd_limit(exc):
-                            logger.critical(
-                                "⛔ Dzienny limit TPD wyczerpany! Zmień providera lub poczekaj. Błąd: %s", exc
-                            )
-                            sys.exit(1)
                         if attempt < _GRAPH_RETRIES - 1:
                             wait = 2 ** attempt * 4
                             logger.warning("Rate-limit (chunk=%s, %s) — retry %d/%d za %ds",

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     ollama_model: str = Field(
         "",
-        description="Model Ollama do generowania Q&A. Pusty = pomiń Ollama, użyj Cerebras.",
+        description="Model Ollama do generowania Q&A. Pusty = pomiń Ollama, użyj OpenAI fallback.",
     )
     ollama_embed_model: str = Field(
         "nomic-embed-text",
@@ -42,26 +42,10 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # SECONDARY provider — Cerebras (rekomendowany: 2000 tok/s, 1M/dzień FREE)
+    # Generation parameters (Ollama primary + OpenAI fallback)
     # ------------------------------------------------------------------
-    secondary_api_key: str = Field("", description="Klucz Cerebras/OpenRouter/Together")
-    secondary_base_url: str = Field(
-        "https://api.cerebras.ai/v1",
-        description="Base URL secondary providera.",
-    )
-    secondary_model: str = Field(
-        "llama3.3-70b",
-        description="Model secondary providera. Cerebras: llama3.3-70b (FREE, jakość ~GPT-4).",
-    )
-
-    # ------------------------------------------------------------------
-    # Fallback endpoint (OpenAI-compatible)
-    # ------------------------------------------------------------------
-    vllm_base_url: str = Field("https://api.openai.com/v1")
-    vllm_model: str = Field("gpt-4o-mini")
-    vllm_api_key: str = Field("not-needed")
-    vllm_temperature: float = Field(0.7)
-    vllm_max_tokens: int = Field(2048, description="Max tokenów na odpowiedź eksperta")
+    generation_temperature: float = Field(0.7)
+    generation_max_tokens: int = Field(2048, description="Max tokenów na odpowiedź eksperta")
 
     # ------------------------------------------------------------------
     # OpenAI (Judge + Embeddings)
