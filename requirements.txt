@@ -64,3 +64,7 @@ python-multipart>=0.0.9
 websockets>=12.0,<14.0
 streamlit>=1.36.0,<2.0
 requests>=2.32.0,<3.0
+
+# ── Gap Scout ─────────────────────────────────────────────────────────────────
+apscheduler>=3.10.0,<4.0    # Hourly background scout scheduling
+feedparser>=6.0.0            # RSS/Atom parsing for EUR-Lex + arXiv crawlers

@@ -123,3 +123,115 @@ def _parse_progress(rec: RunRecord, line: str) -> None:
 
 # Singleton imported by routers
 runs = RunManager()
+
+
+# ===========================================================================
+# Gap Scout — in-memory state
+# ===========================================================================
+
+
+@dataclass
+class ScoutTopic:
+    topic_id: str
+    title: str
+    summary: str
+    score: float
+    recency_score: float
+    llm_uncertainty: float
+    source_count: int
+    social_signal: float
+    sources: list[dict]          # serialised ScoutSource dicts
+    domains: list[str]
+    discovered_at: str           # ISO-8601
+
+
+@dataclass
+class ScoutRecord:
+    scout_id: str
+    status: str = "starting"     # starting | running | done | error
+    topics_found: int = 0
+    started_at: float = field(default_factory=time.time)
+    ended_at: Optional[float] = None
+    error: Optional[str] = None
+    log_lines: list[str] = field(default_factory=list)
+    topics: list[ScoutTopic] = field(default_factory=list)
+
+    @property
+    def elapsed_seconds(self) -> float:
+        end = self.ended_at or time.time()
+        return round(end - self.started_at, 1)
+
+
+class ScoutManager:
+    """In-memory store for scout runs and discovered topics."""
+
+    def __init__(self) -> None:
+        self._runs: dict[str, ScoutRecord] = {}
+        self._topics: dict[str, ScoutTopic] = {}   # topic_id → latest version
+
+    def create(self, scout_id: str) -> ScoutRecord:
+        rec = ScoutRecord(scout_id=scout_id)
+        self._runs[scout_id] = rec
+        return rec
+
+    def get(self, scout_id: str) -> Optional[ScoutRecord]:
+        return self._runs.get(scout_id)
+
+    def update(self, scout_id: str, **kwargs: Any) -> None:
+        rec = self._runs.get(scout_id)
+        if rec is None:
+            return
+        for k, v in kwargs.items():
+            if hasattr(rec, k):
+                setattr(rec, k, v)
+
+    def append_log(self, scout_id: str, line: str) -> None:
+        rec = self._runs.get(scout_id)
+        if rec is not None:
+            rec.log_lines.append(line)
+
+    def add_topics(self, scout_id: str, topic_data_list: list) -> None:
+        """Accept list[ScoutTopicData] from agents/topic_scout.py and persist."""
+        rec = self._runs.get(scout_id)
+        if rec is None:
+            return
+        for t in topic_data_list:
+            topic = ScoutTopic(
+                topic_id=t.topic_id,
+                title=t.title,
+                summary=t.summary,
+                score=t.score,
+                recency_score=t.recency_score,
+                llm_uncertainty=t.llm_uncertainty,
+                source_count=t.source_count,
+                social_signal=t.social_signal,
+                sources=[
+                    {
+                        "url": s.url,
+                        "title": s.title,
+                        "published_at": s.published_at,
+                        "source_type": s.source_type,
+                        "verified": s.verified,
+                    }
+                    for s in t.sources
+                ],
+                domains=t.domains,
+                discovered_at=t.discovered_at,
+            )
+            rec.topics.append(topic)
+            self._topics[topic.topic_id] = topic
+        rec.topics_found = len(rec.topics)
+
+    def get_topic(self, topic_id: str) -> Optional[ScoutTopic]:
+        return self._topics.get(topic_id)
+
+    def latest_topics(self, limit: int = 50) -> list[ScoutTopic]:
+        topics = sorted(self._topics.values(), key=lambda t: t.score, reverse=True)
+        return topics[:limit]
+
+    def list_runs(self) -> list[ScoutRecord]:
+        return list(self._runs.values())
+
+
+# Singleton imported by scout router
+scouts = ScoutManager()

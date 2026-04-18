@@ -10,6 +10,7 @@ import {
   ClipboardCheck,
   Cpu,
   MessageSquare,
+  Telescope,
   ChevronRight,
   ChevronLeft,
   Factory,
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { href: '/review', icon: ClipboardCheck, label: 'Review' },
   { href: '/trening', icon: Cpu, label: 'Trening' },
   { href: '/chatbot', icon: MessageSquare, label: 'Chatbot' },
+  { href: '/scout', icon: Telescope, label: 'Gap Scout' },
 ];
 
 // Use absolute URL so the browser calls the API directly (avoids build-time proxy baking)
