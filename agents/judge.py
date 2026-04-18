@@ -282,10 +282,16 @@ def judge_answer(state: FoundryState) -> dict:
                 "Judge confidence %.2f < %.2f — escalating to %s",
                 confidence, settings.judge_confidence_threshold, settings.openai_fallback_model,
             )
-            raw2 = _call_judge_model(settings.openai_fallback_model, messages)
-            result = _parse_judge_response(raw2)
-            score = _safe_score(result.get("overall_score", 0.0))
-            judge_model = settings.openai_fallback_model
+            try:
+                raw2 = _call_judge_model(settings.openai_fallback_model, messages)
+                result = _parse_judge_response(raw2)
+                score = _safe_score(result.get("overall_score", 0.0))
+                judge_model = settings.openai_fallback_model
+            except Exception as cascade_exc:
+                logger.warning(
+                    "Fallback judge (%s) failed: %s — keeping primary result",
+                    settings.openai_fallback_model, cascade_exc,
+                )
 
     except Exception as exc:
         logger.error("Judge failed for chunk %s: %s", state["chunk"]["id"], exc)
