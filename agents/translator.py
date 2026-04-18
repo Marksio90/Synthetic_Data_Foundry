@@ -173,11 +173,14 @@ def translate_text(text: str, source_lang: str = "en") -> str:
 
     try:
         if settings.deepl_api_key:
-            translated = _translate_deepl(text, source_lang)
-            logger.debug("Translated via DeepL (%d → %d chars)", len(text), len(translated))
-        else:
-            translated = _translate_openai(text, source_lang)
-            logger.debug("Translated via OpenAI (%d → %d chars)", len(text), len(translated))
+            try:
+                translated = _translate_deepl(text, source_lang)
+                logger.debug("Translated via DeepL (%d → %d chars)", len(text), len(translated))
+                return translated
+            except Exception as deepl_exc:
+                logger.warning("DeepL failed (%s) — falling back to OpenAI", deepl_exc)
+        translated = _translate_openai(text, source_lang)
+        logger.debug("Translated via OpenAI (%d → %d chars)", len(text), len(translated))
         return translated
     except Exception as exc:
         logger.error("Translation failed: %s — returning original text", exc)
