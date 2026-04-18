@@ -131,6 +131,11 @@ def run_migrations(engine) -> None:
             conn.rollback()
             conn.execute(text("SELECT 1"))
 
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_claim "
+            "ON directive_chunks (status, created_at) WHERE status IN ('new', 'in_progress');"
+        ))
+
         conn.execute(text("""
             CREATE OR REPLACE FUNCTION claim_chunk_for_processing(p_chunk_id UUID)
             RETURNS BOOLEAN AS $$
@@ -279,37 +284,42 @@ def main() -> None:
 
         logger.info("=== Ingesting: %s ===", path.name)
         with Session() as session:
-            source_doc_id, markdown = ingest_document(str(path), session)
+            try:
+                source_doc_id, markdown = ingest_document(str(path), session)
 
-            doc = session.scalar(
-                select(SourceDocument).where(SourceDocument.id == uuid.UUID(source_doc_id))
-            )
-            valid_from = doc.valid_from_date if doc else None
-
-            existing_count = session.scalar(
-                select(func.count(DirectiveChunk.id)).where(
-                    DirectiveChunk.source_doc_id == uuid.UUID(source_doc_id)
+                doc = session.scalar(
+                    select(SourceDocument).where(SourceDocument.id == uuid.UUID(source_doc_id))
                 )
-            )
-            if existing_count and existing_count > 0:
-                logger.info("Chunks już istnieją dla %s (%d) — pomijam chunking", path.name, existing_count)
-            else:
-                chunk_ids = chunk_document(
-                    session,
-                    source_doc_id=source_doc_id,
-                    markdown=markdown,
-                    valid_from_date=valid_from,
-                )
-                logger.info("Podzielono %s → %d chunków", path.name, len(chunk_ids))
+                valid_from = doc.valid_from_date if doc else None
 
-                if settings.translate_chunks and chunk_ids:
-                    logger.info("=== Tłumaczenie %d chunków (%s → pl) ===",
-                                len(chunk_ids), settings.translate_source_lang)
-                    translated = translate_chunks_in_db(
-                        session, chunk_ids, source_lang=settings.translate_source_lang
+                existing_count = session.scalar(
+                    select(func.count(DirectiveChunk.id)).where(
+                        DirectiveChunk.source_doc_id == uuid.UUID(source_doc_id)
                     )
-                    session.commit()
-                    logger.info("Przetłumaczono %d/%d chunków", translated, len(chunk_ids))
+                )
+                if existing_count and existing_count > 0:
+                    logger.info("Chunks już istnieją dla %s (%d) — pomijam chunking", path.name, existing_count)
+                else:
+                    chunk_ids = chunk_document(
+                        session,
+                        source_doc_id=source_doc_id,
+                        markdown=markdown,
+                        valid_from_date=valid_from,
+                    )
+                    logger.info("Podzielono %s → %d chunków", path.name, len(chunk_ids))
+
+                    if settings.translate_chunks and chunk_ids:
+                        logger.info("=== Tłumaczenie %d chunków (%s → pl) ===",
+                                    len(chunk_ids), settings.translate_source_lang)
+                        translated = translate_chunks_in_db(
+                            session, chunk_ids, source_lang=settings.translate_source_lang
+                        )
+                        session.commit()
+                        logger.info("Przetłumaczono %d/%d chunków", translated, len(chunk_ids))
+            except Exception as exc:
+                session.rollback()
+                logger.error("Ingest failed for %s: %s — pomijam plik", path.name, exc)
+                continue
 
     # ── Phase 1.5: Auto-kalibracja ────────────────────────────────────────────
     with Session() as session:
@@ -352,12 +362,14 @@ def main() -> None:
             }
 
             claimed = claim_chunk(session, chunk.id)
-            if not claimed:
-                logger.debug("Chunk %s not freshly claimed (recovery)", chunk.id)
             try:
                 session.commit()
             except Exception:
                 session.rollback()
+                logger.warning("Chunk %s claim commit failed — skipping", chunk.id)
+                continue
+            if not claimed:
+                logger.debug("Chunk %s already in_progress (recovery mode)", chunk.id)
 
             chunk_ready = False
             _GRAPH_RETRIES = 3

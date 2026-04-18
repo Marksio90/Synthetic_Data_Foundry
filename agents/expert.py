@@ -172,7 +172,7 @@ def _retry_api(func):
 def _make_ollama_client() -> openai.OpenAI:
     """Klient Ollama przez OpenAI-compatible API."""
     base = settings.ollama_url.rstrip("/")
-    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0)
+    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0, timeout=30.0)
 
 
 def _call_provider(messages: list[dict]) -> str:
@@ -270,8 +270,9 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
 
     # Adaptive: zmniejsz top_k gdy historia konwersacji zajmuje dużo miejsca
     history_chars = sum(len(m["content"]) for m in conversation_history)
-    available_chars = _MAX_CONTEXT_CHARS - history_chars
-    if available_chars < 2000:
+    if history_chars >= _MAX_CONTEXT_CHARS:
+        top_k = 3
+    elif _MAX_CONTEXT_CHARS - history_chars < 2000:
         top_k = max(3, top_k // 2)
 
     try:

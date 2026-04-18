@@ -270,7 +270,7 @@ def _retry_api(func):
 
 def _make_ollama_client() -> openai.OpenAI:
     base = settings.ollama_url.rstrip("/")
-    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0)
+    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0, timeout=30.0)
 
 
 def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) -> str:
