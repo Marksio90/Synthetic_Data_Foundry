@@ -99,12 +99,12 @@ def _translate_deepl(text: str, source_lang: str) -> str:
     src = deepl_lang_map.get(source_lang.lower(), source_lang.upper())
     response = httpx.post(
         url,
+        headers={"Authorization": f"DeepL-Auth-Key {settings.deepl_api_key.strip()}"},
         data={
-            "auth_key": settings.deepl_api_key,
             "text": text,
             "source_lang": src,
             "target_lang": "PL",
-            "formality": "prefer_more",  # formalny styl prawniczy
+            "formality": "prefer_more",
         },
         timeout=30,
     )
