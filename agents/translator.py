@@ -85,8 +85,11 @@ def _retry(func):
 @_retry
 def _translate_deepl(text: str, source_lang: str) -> str:
     """Tłumaczy tekst przez DeepL API (bezpłatna lub płatna wersja)."""
-    # DeepL Free API endpoint; płatna → api.deepl.com
-    url = "https://api-free.deepl.com/v2/translate"
+    # Klucze Free kończą się na :fx → api-free.deepl.com; płatne → api.deepl.com
+    if settings.deepl_api_key.endswith(":fx"):
+        url = "https://api-free.deepl.com/v2/translate"
+    else:
+        url = "https://api.deepl.com/v2/translate"
     # Mapowanie kodów języków na format DeepL
     deepl_lang_map = {
         "en": "EN", "de": "DE", "fr": "FR",
