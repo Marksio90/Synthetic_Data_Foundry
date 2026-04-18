@@ -23,3 +23,6 @@ ollama_models/
 .idea/
 *.swp
 .claude/
+
+# TypeScript build cache
+*.tsbuildinfo
