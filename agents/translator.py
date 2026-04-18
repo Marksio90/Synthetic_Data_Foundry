@@ -145,27 +145,41 @@ def _translate_openai(text: str, source_lang: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Language detection (no external deps — Polish diacritics heuristic)
+# ---------------------------------------------------------------------------
+
+_POLISH_CHARS = frozenset("ąęóśźżćńłĄĘÓŚŹŻĆŃŁ")
+
+def _is_already_polish(text: str) -> bool:
+    """Returns True when text appears to already be in Polish.
+    Polish prose naturally has ~5-10% diacritic characters.
+    English/French/German have <0.5% of the Polish-specific set.
+    """
+    if len(text) < 50:
+        return False
+    ratio = sum(1 for c in text if c in _POLISH_CHARS) / len(text)
+    return ratio > 0.02  # >2% → already Polish
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def translate_text(text: str, source_lang: str = "en") -> str:
     """
     Przetłumacz tekst na język polski.
-
-    Args:
-        text:        Tekst do przetłumaczenia.
-        source_lang: Kod języka źródłowego ('en', 'de', 'fr', itp.).
-
-    Returns:
-        Przetłumaczony tekst po polsku.
-        Jeśli język źródłowy to 'pl' — zwraca oryginał bez zmian.
+    Pomija tłumaczenie jeśli tekst jest już po polsku (auto-detekcja).
     """
     if not text or not text.strip():
         return text
 
     source_lang = source_lang.lower()
     if source_lang == "pl":
-        return text  # Nic do tłumaczenia
+        return text
+
+    if _is_already_polish(text):
+        logger.debug("Translator: tekst wykryty jako PL — pomijam tłumaczenie")
+        return text
 
     # Przycinaj do max długości (zbyt długie teksty → błędy API)
     if len(text) > _MAX_CHUNK_CHARS:
