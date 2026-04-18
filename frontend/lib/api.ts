@@ -137,6 +137,57 @@ export async function apiFetch<T = unknown>(
   return res.json() as Promise<T>;
 }
 
+// ─── Gap Scout Types ─────────────────────────────────────────────────────────
+
+export interface ScoutSource {
+  url: string;
+  title: string;
+  published_at: string;
+  source_type: 'arxiv' | 'openalex' | 'hackernews' | 'eurlex' | string;
+  verified: boolean;
+}
+
+export interface ScoutTopic {
+  topic_id: string;
+  title: string;
+  summary: string;
+  score: number;
+  recency_score: number;
+  llm_uncertainty: number;
+  source_count: number;
+  social_signal: number;
+  sources: ScoutSource[];
+  domains: string[];
+  discovered_at: string;
+}
+
+export interface ScoutRun {
+  scout_id: string;
+  status: 'starting' | 'running' | 'done' | 'error';
+  topics_found: number;
+  elapsed_seconds: number;
+  error?: string | null;
+}
+
+export async function startScoutRun(domains?: string[]): Promise<ScoutRun> {
+  return apiFetch<ScoutRun>('/api/scout/run', {
+    method: 'POST',
+    body: JSON.stringify(domains ? { domains } : {}),
+  });
+}
+
+export async function getScoutStatus(scoutId: string): Promise<ScoutRun> {
+  return apiFetch<ScoutRun>(`/api/scout/status/${scoutId}`);
+}
+
+export async function getScoutTopics(limit = 50): Promise<ScoutTopic[]> {
+  return apiFetch<ScoutTopic[]>(`/api/scout/topics?limit=${limit}`);
+}
+
+export async function ingestTopic(topicId: string): Promise<{ message: string; sources_queued: number }> {
+  return apiFetch(`/api/scout/ingest/${topicId}`, { method: 'POST' });
+}
+
 export function getWsBase(): string {
   const base = API_BASE.replace(/^http/, 'ws').replace(/^https/, 'wss');
   return base;
