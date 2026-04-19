@@ -33,13 +33,14 @@ import logging
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import openai
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
-from agents.calibrator import calibrate
+from agents.calibrator import AdaptiveCalibrator, calibrate
 from agents.chunker import chunk_document
 from agents.cross_doc import generate_cross_doc_samples
 from agents.hf_uploader import upload_dataset_to_hub
@@ -48,8 +49,6 @@ from agents.translator import translate_chunks_in_db
 from config.settings import settings
 from db.models import Base, DirectiveChunk, SourceDocument
 from db.repository import claim_chunk, get_pending_chunks
-from pipeline.graph import build_graph
-from pipeline.state import FoundryState
 from utils.datacard import generate_datacard
 from utils.dedup import MinHashDeduplicator
 from utils.output import DPOWriter, JSONLWriter, KTOWriter, ORPOWriter
@@ -71,6 +70,96 @@ _SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".rst",
     ".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm",
 }
+
+
+# ---------------------------------------------------------------------------
+# Swarm constants
+# ---------------------------------------------------------------------------
+
+_GRAPH_RETRIES = 3
+# Cap parallel workers: gpt-4o-mini parallelises well; Ollama is GPU-serial so
+# values >4 don't help throughput and just waste memory / connection pool.
+_MAX_PERSPECTIVE_WORKERS = 4
+
+
+# ---------------------------------------------------------------------------
+# Per-perspective worker (runs in its own thread + DB session)
+# ---------------------------------------------------------------------------
+
+def _run_perspective(
+    perspective: str,
+    chunk_meta: dict,
+    batch_id: str,
+    session_factory,
+    writer,
+    dpo_writer,
+    orpo_writer,
+    kto_writer,
+    deduplicator,
+) -> tuple[bool, float]:
+    """
+    Execute one LangGraph perspective for one chunk in an isolated DB session.
+    Returns (is_ready, quality_score).  Thread-safe: writers already use locks.
+    """
+    from pipeline.graph import build_graph
+    from pipeline.state import FoundryState
+
+    with session_factory() as _session:
+        _graph = build_graph(
+            _session, writer,
+            dpo_writer=dpo_writer,
+            orpo_writer=orpo_writer,
+            kto_writer=kto_writer,
+            deduplicator=deduplicator,
+        )
+        initial_state: FoundryState = {
+            "chunk": chunk_meta,
+            "perspective": perspective,
+            "question": "",
+            "is_adversarial": False,
+            "retrieved_context": [],
+            "retrieved_ids": [],
+            "answer": "",
+            "constitutional_critique": None,
+            "quality_score": 0.0,
+            "judge_model": "",
+            "judge_reasoning": "",
+            "judge_details": {},
+            "retry_count": 0,
+            "status": "in_progress",
+            "error_message": None,
+            "conversation_history": [],
+            "turn_count": 0,
+            "rejected_answer": None,
+            "question_type": "factual",
+            "difficulty": "medium",
+            "sample_id": None,
+            "batch_id": batch_id,
+            "record_index": writer.record_count,
+        }
+
+        for attempt in range(_GRAPH_RETRIES):
+            try:
+                final = _graph.invoke(initial_state)
+                return final.get("status") == "ready", float(final.get("quality_score") or 0.0)
+            except openai.RateLimitError:
+                if attempt < _GRAPH_RETRIES - 1:
+                    wait = 2 ** attempt * 4
+                    logger.warning(
+                        "Rate-limit (chunk=%s, %s) — retry %d/%d za %ds",
+                        chunk_meta["id"], perspective, attempt + 1, _GRAPH_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        "Graph failed (rate-limit, %d attempts) chunk=%s [%s]",
+                        _GRAPH_RETRIES, chunk_meta["id"], perspective,
+                    )
+            except Exception as exc:
+                logger.error("Graph failed chunk=%s [%s]: %s", chunk_meta["id"], perspective, exc)
+                break
+
+    return False, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -332,20 +421,17 @@ def main() -> None:
             settings.max_turns = cal.max_turns
             settings.adversarial_ratio = cal.adversarial_ratio
 
+    adaptive_cal = AdaptiveCalibrator(settings.quality_threshold)
+
     # ── Phase 2: Swarm na pending chunks ─────────────────────────────────────
-    logger.info("=== Uruchamiam swarm (batch=%s, %d perspektyw) ===", batch_id, len(perspectives))
+    logger.info(
+        "=== Uruchamiam swarm (batch=%s, %d perspektyw, max_workers=%d) ===",
+        batch_id, len(perspectives), min(len(perspectives), _MAX_PERSPECTIVE_WORKERS),
+    )
 
     total_processed = total_ready = total_unresolvable = 0
 
     with Session() as session:
-        graph = build_graph(
-            session, writer,
-            dpo_writer=dpo_writer,
-            orpo_writer=orpo_writer,
-            kto_writer=kto_writer,
-            deduplicator=deduplicator,
-        )
-
         limit = args.chunk_limit if args.chunk_limit > 0 else 10_000
         pending = get_pending_chunks(session, limit=limit)
         logger.info("Znaleziono %d pending chunków", len(pending))
@@ -372,53 +458,30 @@ def main() -> None:
                 logger.debug("Chunk %s already in_progress (recovery mode)", chunk.id)
 
             chunk_ready = False
-            _GRAPH_RETRIES = 3
+            max_workers = min(len(perspectives), _MAX_PERSPECTIVE_WORKERS)
 
-            for perspective in perspectives:
-                initial_state: FoundryState = {
-                    "chunk": chunk_meta,
-                    "perspective": perspective,
-                    "question": "",
-                    "is_adversarial": False,
-                    "retrieved_context": [],
-                    "retrieved_ids": [],
-                    "answer": "",
-                    "constitutional_critique": None,
-                    "quality_score": 0.0,
-                    "judge_model": "",
-                    "judge_reasoning": "",
-                    "judge_details": {},
-                    "retry_count": 0,
-                    "status": "in_progress",
-                    "error_message": None,
-                    "conversation_history": [],
-                    "turn_count": 0,
-                    "rejected_answer": None,
-                    "question_type": "factual",
-                    "difficulty": "medium",
-                    "sample_id": None,
-                    "batch_id": batch_id,
-                    "record_index": writer.record_count,
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _run_perspective,
+                        p, chunk_meta, batch_id,
+                        Session, writer, dpo_writer, orpo_writer, kto_writer, deduplicator,
+                    ): p
+                    for p in perspectives
                 }
-
-                for attempt in range(_GRAPH_RETRIES):
+                for future in as_completed(futures):
+                    p = futures[future]
                     try:
-                        final_state = graph.invoke(initial_state)
-                        if final_state.get("status") == "ready":
+                        is_ready, score = future.result()
+                        if is_ready:
                             chunk_ready = True
-                        break
-                    except openai.RateLimitError as exc:
-                        if attempt < _GRAPH_RETRIES - 1:
-                            wait = 2 ** attempt * 4
-                            logger.warning("Rate-limit (chunk=%s, %s) — retry %d/%d za %ds",
-                                           chunk.id, perspective, attempt + 1, _GRAPH_RETRIES, wait)
-                            time.sleep(wait)
-                        else:
-                            logger.error("Graph failed (rate-limit, %d attempts) chunk=%s [%s]",
-                                         _GRAPH_RETRIES, chunk.id, perspective)
+                        if score > 0:
+                            adaptive_cal.record(score)
                     except Exception as exc:
-                        logger.error("Graph failed chunk=%s [%s]: %s", chunk.id, perspective, exc)
-                        break
+                        logger.error("Perspective %s future failed: %s", p, exc)
+
+            # Apply adaptive threshold after each chunk batch
+            settings.quality_threshold = adaptive_cal.current_threshold
 
             total_processed += 1
             if chunk_ready:
@@ -468,16 +531,29 @@ def main() -> None:
     )
 
     # ── Phase 5: HuggingFace Hub upload ───────────────────────────────────────
-    if settings.hf_dataset_repo or args.upload_hf:
-        logger.info("=== Uploading dataset to HuggingFace Hub ===")
-        upload_dataset_to_hub(
-            sft_path=settings.output_file,
-            batch_id=batch_id,
-            dpo_path=settings.dpo_output_file,
-            orpo_path=settings.orpo_output_file,
-            kto_path=settings.kto_output_file,
-            datacard=card,
-        )
+    _upload_requested = settings.hf_dataset_repo or args.upload_hf
+    if _upload_requested:
+        _sft_count = writer.record_count
+        _unresolvable_pct = (total_unresolvable / max(total_processed, 1)) * 100
+        _quality_ok = _sft_count >= 10 and _unresolvable_pct <= 30.0
+
+        if not _quality_ok:
+            logger.warning(
+                "⚠ Quality gate: SFT records=%d, unresolvable=%.1f%% — "
+                "upload blocked. Użyj --upload-hf aby wymusić.",
+                _sft_count, _unresolvable_pct,
+            )
+
+        if _quality_ok or args.upload_hf:
+            logger.info("=== Uploading dataset to HuggingFace Hub ===")
+            upload_dataset_to_hub(
+                sft_path=settings.output_file,
+                batch_id=batch_id,
+                dpo_path=settings.dpo_output_file,
+                orpo_path=settings.orpo_output_file,
+                kto_path=settings.kto_output_file,
+                datacard=card,
+            )
 
     # ── Summary ──────────────────────────────────────────────────────────────
     logger.info("=" * 60)

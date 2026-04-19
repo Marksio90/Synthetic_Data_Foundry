@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
+from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
 
 from api.state import scouts
@@ -163,11 +166,15 @@ def get_topic(topic_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_INGEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FoundryBot/1.0; +https://github.com/marksio90)"}
+
+
 @router.post("/ingest/{topic_id}")
 async def ingest_topic(topic_id: str) -> dict:
     """
-    Queue all verified sources of a topic for pipeline ingestion.
-    Sources are saved to data/ so the AutoPilot can process them.
+    Download verified sources of a topic and save them to data/scout_ingested/<topic_id[:8]>/.
+    Files are ready for immediate pipeline processing via:
+        python main.py --data-dir <output_dir>
     """
     topic = scouts.get_topic(topic_id)
     if topic is None:
@@ -177,13 +184,45 @@ async def ingest_topic(topic_id: str) -> dict:
     if not verified:
         raise HTTPException(status_code=422, detail="No verified sources to ingest.")
 
+    output_dir = Path("data") / "scout_ingested" / topic_id[:8]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[str] = []
+    errors: list[str] = []
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=_INGEST_HEADERS) as client:
+        for src in verified[:8]:  # cap at 8 downloads per ingest call
+            url = src.get("url", "")
+            if not url:
+                continue
+            # arxiv abstract → PDF
+            if "arxiv.org/abs/" in url:
+                url = url.replace("/abs/", "/pdf/") + ".pdf"
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            except Exception as exc:
+                errors.append(f"{url[:80]}: {exc}")
+                logger.warning("Ingest download failed: %s — %s", url[:80], exc)
+                continue
+
+            ct = resp.headers.get("content-type", "")
+            ext = ".pdf" if "pdf" in ct else ".html"
+            safe = re.sub(r"[^\w\-]", "_", (src.get("title") or url)[:60]).strip("_") or "source"
+            path = output_dir / f"{safe}{ext}"
+            path.write_bytes(resp.content)
+            saved_paths.append(str(path))
+            logger.info("Ingest: saved %s (%d B)", path.name, len(resp.content))
+
     return {
         "topic_id": topic_id,
         "title": topic.title,
-        "sources_queued": len(verified),
-        "sources": verified[:5],
+        "sources_downloaded": len(saved_paths),
+        "errors": len(errors),
+        "output_dir": str(output_dir),
+        "paths": saved_paths[:5],
         "message": (
-            f"Queued {len(verified)} source(s) for ingestion. "
-            "Open the AutoPilot page to run the pipeline."
+            f"Pobrano {len(saved_paths)}/{len(verified)} źródeł → {output_dir}. "
+            f"Uruchom pipeline: python main.py --data-dir {output_dir}"
         ),
     }

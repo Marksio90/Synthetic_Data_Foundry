@@ -152,6 +152,8 @@ def _is_retryable_openai(exc: BaseException) -> bool:
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
         return True
+    if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
+        return True
     return False
 
 
@@ -172,7 +174,7 @@ def _retry_api(func):
 def _make_ollama_client() -> openai.OpenAI:
     """Klient Ollama przez OpenAI-compatible API."""
     base = settings.ollama_url.rstrip("/")
-    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0, timeout=30.0)
+    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0, timeout=120.0)
 
 
 def _call_provider(messages: list[dict]) -> str:

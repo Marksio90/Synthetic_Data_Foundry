@@ -33,6 +33,12 @@ from utils.classifier import classify_question
 from utils.dedup import MinHashDeduplicator
 from utils.output import JSONLWriter
 
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+
 if TYPE_CHECKING:
     from utils.output import DPOWriter
 
@@ -121,6 +127,69 @@ _ANSWER_SYSTEM = (
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _doc_centroid(chunks: list[DirectiveChunk]) -> "list[float] | None":
+    """Mean-normalised embedding centroid for a document's chunks."""
+    if not _HAS_NUMPY:
+        return None
+    embeddings = [c.embedding for c in chunks if c.embedding is not None]
+    if not embeddings:
+        return None
+    arr = np.array(embeddings, dtype=np.float32)
+    centroid = arr.mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
+    return (centroid / norm).tolist() if norm > 1e-9 else centroid.tolist()
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    if not _HAS_NUMPY:
+        return 0.5
+    return float(np.dot(np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)))
+
+
+def _pick_doc_pair(
+    by_doc: dict[str, list[DirectiveChunk]],
+    doc_names: dict[str, str],
+) -> tuple[str, str] | tuple[None, None]:
+    """
+    Pick two document IDs biased toward topically similar pairs via softmax sampling.
+    Respects _are_compatible constraint. Falls back to random if numpy is absent.
+    """
+    doc_ids = list(by_doc.keys())
+    if len(doc_ids) < 2:
+        return None, None
+
+    doc_a = random.choice(doc_ids)
+    name_a = doc_names.get(doc_a, "")
+
+    if not _HAS_NUMPY:
+        candidates = [d for d in doc_ids if d != doc_a and _are_compatible(name_a, doc_names.get(d, ""))]
+        return (doc_a, random.choice(candidates)) if candidates else (None, None)
+
+    centroid_a = _doc_centroid(by_doc[doc_a])
+
+    scored: list[tuple[float, str]] = []
+    for doc_b in doc_ids:
+        if doc_b == doc_a:
+            continue
+        name_b = doc_names.get(doc_b, "")
+        if not _are_compatible(name_a, name_b):
+            continue
+        c_b = _doc_centroid(by_doc[doc_b])
+        sim = _cosine_sim(centroid_a, c_b) if (centroid_a and c_b) else 0.5
+        scored.append((sim, doc_b))
+
+    if not scored:
+        return None, None
+
+    scores = np.array([s for s, _ in scored], dtype=np.float32)
+    # Tempered softmax (T=0.4): focuses sampling on similar docs but keeps diversity
+    shifted = (scores - scores.max()) / 0.4
+    probs = np.exp(shifted)
+    probs /= probs.sum()
+    idx = int(np.random.choice(len(scored), p=probs))
+    return doc_a, scored[idx][1]
+
+
 def _get_chunks_by_document(session: Session) -> dict[str, list[DirectiveChunk]]:
     """Return ready, non-superseded chunks grouped by source_doc_id string."""
     chunks = session.scalars(
@@ -167,9 +236,18 @@ def generate_cross_doc_samples(
         )
         return 0
 
+    # Precompute document names once (avoids repeated DB queries per attempt)
+    doc_names: dict[str, str] = {}
+    for did in doc_ids:
+        first_chunk = by_doc[did][0]
+        doc_obj = session.get(SourceDocument, first_chunk.source_doc_id)
+        if doc_obj:
+            doc_names[did] = doc_obj.directive_name or doc_obj.filename or "Document"
+
     logger.info(
-        "Cross-doc pass: %d source documents, targeting %d samples",
+        "Cross-doc pass: %d source documents, targeting %d samples%s",
         len(doc_ids), n_samples,
+        " (similarity-biased pairs)" if _HAS_NUMPY else " (random pairs)",
     )
 
     written = 0
@@ -179,21 +257,16 @@ def generate_cross_doc_samples(
     while written < n_samples and attempts < max_attempts:
         attempts += 1
 
-        # Sample 2 different source documents — tylko kompatybilne pary
-        pair = random.sample(doc_ids, 2)
-        chunk_a = random.choice(by_doc[pair[0]])
-        chunk_b = random.choice(by_doc[pair[1]])
+        # Pick similarity-biased compatible document pair
+        id_a, id_b = _pick_doc_pair(by_doc, doc_names)
+        if id_a is None or id_b is None:
+            logger.warning("Cross-doc: no compatible document pair found — stopping")
+            break
 
-        # Resolve directive names
-        doc_a = session.get(SourceDocument, chunk_a.source_doc_id)
-        doc_b = session.get(SourceDocument, chunk_b.source_doc_id)
-        name_a = (doc_a.directive_name or doc_a.filename or "Dyrektywa A") if doc_a else "Dyrektywa A"
-        name_b = (doc_b.directive_name or doc_b.filename or "Dyrektywa B") if doc_b else "Dyrektywa B"
-
-        # Odrzuć pary niekompatybilne tematycznie (np. CSRD + dokument niezwiązany)
-        if not _are_compatible(name_a, name_b):
-            logger.debug("Cross-doc: para %s + %s jest niekompatybilna — pomijam", name_a, name_b)
-            continue
+        chunk_a = random.choice(by_doc[id_a])
+        chunk_b = random.choice(by_doc[id_b])
+        name_a = doc_names.get(id_a, "Dyrektywa A")
+        name_b = doc_names.get(id_b, "Dyrektywa B")
 
         context = (
             f"[Fragment z {name_a}]\n{chunk_a.content}\n\n"
