@@ -12,6 +12,10 @@ Counters & gauges:
   foundry_scout_runs_total          — Gap Scout runs started
   foundry_topics_discovered_total   — knowledge-gap topics discovered
   foundry_judge_score               — histogram of judge quality scores
+  foundry_scout_sources_active      — active crawlers per source (gauge)
+  foundry_scout_topics_per_source   — topics found per source (counter)
+  foundry_scout_fetch_duration_seconds — fetch latency per source (histogram)
+  foundry_scout_verification_failures  — verification failures per reason/source
 """
 
 from __future__ import annotations
@@ -67,6 +71,35 @@ try:
         "foundry_judge_score",
         "Distribution of judge quality scores",
         buckets=[0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00],
+        registry=_registry,
+    )
+
+    # ------------------------------------------------------------------
+    # Gap Scout crawler metrics (added in Step 2)
+    # ------------------------------------------------------------------
+    scout_sources_active = Gauge(
+        "foundry_scout_sources_active",
+        "Number of active (non-paused) crawlers",
+        labelnames=["source"],
+        registry=_registry,
+    )
+    scout_topics_per_source = Counter(
+        "foundry_scout_topics_per_source",
+        "Total topics discovered per source crawler",
+        labelnames=["source"],
+        registry=_registry,
+    )
+    scout_fetch_duration = Histogram(
+        "foundry_scout_fetch_duration_seconds",
+        "HTTP fetch duration per source crawler (seconds)",
+        labelnames=["source"],
+        buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0],
+        registry=_registry,
+    )
+    scout_verification_failures = Counter(
+        "foundry_scout_verification_failures",
+        "Verification failures per reason and source crawler",
+        labelnames=["reason", "source"],
         registry=_registry,
     )
 
