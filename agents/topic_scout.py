@@ -591,6 +591,33 @@ async def _process_domain(
     social_count = sum(1 for s in verified if s.source_type == "hackernews")
     social       = min(1.0, social_count / 5.0)
 
+    best = max(
+        (s for s in verified if s.published_at),
+        key=lambda s: s.published_at,
+        default=verified[0],
+    )
+
+    # Derive metadata fields
+    best_tier  = _best_tier([s.source_tier for s in verified])
+    fmt_types  = list({_infer_format(s.url) for s in verified})
+    langs      = list({s.language for s in verified if s.language})
+    est_tokens = len(verified) * 800
+
+    # 8-component KNOWLEDGE_GAP_SCORE (lazy import avoids circular dependency)
+    from agents.crawlers.scorer import ScorerContext, score_topic
+    ctx = ScorerContext(
+        domain=domain,
+        sources=verified,
+        cutoff_model_targets=post_cutoff_models,
+        languages=langs,
+        format_types=fmt_types,
+        recency_score=recency,
+        base_uncertainty=float(uncertainty),
+        http_client=_HTTP,
+    )
+    scoring = await score_topic(ctx)
+
+    # Legacy 4-component score kept for backwards compat (used in sort + old API consumers)
     score = round(
         0.40 * recency
         + 0.30 * float(uncertainty)
@@ -599,22 +626,10 @@ async def _process_domain(
         3,
     )
 
-    best = max(
-        (s for s in verified if s.published_at),
-        key=lambda s: s.published_at,
-        default=verified[0],
-    )
-
-    # Derive new metadata fields
-    best_tier  = _best_tier([s.source_tier for s in verified])
-    fmt_types  = list({_infer_format(s.url) for s in verified})
-    langs      = list({s.language for s in verified if s.language})
-    est_tokens = len(verified) * 800   # rough estimate; full extraction in Step 4
-
     await _log(
-        f"  {domain[:40]}: score={score:.2f} tier={best_tier} "
-        f"sources={len(verified)} uncertainty={float(uncertainty):.2f} "
-        f"cutoff_models={len(post_cutoff_models)}"
+        f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
+        f"tier={best_tier} sources={len(verified)} "
+        f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)}"
     )
 
     topic = ScoutTopicData(
@@ -623,17 +638,18 @@ async def _process_domain(
         summary=best.title[:250],
         score=score,
         recency_score=recency,
-        llm_uncertainty=float(uncertainty),
+        llm_uncertainty=scoring.llm_uncertainty,
         source_count=len(verified),
         social_signal=round(social, 3),
         sources=verified[:10],
         domains=[domain],
         discovered_at=datetime.now(tz=timezone.utc).isoformat(),
         # new fields
-        knowledge_gap_score=score,        # bootstrapped; full 8-component score in Step 5
+        knowledge_gap_score=scoring.knowledge_gap_score,
         cutoff_model_targets=post_cutoff_models,
         format_types=fmt_types,
         languages=langs,
+        citation_velocity=scoring.citation_velocity,
         source_tier=best_tier,
         estimated_tokens=est_tokens,
         ingest_ready=True,
