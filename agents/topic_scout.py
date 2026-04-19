@@ -554,26 +554,32 @@ async def _process_domain(
 
     await _log(f"Scanning: {domain[:60]}")
 
-    # Lazy import avoids circular dependency (layer_a imports ScoutSource from this module)
+    # Lazy imports avoid circular dependency (layers import ScoutSource from this module)
     from agents.crawlers.layer_a import run_layer_a
+    from agents.crawlers.layer_b import run_layer_b
+    from agents.crawlers.layer_c import run_layer_c
 
     gathered = await asyncio.gather(
-        run_layer_a(domain),          # Layer A: 14 science/research crawlers
-        _fetch_openalex(domain),      # cross-layer aggregator (kept for coverage)
-        _fetch_hackernews(domain),    # Layer D social signal (full integration in Step 9)
-        _fetch_eurlex(domain),        # Layer B legislation (full integration in Step 6)
+        run_layer_a(domain),           # Layer A: 14 science/research crawlers
+        run_layer_b(domain),           # Layer B: 10 legislation/regulatory crawlers
+        run_layer_c(domain),           # Layer C: 10 finance/economic data crawlers
+        _fetch_openalex(domain),       # cross-layer aggregator (kept for coverage)
+        _fetch_hackernews(domain),     # Layer D social signal (full integration in Step 9)
         _probe_llm_uncertainty(domain),
         return_exceptions=True,
     )
 
     layer_a_srcs = gathered[0] if not isinstance(gathered[0], Exception) else []
-    oa_srcs      = gathered[1] if not isinstance(gathered[1], Exception) else []
-    hn_srcs      = gathered[2] if not isinstance(gathered[2], Exception) else []
-    el_srcs      = gathered[3] if not isinstance(gathered[3], Exception) else []
-    uncertainty  = gathered[4] if not isinstance(gathered[4], Exception) else 0.5
+    layer_b_srcs = gathered[1] if not isinstance(gathered[1], Exception) else []
+    layer_c_srcs = gathered[2] if not isinstance(gathered[2], Exception) else []
+    oa_srcs      = gathered[3] if not isinstance(gathered[3], Exception) else []
+    hn_srcs      = gathered[4] if not isinstance(gathered[4], Exception) else []
+    uncertainty  = gathered[5] if not isinstance(gathered[5], Exception) else 0.5
 
-    # Merge: Layer A first (highest quality), then cross-layer, then social, then legislation
-    all_sources: list[ScoutSource] = [*layer_a_srcs, *oa_srcs, *hn_srcs, *el_srcs]
+    # Merge: Layer A (science) → B (legislation) → C (finance) → cross-layer → social
+    all_sources: list[ScoutSource] = [
+        *layer_a_srcs, *layer_b_srcs, *layer_c_srcs, *oa_srcs, *hn_srcs,
+    ]
 
     # 5-point Anti-Hallucination & Verification Firewall
     # Lazy import avoids circular dependency with verifier → topic_scout
