@@ -184,7 +184,13 @@ export async function getScoutTopics(limit = 50): Promise<ScoutTopic[]> {
   return apiFetch<ScoutTopic[]>(`/api/scout/topics?limit=${limit}`);
 }
 
-export async function ingestTopic(topicId: string): Promise<{ message: string; sources_queued: number }> {
+export async function ingestTopic(topicId: string): Promise<{
+  message: string;
+  sources_downloaded: number;
+  errors: number;
+  output_dir: string;
+  paths: string[];
+}> {
   return apiFetch(`/api/scout/ingest/${topicId}`, { method: 'POST' });
 }
 

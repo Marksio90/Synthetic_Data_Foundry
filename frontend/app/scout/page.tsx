@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   getScoutTopics,
   getWsBase,
@@ -12,6 +13,7 @@ import {
 import {
   ArrowUpRight,
   BookOpen,
+  CheckCircle2,
   FileSearch,
   Loader2,
   MessageCircleQuestion,
@@ -66,8 +68,10 @@ function ScoreBar({ value, label }: { value: number; label: string }) {
 // ─── Topic card ───────────────────────────────────────────────────────────────
 
 function TopicCard({ topic, onIngest }: { topic: ScoutTopic; onIngest: (id: string) => void }) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [ingesting, setIngesting] = useState(false);
+  const [ingestDone, setIngestDone] = useState(false);
   const [ingestMsg, setIngestMsg] = useState('');
 
   const score = Math.round(topic.score * 100);
@@ -83,7 +87,10 @@ function TopicCard({ topic, onIngest }: { topic: ScoutTopic; onIngest: (id: stri
     try {
       const res = await ingestTopic(topic.topic_id);
       setIngestMsg(res.message);
+      setIngestDone(true);
       onIngest(topic.topic_id);
+      // Navigate to AutoPilot — downloaded files are ready
+      setTimeout(() => router.push('/autopilot'), 1800);
     } catch (e: unknown) {
       setIngestMsg(e instanceof Error ? e.message : 'Błąd ingestion');
     } finally {
@@ -132,23 +139,30 @@ function TopicCard({ topic, onIngest }: { topic: ScoutTopic; onIngest: (id: stri
           {open ? 'Zwiń' : 'Zobacz źródła'}
         </button>
         <div className="flex-1" />
-        <button
-          onClick={handleIngest}
-          disabled={ingesting}
-          className="
-            flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium
-            bg-accent/10 text-accent border border-accent/30
-            hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed
-            transition-colors
-          "
-        >
-          {ingesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-          Ingestuj
-        </button>
+        {ingestDone ? (
+          <span className="flex items-center gap-1 text-xs text-success font-medium">
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            Przechodzę do AutoPilota…
+          </span>
+        ) : (
+          <button
+            onClick={handleIngest}
+            disabled={ingesting}
+            className="
+              flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium
+              bg-accent/10 text-accent border border-accent/30
+              hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed
+              transition-colors
+            "
+          >
+            {ingesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+            Ingestuj → AutoPilot
+          </button>
+        )}
       </div>
 
-      {ingestMsg && (
-        <p className="text-xs text-success bg-success/10 rounded px-2 py-1">{ingestMsg}</p>
+      {ingestMsg && !ingestDone && (
+        <p className="text-xs text-error bg-error/10 rounded px-2 py-1">{ingestMsg}</p>
       )}
 
       {/* Source list */}
@@ -185,6 +199,9 @@ function LiveLog({ scoutId, onDone }: { scoutId: string; onDone: () => void }) {
   const [lines, setLines] = useState<string[]>([]);
   const [status, setStatus] = useState('running');
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Stable ref avoids re-creating the WebSocket when parent re-renders
+  const onDoneRef = useRef(onDone);
+  useEffect(() => { onDoneRef.current = onDone; });
 
   useEffect(() => {
     const ws = new WebSocket(`${getWsBase()}/api/scout/ws/${scoutId}`);
@@ -196,12 +213,12 @@ function LiveLog({ scoutId, onDone }: { scoutId: string; onDone: () => void }) {
       if (msg.status) setStatus(msg.status);
       if (msg.line === '__EOF__') {
         ws.close();
-        onDone();
+        onDoneRef.current();
       }
     };
     ws.onerror = () => setStatus('error');
     return () => ws.close();
-  }, [scoutId, onDone]);
+  }, [scoutId]); // scoutId only — onDone stabilised via ref
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -255,7 +272,6 @@ export default function ScoutPage() {
     try {
       const run = await startScoutRun();
       setScoutId(run.scout_id);
-      // Safety timeout: reset loading if WebSocket never fires (e.g. network error)
       setTimeout(() => {
         setLoading((prev) => {
           if (prev) setError('Skanowanie zajęło zbyt długo — spróbuj ponownie');
@@ -268,10 +284,10 @@ export default function ScoutPage() {
     }
   }
 
-  function handleRunDone() {
+  const handleRunDone = useCallback(() => {
     setLoading(false);
     loadTopics();
-  }
+  }, [loadTopics]);
 
   const allTypes = useMemo(
     () => Array.from(new Set(topics.flatMap((t) => t.sources.map((s) => s.source_type)))).sort(),
@@ -303,7 +319,7 @@ export default function ScoutPage() {
         <div>
           <h1 className="text-base font-semibold text-text">Gap Scout</h1>
           <p className="text-xs text-text-muted">
-            Automatyczne wykrywanie luk wiedzy LLM — zweryfikowane źródła
+            Automatyczne wykrywanie luk wiedzy LLM — kliknij &quot;Ingestuj&quot; aby wysłać temat do AutoPilota
           </p>
         </div>
         <div className="flex-1" />
