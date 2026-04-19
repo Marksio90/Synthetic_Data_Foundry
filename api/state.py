@@ -227,6 +227,8 @@ class ScoutManager:
         for k, v in kwargs.items():
             if hasattr(rec, k):
                 setattr(rec, k, v)
+        if kwargs.get("status") in ("done", "error") and rec.ended_at is None:
+            rec.ended_at = time.time()
 
     def append_log(self, scout_id: str, line: str) -> None:
         rec = self._runs.get(scout_id)

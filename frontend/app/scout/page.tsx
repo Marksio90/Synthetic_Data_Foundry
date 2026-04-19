@@ -11,6 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ElementType } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   getScoutTopics,
@@ -332,7 +333,7 @@ function LiveLog({ scoutId, onDone }: { scoutId: string; onDone: () => void }) {
 
 type Tab = 'tematy' | 'live' | 'modele' | 'zrodla';
 
-const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
+const TABS: { id: Tab; label: string; icon: ElementType }[] = [
   { id: 'tematy',  label: 'Tematy',    icon: Telescope },
   { id: 'live',    label: 'Na żywo',   icon: Radio },
   { id: 'modele',  label: 'Modele',    icon: Brain },

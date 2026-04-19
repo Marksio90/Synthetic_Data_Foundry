@@ -9,6 +9,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
+import type { ElementType } from 'react';
 import { getScoutSources } from '@/lib/api';
 import type { CrawlerStatus, ScoutSourcesResponse, WebSubSubscription } from '@/lib/api';
 import {
@@ -73,7 +74,7 @@ function getCrawlerHealth(c: CrawlerStatus): CrawlerHealth {
   return 'ok';
 }
 
-const HEALTH_CONFIG: Record<CrawlerHealth, { icon: React.ElementType; cls: string; label: string }> = {
+const HEALTH_CONFIG: Record<CrawlerHealth, { icon: ElementType; cls: string; label: string }> = {
   ok:       { icon: CheckCircle2, cls: 'text-success',      label: 'OK' },
   degraded: { icon: AlertCircle,  cls: 'text-warning',      label: 'Degradacja' },
   error:    { icon: XCircle,      cls: 'text-error',        label: 'Błąd' },
