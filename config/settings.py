@@ -273,6 +273,15 @@ class Settings(BaseSettings):
         le=50,
         description="Max concurrent HTTP connections during source verification firewall.",
     )
+    scout_whisper_model: str = Field(
+        "base",
+        description=(
+            "faster-whisper model size for audio/video transcription. "
+            "Options: tiny (~39 MB), base (~74 MB), small (~244 MB), "
+            "medium (~769 MB), large-v3 (~1.5 GB). "
+            "Default 'base' runs on CPU with int8 quantisation."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # API / UI service

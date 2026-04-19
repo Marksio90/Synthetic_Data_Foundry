@@ -329,19 +329,22 @@ class CSVExtractor(BaseExtractor):
 
 
 # ===========================================================================
-# Audio / Video — placeholder, implemented in Step 8 (Whisper)
+# Audio / Video — faster-whisper primary, Replicate API fallback (Step 8)
 # ===========================================================================
 
 
 class AudioExtractor(BaseExtractor):
-    """Placeholder — replaced by faster-whisper in Step 8."""
+    """
+    Transcribes audio (mp3, wav, m4a, ogg, flac) and video (mp4, mkv, webm…)
+    using faster-whisper locally or Replicate API as fallback.
+    See agents/extractors/audio.py for full implementation details.
+    """
 
     def extract(self, content: ContentInput) -> str:
-        logger.warning(
-            "AudioExtractor not yet implemented — faster-whisper will be wired in Step 8. "
-            "Install faster-whisper and set SCOUT_WHISPER_MODEL."
+        from agents.extractors.audio import WhisperAudioExtractor
+        return WhisperAudioExtractor().extract(
+            content if isinstance(content, bytes) else content.encode("utf-8", errors="replace")
         )
-        return ""
 
 
 # ===========================================================================
@@ -365,11 +368,23 @@ _FORMAT_MAP: dict[str, type[BaseExtractor]] = {
     "md":   PlainTextExtractor,
     "json": PlainTextExtractor,
     "jsonld": PlainTextExtractor,
+    # Audio formats
     "mp3":  AudioExtractor,
-    "mp4":  AudioExtractor,
     "wav":  AudioExtractor,
     "m4a":  AudioExtractor,
     "ogg":  AudioExtractor,
+    "flac": AudioExtractor,
+    "aac":  AudioExtractor,
+    "opus": AudioExtractor,
+    "wma":  AudioExtractor,
+    # Video formats (audio track extracted via ffmpeg before transcription)
+    "mp4":  AudioExtractor,
+    "mkv":  AudioExtractor,
+    "webm": AudioExtractor,
+    "mov":  AudioExtractor,
+    "avi":  AudioExtractor,
+    "m4v":  AudioExtractor,
+    "wmv":  AudioExtractor,
 }
 
 
