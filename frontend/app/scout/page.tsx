@@ -243,7 +243,7 @@ export default function ScoutPage() {
         const fresh = data.filter((t) => !knownIdsRef.current.has(t.topic_id));
         if (fresh.length > 0) {
           const freshIds = new Set(fresh.map((t) => t.topic_id));
-          setNewTopicIds((prev) => new Set([...prev, ...freshIds]));
+          setNewTopicIds((prev) => new Set([...Array.from(prev), ...Array.from(freshIds)]));
           fresh.forEach((t) => knownIdsRef.current.add(t.topic_id));
           setTimeout(() => {
             setNewTopicIds((prev) => {
