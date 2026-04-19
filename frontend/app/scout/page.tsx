@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getScoutTopics,
   getWsBase,
@@ -255,6 +255,13 @@ export default function ScoutPage() {
     try {
       const run = await startScoutRun();
       setScoutId(run.scout_id);
+      // Safety timeout: reset loading if WebSocket never fires (e.g. network error)
+      setTimeout(() => {
+        setLoading((prev) => {
+          if (prev) setError('Skanowanie zajęło zbyt długo — spróbuj ponownie');
+          return false;
+        });
+      }, 5 * 60 * 1000);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Błąd uruchamiania skanu');
       setLoading(false);
@@ -266,14 +273,27 @@ export default function ScoutPage() {
     loadTopics();
   }
 
-  const allTypes = Array.from(
-    new Set(topics.flatMap((t) => t.sources.map((s) => s.source_type)))
-  ).sort();
+  const allTypes = useMemo(
+    () => Array.from(new Set(topics.flatMap((t) => t.sources.map((s) => s.source_type)))).sort(),
+    [topics],
+  );
 
-  const filtered =
-    filter === 'all'
-      ? topics
-      : topics.filter((t) => t.sources.some((s) => s.source_type === filter));
+  const filtered = useMemo(
+    () =>
+      filter === 'all'
+        ? topics
+        : topics.filter((t) => t.sources.some((s) => s.source_type === filter)),
+    [topics, filter],
+  );
+
+  const stats = useMemo(() => {
+    if (!topics.length) return null;
+    return {
+      avgScore: Math.round((topics.reduce((a, t) => a + t.score, 0) / topics.length) * 100),
+      avgUncertainty: Math.round((topics.reduce((a, t) => a + t.llm_uncertainty, 0) / topics.length) * 100),
+      totalSources: topics.reduce((a, t) => a + t.source_count, 0),
+    };
+  }, [topics]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -323,25 +343,13 @@ export default function ScoutPage() {
         )}
 
         {/* Stats row */}
-        {topics.length > 0 && (
+        {stats && (
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             {[
               { icon: FileSearch, label: 'Tematów', value: topics.length },
-              {
-                icon: TrendingUp,
-                label: 'Śr. score',
-                value: `${Math.round((topics.reduce((a, t) => a + t.score, 0) / topics.length) * 100)}%`,
-              },
-              {
-                icon: MessageCircleQuestion,
-                label: 'Śr. luka LLM',
-                value: `${Math.round((topics.reduce((a, t) => a + t.llm_uncertainty, 0) / topics.length) * 100)}%`,
-              },
-              {
-                icon: BookOpen,
-                label: 'Źródeł łącznie',
-                value: topics.reduce((a, t) => a + t.source_count, 0),
-              },
+              { icon: TrendingUp,             label: 'Śr. score',    value: `${stats.avgScore}%` },
+              { icon: MessageCircleQuestion,  label: 'Śr. luka LLM', value: `${stats.avgUncertainty}%` },
+              { icon: BookOpen,               label: 'Źródeł łącznie', value: stats.totalSources },
             ].map(({ icon: Icon, label, value }) => (
               <div
                 key={label}
@@ -384,7 +392,7 @@ export default function ScoutPage() {
               <TopicCard
                 key={topic.topic_id}
                 topic={topic}
-                onIngest={() => {}}
+                onIngest={loadTopics}
               />
             ))}
           </div>

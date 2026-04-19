@@ -116,9 +116,7 @@ def _parse_progress(rec: RunRecord, line: str) -> None:
         rec.ended_at = time.time()
         return
 
-    if _ERROR_RE.search(line) and rec.status == "running":
-        # Don't switch to error on every error log — only fatal ones
-        pass
+    # _ERROR_RE matches are non-fatal — only the subprocess exit code matters
 
 
 # Singleton imported by routers
@@ -143,6 +141,21 @@ class ScoutTopic:
     sources: list[dict]          # serialised ScoutSource dicts
     domains: list[str]
     discovered_at: str           # ISO-8601
+
+    def to_dict(self) -> dict:
+        return {
+            "topic_id": self.topic_id,
+            "title": self.title,
+            "summary": self.summary,
+            "score": self.score,
+            "recency_score": self.recency_score,
+            "llm_uncertainty": self.llm_uncertainty,
+            "source_count": self.source_count,
+            "social_signal": self.social_signal,
+            "sources": self.sources,
+            "domains": self.domains,
+            "discovered_at": self.discovered_at,
+        }
 
 
 @dataclass
@@ -195,6 +208,7 @@ class ScoutManager:
         rec = self._runs.get(scout_id)
         if rec is None:
             return
+        self._evict_old_topics()
         for t in topic_data_list:
             topic = ScoutTopic(
                 topic_id=t.topic_id,
@@ -221,6 +235,21 @@ class ScoutManager:
             rec.topics.append(topic)
             self._topics[topic.topic_id] = topic
         rec.topics_found = len(rec.topics)
+
+    def _evict_old_topics(self, ttl_hours: int = 72) -> None:
+        """Remove topics older than ttl_hours to prevent unbounded memory growth."""
+        import datetime as _dt
+        cutoff = _dt.datetime.now(tz=_dt.timezone.utc)
+        to_remove = []
+        for tid, topic in self._topics.items():
+            try:
+                age_h = (cutoff - _dt.datetime.fromisoformat(topic.discovered_at)).total_seconds() / 3600
+                if age_h > ttl_hours:
+                    to_remove.append(tid)
+            except Exception:
+                pass
+        for tid in to_remove:
+            self._topics.pop(tid, None)
 
     def get_topic(self, topic_id: str) -> Optional[ScoutTopic]:
         return self._topics.get(topic_id)
