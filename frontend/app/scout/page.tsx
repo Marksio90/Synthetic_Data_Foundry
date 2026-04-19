@@ -1,5 +1,15 @@
 'use client';
 
+/**
+ * scout/page.tsx — Strona Gap Scout
+ *
+ * Zakładki:
+ *   Tematy     — siatka odkrytych luk wiedzy + ingestowanie
+ *   Na żywo    — SSE strumień nowych tematów w czasie rzeczywistym
+ *   Modele     — luki wiedzy pogrupowane per model LLM
+ *   Źródła     — panel zdrowia 46+ crawlerów + WebSub
+ */
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
@@ -7,26 +17,40 @@ import {
   getWsBase,
   ingestTopic,
   startScoutRun,
+  submitFeedback,
   type ScoutSource,
   type ScoutTopic,
 } from '@/lib/api';
+import LiveSourceStream from '@/components/LiveSourceStream';
+import ModelGapChart from '@/components/ModelGapChart';
+import SourceHealthDashboard from '@/components/SourceHealthDashboard';
 import {
+  Activity,
   ArrowUpRight,
+  Brain,
   CheckCircle2,
   Loader2,
   Radio,
   RefreshCw,
+  Server,
   Telescope,
+  ThumbsDown,
+  ThumbsUp,
   Zap,
 } from 'lucide-react';
 
-// ─── Source type helpers ──────────────────────────────────────────────────────
+// ─── Pomocnicze ───────────────────────────────────────────────────────────────
 
 const SOURCE_LABELS: Record<string, string> = {
-  arxiv: 'arXiv',
-  openalex: 'OpenAlex',
-  hackernews: 'HN',
-  eurlex: 'EUR-Lex',
+  arxiv: 'arXiv', openalex: 'OpenAlex', hackernews: 'HN', eurlex: 'EUR-Lex',
+  curia: 'Curia', federalregister: 'Fed.Reg', secedgar: 'SEC', esma: 'ESMA',
+  eba: 'EBA', oecd: 'OECD', wto: 'WTO', wipo: 'WIPO', epo: 'EPO',
+  imf: 'IMF', worldbank: 'WorldBank', fred: 'FRED', ecb: 'ECB', bis: 'BIS',
+  eurostat: 'Eurostat', irena: 'IRENA', owid: 'OurWorldInData', hdx: 'HDX',
+  github: 'GitHub', reddit: 'Reddit', stackexchange: 'StackEx',
+  producthunt: 'PH', paperswithcode: 'PwC', mastodon: 'Mastodon',
+  youtube: 'YouTube', podcastindex: 'Podcast', ted: 'TED',
+  archive: 'Archive', jstor: 'JSTOR', europeana: 'Europeana',
 };
 
 const SOURCE_COLOURS: Record<string, string> = {
@@ -34,6 +58,9 @@ const SOURCE_COLOURS: Record<string, string> = {
   openalex: 'bg-teal-500/15 text-teal-300 border-teal-500/30',
   hackernews: 'bg-orange-500/15 text-orange-300 border-orange-500/30',
   eurlex: 'bg-blue-500/15 text-blue-300 border-blue-500/30',
+  github: 'bg-gray-500/15 text-gray-300 border-gray-500/30',
+  reddit: 'bg-red-500/15 text-red-300 border-red-500/30',
+  youtube: 'bg-red-600/15 text-red-400 border-red-600/30',
 };
 
 function SourceBadge({ type }: { type: string }) {
@@ -59,7 +86,59 @@ function ScoreBar({ value, label }: { value: number; label: string }) {
   );
 }
 
-// ─── Topic card ───────────────────────────────────────────────────────────────
+// ─── Panel oceny ─────────────────────────────────────────────────────────────
+
+function FeedbackPanel({ topicId }: { topicId: string }) {
+  const [done, setDone] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [avgRating, setAvgRating] = useState<number | null>(null);
+
+  async function vote(helpful: boolean) {
+    setLoading(true);
+    try {
+      const res = await submitFeedback(topicId, helpful ? 5 : 2, helpful);
+      setAvgRating(res.avg_rating);
+      setDone(true);
+    } catch {
+      /* cicha obsługa błędu */
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <span className="text-[10px] text-text-muted/60 flex items-center gap-1">
+        <CheckCircle2 className="w-3 h-3 text-success" />
+        Dziękujemy! Śr. ocena: {avgRating?.toFixed(1)}
+      </span>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-1">
+      <span className="text-[10px] text-text-muted/60">Ocena:</span>
+      <button
+        onClick={() => vote(true)}
+        disabled={loading}
+        className="p-0.5 rounded hover:text-success transition-colors text-text-muted/40 disabled:opacity-50"
+        title="Przydatny temat"
+      >
+        <ThumbsUp className="w-3.5 h-3.5" />
+      </button>
+      <button
+        onClick={() => vote(false)}
+        disabled={loading}
+        className="p-0.5 rounded hover:text-error transition-colors text-text-muted/40 disabled:opacity-50"
+        title="Nieprzydatny temat"
+      >
+        <ThumbsDown className="w-3.5 h-3.5" />
+      </button>
+    </div>
+  );
+}
+
+// ─── Karta tematu ─────────────────────────────────────────────────────────────
 
 function TopicCard({
   topic,
@@ -76,11 +155,12 @@ function TopicCard({
   const [ingestDone, setIngestDone] = useState(false);
   const [ingestErr, setIngestErr] = useState('');
 
-  const score = Math.round(topic.score * 100);
+  const gapScore = topic.knowledge_gap_score ?? topic.score;
+  const displayScore = Math.round(gapScore * 100);
   const scoreCls =
-    score >= 70
+    displayScore >= 70
       ? 'text-success border-success/40 bg-success/10'
-      : score >= 40
+      : displayScore >= 40
       ? 'text-warning border-warning/40 bg-warning/10'
       : 'text-error border-error/40 bg-error/10';
 
@@ -105,7 +185,7 @@ function TopicCard({
     <div className={`rounded-lg border border-border bg-bg-surface p-4 flex flex-col gap-2.5 ${isNew ? 'topic-appear' : ''}`}>
       <div className="flex items-start gap-3">
         <span className={`shrink-0 w-9 h-9 rounded-md border flex items-center justify-center text-xs font-bold tabular-nums ${scoreCls}`}>
-          {score}
+          {displayScore}
         </span>
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-text leading-snug line-clamp-2">{topic.title}</p>
@@ -117,17 +197,40 @@ function TopicCard({
         <ScoreBar value={topic.recency_score} label="Świeżość" />
         <ScoreBar value={topic.llm_uncertainty} label="Luka LLM" />
         <ScoreBar value={Math.min(1, topic.source_count / 10)} label="Źródła" />
+        {(topic.citation_velocity ?? 0) > 0 && (
+          <ScoreBar value={Math.min(1, (topic.citation_velocity ?? 0) / 5)} label="Dynamika" />
+        )}
       </div>
 
+      {/* Etykiety źródeł */}
       <div className="flex items-center gap-1 flex-wrap">
-        {sourceTypes.map((t) => <SourceBadge key={t} type={t} />)}
+        {sourceTypes.slice(0, 4).map((t) => <SourceBadge key={t} type={t} />)}
+        {sourceTypes.length > 4 && (
+          <span className="text-[10px] text-text-muted">+{sourceTypes.length - 4}</span>
+        )}
         <span className="text-[10px] text-text-muted ml-0.5">{topic.source_count} src</span>
+        {topic.source_tier && (
+          <span className="text-[10px] text-text-muted/50 ml-0.5">Tier {topic.source_tier}</span>
+        )}
       </div>
 
+      {/* Modele docelowe */}
+      {topic.cutoff_model_targets && topic.cutoff_model_targets.length > 0 && (
+        <div className="flex items-center gap-1 flex-wrap">
+          {topic.cutoff_model_targets.slice(0, 3).map((m) => (
+            <span key={m} className="text-[9px] px-1.5 py-0.5 rounded-full border border-accent/25 bg-accent/5 text-accent/70">
+              {m}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Akcje */}
       <div className="flex items-center gap-2 pt-0.5">
         <button onClick={() => setOpen((v) => !v)} className="text-[11px] text-accent hover:underline">
           {open ? 'Zwiń' : 'Źródła'}
         </button>
+        <FeedbackPanel topicId={topic.topic_id} />
         <div className="flex-1" />
         {ingestDone ? (
           <span className="flex items-center gap-1 text-[11px] text-success font-medium">
@@ -178,7 +281,7 @@ function TopicCard({
   );
 }
 
-// ─── Live log panel ───────────────────────────────────────────────────────────
+// ─── Panel postępu skanowania (WebSocket log) ─────────────────────────────────
 
 function LiveLog({ scoutId, onDone }: { scoutId: string; onDone: () => void }) {
   const [lines, setLines] = useState<string[]>([]);
@@ -190,8 +293,8 @@ function LiveLog({ scoutId, onDone }: { scoutId: string; onDone: () => void }) {
   useEffect(() => {
     const ws = new WebSocket(`${getWsBase()}/api/scout/ws/${scoutId}`);
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.line && msg.line !== '__EOF__') setLines((prev) => [...prev, msg.line]);
+      const msg = JSON.parse(e.data as string) as { line?: string; status?: string };
+      if (msg.line && msg.line !== '__EOF__') setLines((prev) => [...prev, msg.line!]);
       if (msg.status) setStatus(msg.status);
       if (msg.line === '__EOF__') { ws.close(); onDoneRef.current(); }
     };
@@ -225,9 +328,23 @@ function LiveLog({ scoutId, onDone }: { scoutId: string; onDone: () => void }) {
   );
 }
 
-// ─── Main page ────────────────────────────────────────────────────────────────
+// ─── Typy zakładek ─────────────────────────────────────────────────────────────
+
+type Tab = 'tematy' | 'live' | 'modele' | 'zrodla';
+
+const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
+  { id: 'tematy',  label: 'Tematy',    icon: Telescope },
+  { id: 'live',    label: 'Na żywo',   icon: Radio },
+  { id: 'modele',  label: 'Modele',    icon: Brain },
+  { id: 'zrodla',  label: 'Źródła',    icon: Server },
+];
+
+// ─── Strona główna ─────────────────────────────────────────────────────────────
 
 export default function ScoutPage() {
+  const [activeTab, setActiveTab] = useState<Tab>('tematy');
+
+  // Stan tematów
   const [topics, setTopics] = useState<ScoutTopic[]>([]);
   const [newTopicIds, setNewTopicIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -257,12 +374,12 @@ export default function ScoutPage() {
         data.forEach((t) => knownIdsRef.current.add(t.topic_id));
       }
       setTopics(data);
-    } catch { /* silent */ }
+    } catch { /* cicha obsługa błędu */ }
   }, []);
 
   useEffect(() => { loadTopics(false); }, [loadTopics]);
 
-  // Poll topics every 2.5s while scan is running
+  // Odpytuj tematy co 2.5s podczas aktywnego skanu
   useEffect(() => {
     if (!loading || !scoutId) return;
     const interval = setInterval(() => loadTopics(true), 2500);
@@ -300,7 +417,7 @@ export default function ScoutPage() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {/* ── Header ── */}
+      {/* ── Nagłówek ── */}
       <div className="flex items-center gap-3 px-5 py-3 border-b border-border bg-bg-surface shrink-0">
         <div className="relative">
           <Telescope className={`w-5 h-5 ${loading ? 'text-accent radar-pulse' : 'text-accent'}`} />
@@ -335,84 +452,150 @@ export default function ScoutPage() {
         </button>
       </div>
 
-      {/* ── Body ── */}
+      {/* ── Pasek zakładek ── */}
+      <div className="flex items-center gap-0.5 px-5 py-0 border-b border-border bg-bg-surface shrink-0">
+        {TABS.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            onClick={() => setActiveTab(id)}
+            className={`
+              flex items-center gap-1.5 px-3 py-2.5 text-[12px] font-medium border-b-2 transition-colors
+              ${activeTab === id
+                ? 'border-accent text-accent'
+                : 'border-transparent text-text-muted hover:text-text'}
+            `}
+          >
+            <Icon className="w-3.5 h-3.5" />
+            {label}
+            {id === 'tematy' && topics.length > 0 && (
+              <span className="text-[10px] tabular-nums text-text-muted/60">({topics.length})</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Treść zakładki ── */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
 
-        {/* Left panel — log (visible while scanning) */}
-        {scoutId && (
-          <div className="w-72 shrink-0 flex flex-col border-r border-border p-3 min-h-0">
-            <p className="text-[10px] font-semibold text-text-muted uppercase tracking-widest mb-2 shrink-0">
-              Postęp skanowania
-            </p>
-            <LiveLog scoutId={scoutId} onDone={handleRunDone} />
+        {/* ── ZAKŁADKA: Tematy ── */}
+        {activeTab === 'tematy' && (
+          <>
+            {/* Lewy panel — postęp skanowania */}
+            {scoutId && (
+              <div className="w-72 shrink-0 flex flex-col border-r border-border p-3 min-h-0">
+                <p className="text-[10px] font-semibold text-text-muted uppercase tracking-widest mb-2 shrink-0">
+                  Postęp skanowania
+                </p>
+                <LiveLog scoutId={scoutId} onDone={handleRunDone} />
+              </div>
+            )}
+
+            {/* Prawy panel — tematy */}
+            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+              {error && (
+                <div className="mx-4 mt-4 rounded-lg bg-error/10 border border-error/30 text-error text-sm px-4 py-3 shrink-0">
+                  {error}
+                </div>
+              )}
+
+              {/* Filtry zakładek */}
+              {allTypes.length > 0 && (
+                <div className="flex gap-1.5 flex-wrap px-4 pt-3 pb-2 shrink-0">
+                  {['all', ...allTypes].map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => setFilter(t)}
+                      className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium border transition-colors
+                        ${filter === t
+                          ? 'bg-accent/15 text-accent border-accent/40'
+                          : 'bg-bg-surface text-text-muted border-border hover:border-accent/30'}`}
+                    >
+                      {t === 'all' ? `Wszystkie (${topics.length})` : SOURCE_LABELS[t] ?? t}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Siatka tematów */}
+              <div className="flex-1 overflow-y-auto px-4 pb-4">
+                {filtered.length > 0 ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 pt-2">
+                    {filtered.map((topic) => (
+                      <TopicCard
+                        key={topic.topic_id}
+                        topic={topic}
+                        isNew={newTopicIds.has(topic.topic_id)}
+                        onIngest={handleIngest}
+                      />
+                    ))}
+                  </div>
+                ) : !loading ? (
+                  <div className="flex flex-col items-center justify-center py-24 text-center gap-4">
+                    <Telescope className="w-14 h-14 text-text-muted/20" />
+                    <div>
+                      <p className="text-text font-medium">Brak wykrytych tematów</p>
+                      <p className="text-sm text-text-muted mt-1">
+                        Kliknij <strong>Uruchom skan</strong> — AI przeskanuje 46 źródeł w 5 warstwach
+                      </p>
+                    </div>
+                    <button
+                      onClick={handleRun}
+                      className="mt-2 flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium
+                        bg-accent text-bg-base hover:bg-accent/90 transition-colors"
+                    >
+                      <Telescope className="w-4 h-4" />
+                      Uruchom pierwszy skan
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-24 gap-3">
+                    <Loader2 className="w-8 h-8 text-accent animate-spin" />
+                    <p className="text-sm text-text-muted">Odkrywanie tematów w czasie rzeczywistym…</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── ZAKŁADKA: Na żywo ── */}
+        {activeTab === 'live' && (
+          <div className="flex-1 flex flex-col min-h-0 p-4 overflow-hidden">
+            <div className="mb-3 shrink-0">
+              <p className="text-[11px] text-text-muted">
+                Tematy odkrywane przez Gap Scout pojawiają się tutaj natychmiast — bez konieczności odświeżania.
+                Strumień SSE odtwarza 20 ostatnich tematów przy połączeniu.
+              </p>
+            </div>
+            <LiveSourceStream className="flex-1 min-h-0" />
           </div>
         )}
 
-        {/* Right panel — topics */}
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          {error && (
-            <div className="mx-4 mt-4 rounded-lg bg-error/10 border border-error/30 text-error text-sm px-4 py-3 shrink-0">
-              {error}
+        {/* ── ZAKŁADKA: Modele ── */}
+        {activeTab === 'modele' && (
+          <div className="flex-1 overflow-y-auto p-4 min-h-0">
+            <div className="mb-3">
+              <p className="text-[11px] text-text-muted">
+                Tematy pogrupowane według docelowych modeli LLM na podstawie dat granicnych danych treningowych.
+                Kliknij kartę modelu, aby zobaczyć szczegóły.
+              </p>
             </div>
-          )}
-
-          {/* Filter tabs */}
-          {allTypes.length > 0 && (
-            <div className="flex gap-1.5 flex-wrap px-4 pt-3 pb-2 shrink-0">
-              {['all', ...allTypes].map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setFilter(t)}
-                  className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium border transition-colors
-                    ${filter === t
-                      ? 'bg-accent/15 text-accent border-accent/40'
-                      : 'bg-bg-surface text-text-muted border-border hover:border-accent/30'}`}
-                >
-                  {t === 'all' ? `Wszystkie (${topics.length})` : SOURCE_LABELS[t] ?? t}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* Topics grid */}
-          <div className="flex-1 overflow-y-auto px-4 pb-4">
-            {filtered.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 pt-2">
-                {filtered.map((topic) => (
-                  <TopicCard
-                    key={topic.topic_id}
-                    topic={topic}
-                    isNew={newTopicIds.has(topic.topic_id)}
-                    onIngest={handleIngest}
-                  />
-                ))}
-              </div>
-            ) : !loading ? (
-              <div className="flex flex-col items-center justify-center py-24 text-center gap-4">
-                <Telescope className="w-14 h-14 text-text-muted/20" />
-                <div>
-                  <p className="text-text font-medium">Brak wykrytych tematów</p>
-                  <p className="text-sm text-text-muted mt-1">
-                    Kliknij <strong>Uruchom skan</strong> — AI przeskanuje arXiv, EUR-Lex, OpenAlex i HackerNews
-                  </p>
-                </div>
-                <button
-                  onClick={handleRun}
-                  className="mt-2 flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium
-                    bg-accent text-bg-base hover:bg-accent/90 transition-colors"
-                >
-                  <Telescope className="w-4 h-4" />
-                  Uruchom pierwszy skan
-                </button>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center py-24 gap-3">
-                <Loader2 className="w-8 h-8 text-accent animate-spin" />
-                <p className="text-sm text-text-muted">Odkrywanie tematów w czasie rzeczywistym…</p>
-              </div>
-            )}
+            <ModelGapChart />
           </div>
-        </div>
+        )}
+
+        {/* ── ZAKŁADKA: Źródła ── */}
+        {activeTab === 'zrodla' && (
+          <div className="flex-1 overflow-y-auto p-4 min-h-0">
+            <div className="mb-3">
+              <p className="text-[11px] text-text-muted">
+                Stan wszystkich crawlerów (warstwy A–E) oraz subskrypcji WebSub Tier 1.
+                Odświeżany automatycznie co 30 sekund.
+              </p>
+            </div>
+            <SourceHealthDashboard />
+          </div>
+        )}
       </div>
     </div>
   );
