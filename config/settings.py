@@ -250,6 +250,29 @@ class Settings(BaseSettings):
         "",
         description="CORE.ac.uk API key (free registration at core.ac.uk/services/api).",
     )
+    # Verification firewall — tunable cutoff dates (ISO-8601 YYYY-MM-DD)
+    scout_cutoff_gpt4o: str = Field(
+        "2024-04-01",
+        description="GPT-4o training data cutoff (used in temporal verification).",
+    )
+    scout_cutoff_claude35: str = Field(
+        "2024-04-01",
+        description="Claude 3.5 Sonnet training data cutoff.",
+    )
+    scout_cutoff_llama3: str = Field(
+        "2024-03-01",
+        description="Llama 3 training data cutoff.",
+    )
+    scout_cutoff_gemini15: str = Field(
+        "2024-02-01",
+        description="Gemini 1.5 training data cutoff.",
+    )
+    scout_verification_max_concurrent: int = Field(
+        8,
+        ge=1,
+        le=50,
+        description="Max concurrent HTTP connections during source verification firewall.",
+    )
 
     # ------------------------------------------------------------------
     # API / UI service

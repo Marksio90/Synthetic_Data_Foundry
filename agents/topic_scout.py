@@ -575,23 +575,15 @@ async def _process_domain(
     # Merge: Layer A first (highest quality), then cross-layer, then social, then legislation
     all_sources: list[ScoutSource] = [*layer_a_srcs, *oa_srcs, *hn_srcs, *el_srcs]
 
-    # Batch-verify sources not yet confirmed (e.g. OpenAlex oa_url can be any domain)
-    unverified = [s for s in all_sources if not s.verified]
-    if unverified:
-        ok_results = await asyncio.gather(
-            *[_verify_url(s.url) for s in unverified], return_exceptions=True
-        )
-        for src, ok in zip(unverified, ok_results):
-            src.verified = ok is True
+    # 5-point Anti-Hallucination & Verification Firewall
+    # Lazy import avoids circular dependency with verifier → topic_scout
+    from agents.crawlers.verifier import verify_batch
+    batch = await verify_batch(all_sources, _HTTP, max_concurrent=8)
+    verified = batch.verified
+    post_cutoff_models = batch.post_cutoff_models
 
-    # Assign trust tier to each verified source
-    for s in all_sources:
-        if s.verified:
-            s.source_tier = _get_source_tier(s.url)
-
-    verified = [s for s in all_sources if s.verified]
     if not verified:
-        await _log(f"  {domain[:40]}: no verified sources — skipped")
+        await _log(f"  {domain[:40]}: no sources passed verification firewall — skipped")
         return None
 
     recency      = _compute_recency(verified)
@@ -614,14 +606,15 @@ async def _process_domain(
     )
 
     # Derive new metadata fields
-    best_tier    = _best_tier([s.source_tier for s in verified])
-    fmt_types    = list({_infer_format(s.url) for s in verified})
-    langs        = list({s.language for s in verified if s.language})
-    est_tokens   = len(verified) * 800  # rough estimate until full extraction (Part 4)
+    best_tier  = _best_tier([s.source_tier for s in verified])
+    fmt_types  = list({_infer_format(s.url) for s in verified})
+    langs      = list({s.language for s in verified if s.language})
+    est_tokens = len(verified) * 800   # rough estimate; full extraction in Step 4
 
     await _log(
         f"  {domain[:40]}: score={score:.2f} tier={best_tier} "
-        f"sources={len(verified)} uncertainty={float(uncertainty):.2f}"
+        f"sources={len(verified)} uncertainty={float(uncertainty):.2f} "
+        f"cutoff_models={len(post_cutoff_models)}"
     )
 
     topic = ScoutTopicData(
@@ -637,7 +630,8 @@ async def _process_domain(
         domains=[domain],
         discovered_at=datetime.now(tz=timezone.utc).isoformat(),
         # new fields
-        knowledge_gap_score=score,  # bootstrapped; replaced by 8-component scorer in Step 5
+        knowledge_gap_score=score,        # bootstrapped; full 8-component score in Step 5
+        cutoff_model_targets=post_cutoff_models,
         format_types=fmt_types,
         languages=langs,
         source_tier=best_tier,
