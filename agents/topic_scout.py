@@ -588,6 +588,13 @@ async def _process_domain(
     verified = batch.verified
     post_cutoff_models = batch.post_cutoff_models
 
+    # 3-Stage Deduplication: URL hash → SimHash → semantic cosine
+    # Eliminates cross-layer near-duplicates (same paper at different URLs/sources)
+    if verified:
+        from agents.crawlers.dedup import DedupPipeline
+        dedup = DedupPipeline(enable_semantic=False)   # semantic dedup in scorer (w3)
+        verified = await dedup.filter(verified)
+
     if not verified:
         await _log(f"  {domain[:40]}: no sources passed verification firewall — skipped")
         return None
