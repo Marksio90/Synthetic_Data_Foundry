@@ -77,14 +77,19 @@ async def lifespan(app: FastAPI):
         )
         _scheduler.start()
         logger.info("APScheduler started — hourly Gap Scout enabled")
-        # Run once immediately so the UI has data on first load
-        asyncio.create_task(_scheduled_scout())
+        # Delay first run so the server finishes startup before the long scout task runs
+        async def _delayed_scout() -> None:
+            await asyncio.sleep(5.0)
+            await _scheduled_scout()
+        asyncio.create_task(_delayed_scout())
 
     yield
 
     # ── Shutdown ──
     if _scheduler is not None and _scheduler.running:
         _scheduler.shutdown(wait=False)
+    from agents.topic_scout import _HTTP as _scout_http
+    await _scout_http.aclose()
 
 
 # ---------------------------------------------------------------------------

@@ -13,11 +13,14 @@ api/routers/scout.py — Gap Scout endpoints.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 
 from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
 
 from api.state import scouts
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -58,8 +61,7 @@ async def run_scout(
             scouts.update(scout_id, status="done", topics_found=len(topics))
             scouts.append_log(scout_id, f"[Scout] ✅ Done — {len(topics)} topics found.")
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).error("Scout run failed: %s", exc)
+            logger.error("Scout run failed: %s", exc)
             scouts.update(scout_id, status="error", error=str(exc))
             scouts.append_log(scout_id, f"[Scout] ❌ Error: {exc}")
 
@@ -140,22 +142,7 @@ async def websocket_scout(websocket: WebSocket, scout_id: str) -> None:
 
 @router.get("/topics")
 def list_topics(limit: int = 50) -> list[dict]:
-    return [
-        {
-            "topic_id": t.topic_id,
-            "title": t.title,
-            "summary": t.summary,
-            "score": t.score,
-            "recency_score": t.recency_score,
-            "llm_uncertainty": t.llm_uncertainty,
-            "source_count": t.source_count,
-            "social_signal": t.social_signal,
-            "sources": t.sources,
-            "domains": t.domains,
-            "discovered_at": t.discovered_at,
-        }
-        for t in scouts.latest_topics(limit=limit)
-    ]
+    return [t.to_dict() for t in scouts.latest_topics(limit=limit)]
 
 
 # ---------------------------------------------------------------------------
@@ -168,19 +155,7 @@ def get_topic(topic_id: str) -> dict:
     topic = scouts.get_topic(topic_id)
     if topic is None:
         raise HTTPException(status_code=404, detail=f"Topic not found: {topic_id}")
-    return {
-        "topic_id": topic.topic_id,
-        "title": topic.title,
-        "summary": topic.summary,
-        "score": topic.score,
-        "recency_score": topic.recency_score,
-        "llm_uncertainty": topic.llm_uncertainty,
-        "source_count": topic.source_count,
-        "social_signal": topic.social_signal,
-        "sources": topic.sources,
-        "domains": topic.domains,
-        "discovered_at": topic.discovered_at,
-    }
+    return topic.to_dict()
 
 
 # ---------------------------------------------------------------------------
