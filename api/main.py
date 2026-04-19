@@ -25,6 +25,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import chatbot, documents, pipeline, samples, scout, training
+from api.routers import websub as websub_router
 from api.monitoring import get_metrics_payload, is_available as metrics_available
 
 logger = logging.getLogger(__name__)
@@ -84,11 +85,33 @@ async def lifespan(app: FastAPI):
             await _scheduled_scout()
         asyncio.create_task(_delayed_scout())
 
+    # ── WebSub — subscribe to real-time feeds ──
+    from config.settings import settings as _s
+    _callback_url = getattr(_s, "scout_webhook_callback_url", "")
+    _ws_secret    = getattr(_s, "scout_webhook_secret", "")
+    if _callback_url:
+        from agents.crawlers.websub import WebSubSubscriber
+        _websub = WebSubSubscriber.instance()
+        asyncio.create_task(
+            _websub.subscribe_all(
+                callback_base_url=_callback_url,
+                secret=_ws_secret,
+                lease_seconds=86400,
+            )
+        )
+        logger.info("WebSub: subscribing to %d known feeds via %s", 15, _callback_url)
+    else:
+        logger.info(
+            "WebSub Tier 1 disabled — set SCOUT_WEBHOOK_CALLBACK_URL to enable"
+        )
+
     yield
 
     # ── Shutdown ──
     if _scheduler is not None and _scheduler.running:
         _scheduler.shutdown(wait=False)
+    from agents.crawlers.websub import WebSubSubscriber as _WS
+    await _WS.instance().aclose()
     from agents.topic_scout import _HTTP as _scout_http
     await _scout_http.aclose()
 
@@ -116,7 +139,8 @@ app.include_router(pipeline.router,  prefix="/api/pipeline",  tags=["pipeline"])
 app.include_router(samples.router,   prefix="/api/samples",   tags=["samples"])
 app.include_router(training.router,  prefix="/api/training",  tags=["training"])
 app.include_router(chatbot.router,   prefix="/api/chatbot",   tags=["chatbot"])
-app.include_router(scout.router,     prefix="/api/scout",     tags=["scout"])
+app.include_router(scout.router,           prefix="/api/scout",  tags=["scout"])
+app.include_router(websub_router.router,   prefix="/api/scout",  tags=["websub"])
 
 
 @app.get("/health")

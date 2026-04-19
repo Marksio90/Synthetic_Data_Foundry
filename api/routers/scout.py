@@ -1,25 +1,37 @@
 """
 api/routers/scout.py — Gap Scout endpoints.
 
-  POST /api/scout/run            Start a discovery run (async background)
-  GET  /api/scout/status/{id}    Run status + topics_found counter
-  GET  /api/scout/log/{id}       Log lines (polling fallback)
-  WS   /api/scout/ws/{id}        WebSocket live log stream
-  GET  /api/scout/topics         All discovered topics sorted by score
-  GET  /api/scout/topic/{id}     Single topic with full source list
-  POST /api/scout/ingest/{id}    Queue topic sources for pipeline ingestion
+  POST /api/scout/run              Start a discovery run (async background)
+  GET  /api/scout/status/{id}      Run status + topics_found counter
+  GET  /api/scout/log/{id}         Log lines (polling fallback)
+  WS   /api/scout/ws/{id}          WebSocket live log stream
+  GET  /api/scout/topics           All discovered topics sorted by score
+  GET  /api/scout/topic/{id}       Single topic with full source list
+  POST /api/scout/ingest/{id}      Queue topic sources for pipeline ingestion
+
+  KROK 11 — new endpoints:
+  GET  /api/scout/sources          Aggregated health of all 46+ crawlers + WebSub subs
+  GET  /api/scout/gaps/models      Topics grouped / ranked by LLM cutoff targets
+  POST /api/scout/run/targeted     Scout run constrained to given domains (required)
+  GET  /api/scout/trending         Topics sorted by citation_velocity desc
+  GET  /api/scout/live             SSE real-time topic/source stream (text/event-stream)
+  POST /api/scout/feedback         Submit quality signal on a discovered topic
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import uuid
 from pathlib import Path
+from typing import List, Optional
 
 import httpx
-from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from api.state import scouts
 from config.settings import settings as _settings
@@ -238,4 +250,280 @@ async def ingest_topic(topic_id: str) -> dict:
             f"Pobrano {len(saved_paths)}/{len(verified)} źródeł do {_DATA_DIR}. "
             f"Pliki gotowe — przejdź do AutoPilota."
         ),
+    }
+
+
+# ===========================================================================
+# KROK 11 — new endpoints
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# GET /sources — aggregated health of all crawlers + WebSub subscriptions
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sources")
+def get_all_sources() -> dict:
+    """
+    Return health status for all 46+ source crawlers across layers A–E
+    plus live WebSub subscription states.
+    """
+    from agents.crawlers import (
+        get_crawler_status,
+        get_crawler_status_b,
+        get_crawler_status_c,
+        get_crawler_status_d,
+        get_crawler_status_e,
+    )
+    from agents.crawlers.websub import WebSubSubscriber
+
+    crawlers = (
+        get_crawler_status()
+        + get_crawler_status_b()
+        + get_crawler_status_c()
+        + get_crawler_status_d()
+        + get_crawler_status_e()
+    )
+
+    # Update Prometheus gauge
+    try:
+        from api.monitoring import scout_sources_active
+        for c in crawlers:
+            is_active = c.get("status") not in ("paused", "error", "circuit_open")
+            scout_sources_active.labels(source=c.get("name", "unknown")).set(1 if is_active else 0)
+    except Exception:
+        pass
+
+    sub = WebSubSubscriber.instance()
+    return {
+        "crawlers": crawlers,
+        "total_crawlers": len(crawlers),
+        "active_crawlers": sum(
+            1 for c in crawlers if c.get("status") not in ("paused", "error", "circuit_open")
+        ),
+        "websub_subscriptions": sub.status(),
+        "websub_stats": sub.stats(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /gaps/models — topics ranked per LLM cutoff model
+# ---------------------------------------------------------------------------
+
+
+@router.get("/gaps/models")
+def gaps_by_model(
+    model: Optional[str] = Query(None, description="Filter to a single model identifier"),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict:
+    """
+    Return discovered topics grouped and ranked by their LLM cutoff targets.
+
+    Each topic that targets specific models (e.g. gpt-4o, llama-3) appears
+    under each of those model keys. Topics with no cutoff target appear under 'all'.
+    """
+    all_topics = scouts.latest_topics(limit=500)
+
+    model_map: dict[str, list] = {}
+    for topic in all_topics:
+        targets: list[str] = topic.cutoff_model_targets or []
+        if not targets:
+            targets = ["all"]
+        for t in targets:
+            model_map.setdefault(t, []).append(topic)
+
+    def _ranked(topics: list) -> list[dict]:
+        return [
+            t.to_dict()
+            for t in sorted(topics, key=lambda x: x.knowledge_gap_score, reverse=True)[:limit]
+        ]
+
+    if model:
+        matching = model_map.get(model, [])
+        return {
+            "model": model,
+            "count": len(matching),
+            "topics": _ranked(matching),
+        }
+
+    return {
+        "models": {m: _ranked(topics) for m, topics in model_map.items()},
+        "model_count": len(model_map),
+        "total_topics": len(all_topics),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /run/targeted — targeted domain scan (domains required)
+# ---------------------------------------------------------------------------
+
+
+class TargetedRunRequest(BaseModel):
+    domains: List[str] = Field(..., min_length=1, description="Domains to scan (required)")
+    max_topics: int = Field(20, ge=1, le=100)
+    min_gap_score: float = Field(0.0, ge=0.0, le=1.0)
+
+
+@router.post("/run/targeted")
+async def run_targeted_scout(body: TargetedRunRequest) -> dict:
+    """
+    Start a Gap Scout run scoped to the given domains.
+    Results are filtered by min_gap_score before persisting.
+    Returns scout_id immediately; poll /status or open /ws for progress.
+    """
+    from agents.topic_scout import run_scout as _run_scout
+
+    if not body.domains:
+        raise HTTPException(status_code=422, detail="At least one domain is required.")
+
+    scout_id = uuid.uuid4().hex
+    scouts.create(scout_id)
+    scouts.append_log(scout_id, f"[Scout] Targeted run {scout_id} — domains: {body.domains}")
+
+    async def _background() -> None:
+        scouts.update(scout_id, status="running")
+        try:
+            async def _cb(msg: str) -> None:
+                scouts.append_log(scout_id, f"[Scout] {msg}")
+
+            async def _topic_cb(topic) -> None:
+                if topic.knowledge_gap_score >= body.min_gap_score:
+                    scouts.add_single_topic(scout_id, topic)
+
+            topics = await _run_scout(
+                domains=body.domains,
+                max_topics=body.max_topics,
+                progress_callback=_cb,
+                topic_callback=_topic_cb,
+            )
+            # add any not yet streamed via callback
+            eligible = [t for t in topics if t.knowledge_gap_score >= body.min_gap_score]
+            scouts.add_topics(scout_id, eligible)
+            final_count = scouts.get(scout_id).topics_found if scouts.get(scout_id) else len(eligible)
+            scouts.update(scout_id, status="done", topics_found=final_count)
+            scouts.append_log(scout_id, f"[Scout] Done — {final_count} topics (gap_score >= {body.min_gap_score})")
+        except Exception as exc:
+            logger.error("Targeted scout run failed: %s", exc)
+            scouts.update(scout_id, status="error", error=str(exc))
+            scouts.append_log(scout_id, f"[Scout] Error: {exc}")
+
+    asyncio.create_task(_background())
+    return {"scout_id": scout_id, "status": "starting", "domains": body.domains}
+
+
+# ---------------------------------------------------------------------------
+# GET /trending — topics sorted by citation_velocity desc
+# ---------------------------------------------------------------------------
+
+
+@router.get("/trending")
+def trending_topics(
+    limit: int = Query(20, ge=1, le=100),
+    min_velocity: float = Query(0.0, ge=0.0, description="Minimum citation_velocity to include"),
+) -> list:
+    """Return topics sorted by citation velocity (papers-per-day proxy) descending."""
+    all_topics = scouts.latest_topics(limit=500)
+    filtered = [t for t in all_topics if t.citation_velocity >= min_velocity]
+    filtered.sort(key=lambda t: t.citation_velocity, reverse=True)
+    return [t.to_dict() for t in filtered[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# GET /live — SSE real-time topic/source stream
+# ---------------------------------------------------------------------------
+
+
+@router.get("/live")
+async def live_stream(request: Request) -> StreamingResponse:
+    """
+    Server-Sent Events stream of Gap Scout discoveries.
+
+    Events:
+      data: {"event": "topic", "data": <ScoutTopic dict>}
+      data: {"event": "heartbeat"}
+
+    Replays the 20 most-recent topics on connect, then streams new ones live.
+    Disconnect by closing the HTTP connection.
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    scouts.register_sse_subscriber(queue)
+
+    # Update SSE subscriber gauge
+    try:
+        from api.monitoring import scout_sse_subscribers
+        scout_sse_subscribers.inc()
+    except Exception:
+        pass
+
+    async def _generator():
+        try:
+            # Replay recent topics for new subscribers
+            for topic in scouts.latest_topics(limit=20):
+                yield f"data: {json.dumps({'event': 'topic', 'data': topic.to_dict()})}\n\n"
+
+            # Stream live events
+            while not await request.is_disconnected():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=25.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "data: {\"event\": \"heartbeat\"}\n\n"
+        finally:
+            scouts.unregister_sse_subscriber(queue)
+            try:
+                from api.monitoring import scout_sse_subscribers
+                scout_sse_subscribers.dec()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /feedback — human quality signal on a topic
+# ---------------------------------------------------------------------------
+
+
+class FeedbackRequest(BaseModel):
+    topic_id: str
+    rating: int = Field(..., ge=1, le=5, description="Quality score 1 (poor) – 5 (excellent)")
+    helpful: bool = Field(True, description="True if topic was useful for training data")
+    comment: str = Field("", max_length=500)
+
+
+@router.post("/feedback")
+async def submit_feedback(body: FeedbackRequest) -> dict:
+    """
+    Record human quality feedback for a discovered topic.
+    Feedback is stored in-memory and exposed via Prometheus scout_feedback_total.
+    """
+    topic = scouts.get_topic(body.topic_id)
+    if topic is None:
+        raise HTTPException(status_code=404, detail=f"Topic not found: {body.topic_id}")
+
+    scouts.add_feedback(
+        topic_id=body.topic_id,
+        rating=body.rating,
+        helpful=body.helpful,
+        comment=body.comment,
+    )
+
+    # Aggregate feedback for this topic
+    feedback_list = scouts.list_feedback(topic_id=body.topic_id)
+    avg_rating = sum(f.rating for f in feedback_list) / len(feedback_list)
+
+    return {
+        "topic_id": body.topic_id,
+        "status": "received",
+        "feedback_count": len(feedback_list),
+        "avg_rating": round(avg_rating, 2),
     }

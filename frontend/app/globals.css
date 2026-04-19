@@ -387,6 +387,23 @@ input[type='checkbox'] {
   animation: topic-appear 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* ── Live stream event entrance (SSE) ─────────────────────────────── */
+
+@keyframes event-appear {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.event-appear {
+  animation: event-appear 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
 /* Radar pulse for Scout scanning indicator */
 @keyframes radar-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }

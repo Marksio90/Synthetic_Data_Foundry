@@ -199,6 +199,120 @@ class Settings(BaseSettings):
     calibration_samples: int = Field(50, ge=10, le=500)
 
     # ------------------------------------------------------------------
+    # Gap Scout — expanded source crawler configuration
+    # ------------------------------------------------------------------
+    scout_sources_enabled: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit allowlist of crawler IDs to activate. "
+            "Empty list = all crawlers enabled. "
+            "Example: [\"arxiv\",\"eurlex\",\"hackernews\",\"openalex\"]"
+        ),
+    )
+    scout_min_gap_score: float = Field(
+        0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum KNOWLEDGE_GAP_SCORE for a topic to be surfaced in results.",
+    )
+    scout_model_targets: List[str] = Field(
+        default_factory=lambda: ["gpt-4o", "claude-3.5-sonnet", "llama-3", "gemini-1.5", "mistral"],
+        description="LLM identifiers used when computing cross-model divergence and cutoff targets.",
+    )
+    scout_languages: List[str] = Field(
+        default_factory=lambda: ["en", "de", "fr", "ja", "zh", "ko", "ar", "ru", "pt", "es"],
+        description="Active language codes for multilingual content scanning (BCP-47).",
+    )
+    scout_webhook_secret: str = Field(
+        "",
+        description="HMAC-SHA256 secret for verifying incoming WebSub/PubSubHubbub callbacks.",
+    )
+    scout_webhook_callback_url: str = Field(
+        "",
+        description=(
+            "Publicly accessible URL for the WebSub callback endpoint, e.g. "
+            "'https://api.example.com/api/scout/webhook'. "
+            "Empty = Tier 1 WebSub disabled (Tier 2 polling still active)."
+        ),
+    )
+    scout_deepl_api_key: str = Field(
+        "",
+        description="DeepL API key for scout-specific translation (overrides deepl_api_key).",
+    )
+    scout_serpapi_key: str = Field(
+        "",
+        description="SerpAPI key used for niche_penetration scoring (Google Search results count).",
+    )
+    scout_max_concurrent_crawlers: int = Field(
+        20,
+        ge=1,
+        le=100,
+        description="Maximum number of source crawlers running concurrently via asyncio.",
+    )
+    # API keys for Layer A crawlers that require authentication
+    ieee_api_key: str = Field(
+        "",
+        description="IEEE Xplore API key (free registration at developer.ieee.org).",
+    )
+    core_api_key: str = Field(
+        "",
+        description="CORE.ac.uk API key (free registration at core.ac.uk/services/api).",
+    )
+    # API keys for Layer D / E crawlers
+    producthunt_api_key: str = Field(
+        "",
+        description="Product Hunt developer token (OAuth 2.0 Bearer, optional).",
+    )
+    youtube_api_key: str = Field(
+        "",
+        description="YouTube Data API v3 key (free, 10 000 units/day).",
+    )
+    podcast_index_api_key: str = Field(
+        "",
+        description="Podcast Index API key (free at podcastindex.org).",
+    )
+    podcast_index_api_secret: str = Field(
+        "",
+        description="Podcast Index API secret (paired with podcast_index_api_key).",
+    )
+    europeana_api_key: str = Field(
+        "",
+        description="Europeana API key (free at pro.europeana.eu; falls back to 'api2demo').",
+    )
+    # Verification firewall — tunable cutoff dates (ISO-8601 YYYY-MM-DD)
+    scout_cutoff_gpt4o: str = Field(
+        "2024-04-01",
+        description="GPT-4o training data cutoff (used in temporal verification).",
+    )
+    scout_cutoff_claude35: str = Field(
+        "2024-04-01",
+        description="Claude 3.5 Sonnet training data cutoff.",
+    )
+    scout_cutoff_llama3: str = Field(
+        "2024-03-01",
+        description="Llama 3 training data cutoff.",
+    )
+    scout_cutoff_gemini15: str = Field(
+        "2024-02-01",
+        description="Gemini 1.5 training data cutoff.",
+    )
+    scout_verification_max_concurrent: int = Field(
+        8,
+        ge=1,
+        le=50,
+        description="Max concurrent HTTP connections during source verification firewall.",
+    )
+    scout_whisper_model: str = Field(
+        "base",
+        description=(
+            "faster-whisper model size for audio/video transcription. "
+            "Options: tiny (~39 MB), base (~74 MB), small (~244 MB), "
+            "medium (~769 MB), large-v3 (~1.5 GB). "
+            "Default 'base' runs on CPU with int8 quantisation."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # API / UI service
     # ------------------------------------------------------------------
     data_dir: str = Field("/app/data")

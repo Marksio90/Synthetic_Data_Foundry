@@ -145,6 +145,10 @@ export interface ScoutSource {
   published_at: string;
   source_type: 'arxiv' | 'openalex' | 'hackernews' | 'eurlex' | string;
   verified: boolean;
+  // new fields (optional for backwards compat)
+  source_tier?: 'S' | 'A' | 'B' | 'C';
+  language?: string;
+  snippet?: string;
 }
 
 export interface ScoutTopic {
@@ -159,6 +163,15 @@ export interface ScoutTopic {
   sources: ScoutSource[];
   domains: string[];
   discovered_at: string;
+  // new fields (optional for backwards compat)
+  knowledge_gap_score?: number;
+  cutoff_model_targets?: string[];
+  format_types?: string[];
+  languages?: string[];
+  citation_velocity?: number;
+  source_tier?: 'S' | 'A' | 'B' | 'C';
+  estimated_tokens?: number;
+  ingest_ready?: boolean;
 }
 
 export interface ScoutRun {
@@ -197,4 +210,103 @@ export async function ingestTopic(topicId: string): Promise<{
 export function getWsBase(): string {
   const base = API_BASE.replace(/^http/, 'ws').replace(/^https/, 'wss');
   return base;
+}
+
+// ─── KROK 11/12 — nowe typy Gap Scout ────────────────────────────────────────
+
+export interface CrawlerStatus {
+  source_id: string;
+  poll_interval: number;
+  is_paused: boolean;
+  consecutive_errors: number;
+  last_seen_id?: string | null;
+}
+
+export interface WebSubSubscription {
+  topic_url: string;
+  source_type: string;
+  tier: string;
+  verified: boolean;
+  expires_in_s: number;
+  delivery_count: number;
+}
+
+export interface WebSubStats {
+  total_subscriptions: number;
+  verified: number;
+  pending_verification: number;
+  feeds: number;
+}
+
+export interface ScoutSourcesResponse {
+  crawlers: CrawlerStatus[];
+  total_crawlers: number;
+  active_crawlers: number;
+  websub_subscriptions: WebSubSubscription[];
+  websub_stats: WebSubStats;
+}
+
+export interface ModelGapsResponse {
+  models: Record<string, ScoutTopic[]>;
+  model_count: number;
+  total_topics: number;
+}
+
+export interface FeedbackResponse {
+  topic_id: string;
+  status: string;
+  feedback_count: number;
+  avg_rating: number;
+}
+
+// ─── KROK 11/12 — nowe funkcje API ───────────────────────────────────────────
+
+export async function getScoutSources(): Promise<ScoutSourcesResponse> {
+  return apiFetch<ScoutSourcesResponse>('/api/scout/sources');
+}
+
+export async function getGapsByModel(
+  model?: string,
+  limit = 10,
+): Promise<ModelGapsResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (model) params.set('model', model);
+  return apiFetch<ModelGapsResponse>(`/api/scout/gaps/models?${params}`);
+}
+
+export async function getTrending(limit = 20, minVelocity = 0): Promise<ScoutTopic[]> {
+  return apiFetch<ScoutTopic[]>(
+    `/api/scout/trending?limit=${limit}&min_velocity=${minVelocity}`,
+  );
+}
+
+export async function startTargetedRun(
+  domains: string[],
+  maxTopics = 20,
+  minGapScore = 0,
+): Promise<ScoutRun> {
+  return apiFetch<ScoutRun>('/api/scout/run/targeted', {
+    method: 'POST',
+    body: JSON.stringify({
+      domains,
+      max_topics: maxTopics,
+      min_gap_score: minGapScore,
+    }),
+  });
+}
+
+export async function submitFeedback(
+  topicId: string,
+  rating: number,
+  helpful: boolean,
+  comment = '',
+): Promise<FeedbackResponse> {
+  return apiFetch<FeedbackResponse>('/api/scout/feedback', {
+    method: 'POST',
+    body: JSON.stringify({ topic_id: topicId, rating, helpful, comment }),
+  });
+}
+
+export function getSseUrl(): string {
+  return `${API_BASE}/api/scout/live`;
 }

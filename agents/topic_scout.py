@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
@@ -54,6 +54,34 @@ except ImportError:
 # Trusted-domain whitelist  (anti-hallucination firewall)
 # ---------------------------------------------------------------------------
 
+# Domain trust tiers for verification firewall (Part 5, Step 4)
+_TIER_S_DOMAINS = frozenset({
+    "arxiv.org", "export.arxiv.org",
+    "eur-lex.europa.eu", "ec.europa.eu", "publications.europa.eu",
+    "pubmed.ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov",
+    "sec.gov", "wipo.int", "who.int", "imf.org",
+    "federalregister.gov", "biorxiv.org", "medrxiv.org",
+    "semanticscholar.org", "api.semanticscholar.org",
+})
+
+_TIER_A_DOMAINS = frozenset({
+    "openalex.org", "api.openalex.org",
+    "europepmc.org", "core.ac.uk",
+    "ieee.org", "ieeexplore.ieee.org",
+    "ssrn.com", "philpapers.org",
+    "worldbank.org", "data.worldbank.org",
+    "oecd.org", "oecd-ilibrary.org",
+})
+
+_TIER_B_DOMAINS = frozenset({
+    "reuters.com", "ft.com", "bloomberg.com",
+    "nature.com", "science.org",
+    "bbc.com", "bbc.co.uk",
+    "news.ycombinator.com", "hn.algolia.com",
+    "github.com",
+    "paperswithcode.com",
+})
+
 _TRUSTED_DOMAINS = frozenset({
     "eur-lex.europa.eu",
     "ec.europa.eu",
@@ -76,6 +104,39 @@ _TRUSTED_DOMAINS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Domain tier resolver (used in verification firewall)
+# ---------------------------------------------------------------------------
+
+
+def _get_source_tier(url: str) -> str:
+    """Return S/A/B/C trust tier for a URL based on its domain."""
+    try:
+        host = urlparse(url).netloc.lstrip("www.")
+    except Exception:
+        return "C"
+    if any(host == d or host.endswith("." + d) for d in _TIER_S_DOMAINS):
+        return "S"
+    if any(host == d or host.endswith("." + d) for d in _TIER_A_DOMAINS):
+        return "A"
+    # .edu / .gov / .ac.uk automatically get tier A
+    if host.endswith(".edu") or host.endswith(".gov") or host.endswith(".ac.uk"):
+        return "A"
+    if any(host == d or host.endswith("." + d) for d in _TIER_B_DOMAINS):
+        return "B"
+    return "C"
+
+
+_TIER_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3}
+
+
+def _best_tier(tiers: list[str]) -> str:
+    """Return the highest-quality tier from a list ('S' beats 'A' beats 'B' beats 'C')."""
+    if not tiers:
+        return "C"
+    return min(tiers, key=lambda t: _TIER_ORDER.get(t, 3))
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -85,8 +146,12 @@ class ScoutSource:
     url: str
     title: str
     published_at: str        # ISO-8601 from source metadata, "" if unknown
-    source_type: str         # eurlex | arxiv | openalex | hackernews
+    source_type: str         # eurlex | arxiv | openalex | hackernews | ...
     verified: bool = False
+    # --- new fields (backwards-compatible, all have defaults) ---
+    source_tier: str = "C"   # S | A | B | C  (domain trust level)
+    language: str = ""       # BCP-47 code detected from content, "" = unknown
+    snippet: str = ""        # up to 500-char content preview (no full text stored)
 
 
 @dataclass
@@ -102,6 +167,15 @@ class ScoutTopicData:
     sources: list[ScoutSource]
     domains: list[str]
     discovered_at: str       # ISO-8601
+    # --- new fields (backwards-compatible, all have defaults) ---
+    knowledge_gap_score: float = 0.0          # 8-component unified score (Part 2)
+    cutoff_model_targets: list[str] = field(default_factory=list)  # ["gpt-4o", "claude-3.5", ...]
+    format_types: list[str] = field(default_factory=list)          # ["pdf", "html", "video", ...]
+    languages: list[str] = field(default_factory=list)             # detected languages in sources
+    citation_velocity: float = 0.0            # Semantic Scholar weekly/quarterly ratio
+    source_tier: str = "C"                    # best tier across all verified sources
+    estimated_tokens: int = 0                 # rough token budget for ingest
+    ingest_ready: bool = False                # True when ≥1 verified source present
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +506,34 @@ TopicCallback = Callable[["ScoutTopicData"], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
+# Format inference from URL/content-type (extended in Part 4)
+# ---------------------------------------------------------------------------
+
+_FORMAT_PATTERNS: list[tuple[str, str]] = [
+    (".pdf", "pdf"),
+    (".docx", "docx"),
+    (".xlsx", "xlsx"),
+    (".pptx", "pptx"),
+    ("/pdf/", "pdf"),
+    ("youtube.com/watch", "video"),
+    ("youtu.be/", "video"),
+    (".mp3", "audio"),
+    (".mp4", "video"),
+    (".srt", "srt"),
+    (".csv", "csv"),
+    (".json", "json"),
+]
+
+
+def _infer_format(url: str) -> str:
+    url_lower = url.lower()
+    for pattern, fmt in _FORMAT_PATTERNS:
+        if pattern in url_lower:
+            return fmt
+    return "html"
+
+
+# ---------------------------------------------------------------------------
 # Per-domain processing (runs in parallel)
 # ---------------------------------------------------------------------------
 
@@ -452,42 +554,89 @@ async def _process_domain(
 
     await _log(f"Scanning: {domain[:60]}")
 
+    # Lazy imports avoid circular dependency (layers import ScoutSource from this module)
+    from agents.crawlers.layer_a import run_layer_a
+    from agents.crawlers.layer_b import run_layer_b
+    from agents.crawlers.layer_c import run_layer_c
+    from agents.crawlers.layer_d import run_layer_d
+    from agents.crawlers.layer_e import run_layer_e
+
     gathered = await asyncio.gather(
-        _fetch_arxiv(domain),
-        _fetch_openalex(domain),
-        _fetch_hackernews(domain),
-        _fetch_eurlex(domain),
+        run_layer_a(domain),           # Layer A: 14 science/research crawlers
+        run_layer_b(domain),           # Layer B: 10 legislation/regulatory crawlers
+        run_layer_c(domain),           # Layer C: 10 finance/economic data crawlers
+        run_layer_d(domain),           # Layer D:  6 tech/social signal crawlers
+        run_layer_e(domain),           # Layer E:  6 multimedia/archive crawlers
+        _fetch_openalex(domain),       # cross-layer aggregator (kept for coverage)
         _probe_llm_uncertainty(domain),
         return_exceptions=True,
     )
 
-    arxiv_srcs  = gathered[0] if not isinstance(gathered[0], Exception) else []
-    oa_srcs     = gathered[1] if not isinstance(gathered[1], Exception) else []
-    hn_srcs     = gathered[2] if not isinstance(gathered[2], Exception) else []
-    el_srcs     = gathered[3] if not isinstance(gathered[3], Exception) else []
-    uncertainty = gathered[4] if not isinstance(gathered[4], Exception) else 0.5
+    layer_a_srcs = gathered[0] if not isinstance(gathered[0], Exception) else []
+    layer_b_srcs = gathered[1] if not isinstance(gathered[1], Exception) else []
+    layer_c_srcs = gathered[2] if not isinstance(gathered[2], Exception) else []
+    layer_d_srcs = gathered[3] if not isinstance(gathered[3], Exception) else []
+    layer_e_srcs = gathered[4] if not isinstance(gathered[4], Exception) else []
+    oa_srcs      = gathered[5] if not isinstance(gathered[5], Exception) else []
+    uncertainty  = gathered[6] if not isinstance(gathered[6], Exception) else 0.5
 
-    all_sources: list[ScoutSource] = [*arxiv_srcs, *oa_srcs, *hn_srcs, *el_srcs]
+    # Merge: A (science) → B (legislation) → C (finance) → D (social) → E (multimedia) → OA
+    all_sources: list[ScoutSource] = [
+        *layer_a_srcs, *layer_b_srcs, *layer_c_srcs,
+        *layer_d_srcs, *layer_e_srcs, *oa_srcs,
+    ]
 
-    # Batch-verify sources not yet confirmed (e.g. OpenAlex oa_url can be any domain)
-    unverified = [s for s in all_sources if not s.verified]
-    if unverified:
-        ok_results = await asyncio.gather(
-            *[_verify_url(s.url) for s in unverified], return_exceptions=True
-        )
-        for src, ok in zip(unverified, ok_results):
-            src.verified = ok is True
+    # 5-point Anti-Hallucination & Verification Firewall
+    # Lazy import avoids circular dependency with verifier → topic_scout
+    from agents.crawlers.verifier import verify_batch
+    batch = await verify_batch(all_sources, _HTTP, max_concurrent=8)
+    verified = batch.verified
+    post_cutoff_models = batch.post_cutoff_models
 
-    verified = [s for s in all_sources if s.verified]
+    # 3-Stage Deduplication: URL hash → SimHash → semantic cosine
+    # Eliminates cross-layer near-duplicates (same paper at different URLs/sources)
+    if verified:
+        from agents.crawlers.dedup import DedupPipeline
+        dedup = DedupPipeline(enable_semantic=False)   # semantic dedup in scorer (w3)
+        verified = await dedup.filter(verified)
+
     if not verified:
-        await _log(f"  {domain[:40]}: no verified sources — skipped")
+        await _log(f"  {domain[:40]}: no sources passed verification firewall — skipped")
         return None
 
     recency      = _compute_recency(verified)
     density      = min(1.0, len(verified) / 10.0)
-    social_count = sum(1 for s in verified if s.source_type == "hackernews")
+    _SOCIAL_TYPES = frozenset({"hackernews", "reddit", "mastodon", "producthunt"})
+    social_count = sum(1 for s in verified if s.source_type in _SOCIAL_TYPES)
     social       = min(1.0, social_count / 5.0)
 
+    best = max(
+        (s for s in verified if s.published_at),
+        key=lambda s: s.published_at,
+        default=verified[0],
+    )
+
+    # Derive metadata fields
+    best_tier  = _best_tier([s.source_tier for s in verified])
+    fmt_types  = list({_infer_format(s.url) for s in verified})
+    langs      = list({s.language for s in verified if s.language})
+    est_tokens = len(verified) * 800
+
+    # 8-component KNOWLEDGE_GAP_SCORE (lazy import avoids circular dependency)
+    from agents.crawlers.scorer import ScorerContext, score_topic
+    ctx = ScorerContext(
+        domain=domain,
+        sources=verified,
+        cutoff_model_targets=post_cutoff_models,
+        languages=langs,
+        format_types=fmt_types,
+        recency_score=recency,
+        base_uncertainty=float(uncertainty),
+        http_client=_HTTP,
+    )
+    scoring = await score_topic(ctx)
+
+    # Legacy 4-component score kept for backwards compat (used in sort + old API consumers)
     score = round(
         0.40 * recency
         + 0.30 * float(uncertainty)
@@ -496,15 +645,10 @@ async def _process_domain(
         3,
     )
 
-    best = max(
-        (s for s in verified if s.published_at),
-        key=lambda s: s.published_at,
-        default=verified[0],
-    )
-
     await _log(
-        f"  {domain[:40]}: score={score:.2f} "
-        f"sources={len(verified)} uncertainty={float(uncertainty):.2f}"
+        f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
+        f"tier={best_tier} sources={len(verified)} "
+        f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)}"
     )
 
     topic = ScoutTopicData(
@@ -513,12 +657,21 @@ async def _process_domain(
         summary=best.title[:250],
         score=score,
         recency_score=recency,
-        llm_uncertainty=float(uncertainty),
+        llm_uncertainty=scoring.llm_uncertainty,
         source_count=len(verified),
         social_signal=round(social, 3),
         sources=verified[:10],
         domains=[domain],
         discovered_at=datetime.now(tz=timezone.utc).isoformat(),
+        # new fields
+        knowledge_gap_score=scoring.knowledge_gap_score,
+        cutoff_model_targets=post_cutoff_models,
+        format_types=fmt_types,
+        languages=langs,
+        citation_velocity=scoring.citation_velocity,
+        source_tier=best_tier,
+        estimated_tokens=est_tokens,
+        ingest_ready=True,
     )
 
     if topic_callback:

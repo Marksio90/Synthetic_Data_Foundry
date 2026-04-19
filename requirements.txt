@@ -38,8 +38,9 @@ python-docx>=1.1.0          # DOCX/DOC → Markdown (lokalny, darmowy)
 beautifulsoup4>=4.12.0      # HTML/XML → Markdown (lokalny, darmowy)
 lxml>=5.2.0                 # szybki parser HTML/XML dla BeautifulSoup
 
-# ── Audio transcription ───────────────────────────────────────────────────
-replicate>=0.30.0           # Replicate Whisper large-v3 ($0.0002/min audio)
+# ── Audio / video transcription (KROK 8) ─────────────────────────────────
+faster-whisper>=1.0.0       # Local Whisper (CTranslate2, CPU int8, zero cost)
+replicate>=0.30.0           # Replicate Whisper large-v3 fallback ($0.0002/min)
 
 # ── HuggingFace Hub — auto-upload dataset i modelu ────────────────────────
 huggingface_hub>=0.23.0     # upload datasetu i modelu do HF Hub
@@ -68,3 +69,9 @@ requests>=2.32.0,<3.0
 # ── Gap Scout ─────────────────────────────────────────────────────────────────
 apscheduler>=3.10.0,<4.0    # Hourly background scout scheduling
 feedparser>=6.0.0            # RSS/Atom parsing for EUR-Lex + arXiv crawlers
+trafilatura>=1.6.0           # Article extraction from HTML (boilerplate removal)
+pdfminer.six>=20221105       # PDF text extraction (primary; pymupdf is fallback)
+openpyxl>=3.1.0              # XLSX extraction → JSON schema for scout ingestion
+python-pptx>=0.6.23          # PPTX extraction → slide text + speaker notes
+langdetect>=1.0.9            # Language detection ensemble (Step 4 multilingual)
+simhash>=2.1.2               # SimHash fingerprinting for content deduplication
