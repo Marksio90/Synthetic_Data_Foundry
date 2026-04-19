@@ -428,6 +428,7 @@ def _topic_id(key: str) -> str:
 
 
 ProgressCallback = Callable[[str], Awaitable[None]]
+TopicCallback = Callable[["ScoutTopicData"], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +439,7 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 async def _process_domain(
     domain: str,
     progress_callback: Optional[ProgressCallback] = None,
+    topic_callback: Optional[TopicCallback] = None,
 ) -> Optional[ScoutTopicData]:
     """Crawl all sources for one domain, verify URLs, score, and return a topic."""
     async def _log(msg: str) -> None:
@@ -505,7 +507,7 @@ async def _process_domain(
         f"sources={len(verified)} uncertainty={float(uncertainty):.2f}"
     )
 
-    return ScoutTopicData(
+    topic = ScoutTopicData(
         topic_id=_topic_id(domain),
         title=domain,
         summary=best.title[:250],
@@ -519,6 +521,14 @@ async def _process_domain(
         discovered_at=datetime.now(tz=timezone.utc).isoformat(),
     )
 
+    if topic_callback:
+        try:
+            await topic_callback(topic)
+        except Exception:
+            pass
+
+    return topic
+
 
 # ---------------------------------------------------------------------------
 # Main public function
@@ -529,6 +539,7 @@ async def run_scout(
     domains: Optional[list[str]] = None,
     max_topics: int = 50,
     progress_callback: Optional[ProgressCallback] = None,
+    topic_callback: Optional[TopicCallback] = None,
 ) -> list[ScoutTopicData]:
     """
     Discover knowledge-gap topics using all available methods.
@@ -552,7 +563,7 @@ async def run_scout(
 
     # Process all domains concurrently (each internally already fans out crawlers in parallel)
     domain_results = await asyncio.gather(
-        *[_process_domain(domain, progress_callback) for domain in domains],
+        *[_process_domain(domain, progress_callback, topic_callback) for domain in domains],
         return_exceptions=True,
     )
 

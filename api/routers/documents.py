@@ -96,12 +96,19 @@ async def upload_documents(
     return {"uploaded": [d.model_dump() for d in uploaded], "count": len(uploaded)}
 
 
+_SUPPORTED_EXTS = {".pdf", ".docx", ".doc", ".html", ".txt", ".md", ".mp3", ".wav", ".m4a", ".mp4"}
+
+
 @router.get("", response_model=DocumentListResponse)
 def list_documents(session: Session = Depends(get_session)) -> DocumentListResponse:
-    """List all PDFs in the data/ directory with chunk/sample counts from DB."""
+    """List all supported files in the data/ directory with chunk/sample counts from DB."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    pdf_files = sorted(DATA_DIR.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
-    docs = [_doc_info(p.name, session) for p in pdf_files]
+    files = sorted(
+        [p for p in DATA_DIR.iterdir() if p.is_file() and p.suffix.lower() in _SUPPORTED_EXTS],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    docs = [_doc_info(p.name, session) for p in files]
     return DocumentListResponse(documents=docs, total=len(docs))
 
 

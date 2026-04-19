@@ -22,6 +22,9 @@ import httpx
 from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
 
 from api.state import scouts
+from config.settings import settings as _settings
+
+_DATA_DIR = Path(_settings.data_dir)
 
 logger = logging.getLogger(__name__)
 
@@ -55,14 +58,23 @@ async def run_scout(
             async def _cb(msg: str) -> None:
                 scouts.append_log(scout_id, f"[Scout] {msg}")
 
+            async def _topic_cb(topic) -> None:
+                scouts.add_single_topic(scout_id, topic)
+                rec = scouts.get(scout_id)
+                n = rec.topics_found if rec else "?"
+                scouts.append_log(scout_id, f"[Scout] 🎯 Topic #{n}: {topic.title[:60]} (score={topic.score:.2f})")
+
             topics = await _run_scout(
                 domains=domains,
                 max_topics=50,
                 progress_callback=_cb,
+                topic_callback=_topic_cb,
             )
+            # add_topics is idempotent — catches any not already added via callback
             scouts.add_topics(scout_id, topics)
-            scouts.update(scout_id, status="done", topics_found=len(topics))
-            scouts.append_log(scout_id, f"[Scout] ✅ Done — {len(topics)} topics found.")
+            final_count = scouts.get(scout_id).topics_found if scouts.get(scout_id) else len(topics)
+            scouts.update(scout_id, status="done", topics_found=final_count)
+            scouts.append_log(scout_id, f"[Scout] ✅ Done — {final_count} topics found.")
         except Exception as exc:
             logger.error("Scout run failed: %s", exc)
             scouts.update(scout_id, status="error", error=str(exc))
@@ -184,11 +196,11 @@ async def ingest_topic(topic_id: str) -> dict:
     if not verified:
         raise HTTPException(status_code=422, detail="No verified sources to ingest.")
 
-    output_dir = Path("data") / "scout_ingested" / topic_id[:8]
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     saved_paths: list[str] = []
     errors: list[str] = []
+    prefix = f"scout_{topic_id[:8]}_"
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=_INGEST_HEADERS) as client:
         for src in verified[:8]:  # cap at 8 downloads per ingest call
@@ -208,21 +220,22 @@ async def ingest_topic(topic_id: str) -> dict:
 
             ct = resp.headers.get("content-type", "")
             ext = ".pdf" if "pdf" in ct else ".html"
-            safe = re.sub(r"[^\w\-]", "_", (src.get("title") or url)[:60]).strip("_") or "source"
-            path = output_dir / f"{safe}{ext}"
+            safe_title = re.sub(r"[^\w\-]", "_", (src.get("title") or url)[:50]).strip("_") or "source"
+            filename = f"{prefix}{safe_title}{ext}"
+            path = _DATA_DIR / filename
             path.write_bytes(resp.content)
-            saved_paths.append(str(path))
-            logger.info("Ingest: saved %s (%d B)", path.name, len(resp.content))
+            saved_paths.append(filename)
+            logger.info("Ingest: saved %s (%d B)", filename, len(resp.content))
 
     return {
         "topic_id": topic_id,
         "title": topic.title,
         "sources_downloaded": len(saved_paths),
         "errors": len(errors),
-        "output_dir": str(output_dir),
+        "output_dir": str(_DATA_DIR),
         "paths": saved_paths[:5],
         "message": (
-            f"Pobrano {len(saved_paths)}/{len(verified)} źródeł → {output_dir}. "
-            f"Uruchom pipeline: python main.py --data-dir {output_dir}"
+            f"Pobrano {len(saved_paths)}/{len(verified)} źródeł do {_DATA_DIR}. "
+            f"Pliki gotowe — przejdź do AutoPilota."
         ),
     }

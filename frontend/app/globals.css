@@ -369,3 +369,30 @@ input[type='checkbox'] {
   animation: progress-indeterminate 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
   border-radius: inherit;
 }
+
+/* ── Scout topic card entrance ─────────────────────────────────────── */
+
+@keyframes topic-appear {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.topic-appear {
+  animation: topic-appear 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Radar pulse for Scout scanning indicator */
+@keyframes radar-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(1.15); }
+}
+
+.radar-pulse {
+  animation: radar-pulse 1.2s ease-in-out infinite;
+}

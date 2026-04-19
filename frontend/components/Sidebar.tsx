@@ -16,12 +16,12 @@ import {
 } from 'lucide-react';
 
 const NAV_ITEMS = [
+  { href: '/scout', icon: Telescope, label: 'Gap Scout' },
   { href: '/autopilot', icon: Zap, label: 'AutoPilot' },
   { href: '/dataset', icon: Database, label: 'Dataset' },
   { href: '/review', icon: ClipboardCheck, label: 'Review' },
   { href: '/trening', icon: Cpu, label: 'Trening' },
   { href: '/chatbot', icon: MessageSquare, label: 'Chatbot' },
-  { href: '/scout', icon: Telescope, label: 'Gap Scout' },
 ];
 
 // Use absolute URL so the browser calls the API directly (avoids build-time proxy baking)
