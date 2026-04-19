@@ -4,7 +4,6 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
-  FileText,
   Zap,
   Database,
   ClipboardCheck,
@@ -17,7 +16,6 @@ import {
 } from 'lucide-react';
 
 const NAV_ITEMS = [
-  { href: '/dokumenty', icon: FileText, label: 'Dokumenty' },
   { href: '/autopilot', icon: Zap, label: 'AutoPilot' },
   { href: '/dataset', icon: Database, label: 'Dataset' },
   { href: '/review', icon: ClipboardCheck, label: 'Review' },

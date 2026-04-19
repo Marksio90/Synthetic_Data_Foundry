@@ -1,8 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Zap, ChevronDown, ChevronUp, Square, RotateCcw } from 'lucide-react';
-import type { Document, AnalysisResult, PipelineRun } from '@/lib/api';
+import { Loader2, RotateCcw, Square, UploadCloud, Zap } from 'lucide-react';
+import type { Document, PipelineRun } from '@/lib/api';
 import LiveLog from '@/components/LiveLog';
 import StatusBadge from '@/components/StatusBadge';
 import ProgressBar from '@/components/ProgressBar';
@@ -18,12 +18,11 @@ function ErrorBanner({ message, onClose }: { message: string; onClose: () => voi
   );
 }
 
-function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
+function MetricCard({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="metric-card">
       <div className="metric-value">{value}</div>
       <div className="metric-label">{label}</div>
-      {sub && <div className="text-xs text-text-muted mt-1">{sub}</div>}
     </div>
   );
 }
@@ -33,20 +32,10 @@ export default function AutopilotPage() {
   const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
   const [loadingDocs, setLoadingDocs] = useState(true);
 
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
-  const [analysisError, setAnalysisError] = useState('');
-  const [showReasoning, setShowReasoning] = useState(false);
-
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [overrideQuality, setOverrideQuality] = useState(false);
-  const [qualityThreshold, setQualityThreshold] = useState(0.75);
-  const [overrideTurns, setOverrideTurns] = useState(false);
-  const [maxTurns, setMaxTurns] = useState(3);
-  const [overrideAdversarial, setOverrideAdversarial] = useState(false);
-  const [adversarialRatio, setAdversarialRatio] = useState(0.1);
-  const [chunkLimit, setChunkLimit] = useState(0);
-  const [batchId, setBatchId] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [running, setRunning] = useState(false);
   const [run, setRun] = useState<PipelineRun | null>(null);
@@ -55,6 +44,8 @@ export default function AutopilotPage() {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // ── Documents ──────────────────────────────────────────────────────────────
+
   const loadDocs = useCallback(async () => {
     setLoadingDocs(true);
     try {
@@ -62,6 +53,8 @@ export default function AutopilotPage() {
       const data = await res.json();
       const list: Document[] = data.documents ?? data ?? [];
       setDocs(list);
+      // Auto-select all on load (including freshly Scout-ingested files)
+      setSelectedDocs(new Set(list.map((d) => d.filename)));
     } catch {
       // ignore
     } finally {
@@ -71,49 +64,55 @@ export default function AutopilotPage() {
 
   useEffect(() => { loadDocs(); }, [loadDocs]);
 
-  const toggleDoc = (filename: string) => {
-    setSelectedDocs(prev => {
+  const toggleDoc = (filename: string) =>
+    setSelectedDocs((prev) => {
       const next = new Set(prev);
-      if (next.has(filename)) next.delete(filename);
-      else next.add(filename);
+      if (next.has(filename)) next.delete(filename); else next.add(filename);
       return next;
     });
-  };
 
-  const toggleAll = () => {
-    if (selectedDocs.size === docs.length) {
-      setSelectedDocs(new Set());
-    } else {
-      setSelectedDocs(new Set(docs.map(d => d.filename)));
-    }
-  };
+  const toggleAll = () =>
+    setSelectedDocs(selectedDocs.size === docs.length ? new Set() : new Set(docs.map((d) => d.filename)));
 
-  const handleAnalyze = async () => {
-    if (selectedDocs.size === 0) { setAnalysisError('Wybierz co najmniej jeden dokument.'); return; }
-    setAnalyzing(true);
-    setAnalysisError('');
-    setAnalysis(null);
+  // ── Upload ─────────────────────────────────────────────────────────────────
+
+  const uploadFiles = async (files: FileList | File[]) => {
+    const arr = Array.from(files);
+    if (!arr.length) return;
+    setUploading(true);
+    setUploadError('');
     try {
-      const res = await fetch(`${API}/api/pipeline/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filenames: Array.from(selectedDocs) }),
-      });
-      if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`);
-      const data: AnalysisResult = await res.json();
-      setAnalysis(data);
-      // Pre-fill advanced settings from calibration
-      setQualityThreshold(data.calibration.quality_threshold);
-      setMaxTurns(data.calibration.max_turns);
-      setAdversarialRatio(data.calibration.adversarial_ratio);
+      for (const file of arr) {
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await fetch(`${API}/api/documents/upload`, { method: 'POST', body: fd });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail ?? `HTTP ${res.status}`);
+        }
+      }
+      await loadDocs();
     } catch (e: unknown) {
-      setAnalysisError(e instanceof Error ? e.message : 'Błąd analizy');
+      setUploadError(e instanceof Error ? e.message : 'Błąd uploadu');
     } finally {
-      setAnalyzing(false);
+      setUploading(false);
     }
   };
 
-  const startPollRun = (runId: string) => {
+  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) uploadFiles(e.target.files);
+    e.target.value = '';
+  };
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (e.dataTransfer.files) uploadFiles(e.dataTransfer.files);
+  };
+
+  // ── Pipeline ───────────────────────────────────────────────────────────────
+
+  const startPoll = (runId: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
@@ -134,29 +133,21 @@ export default function AutopilotPage() {
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   const handleRun = async () => {
-    if (selectedDocs.size === 0) { setRunError('Wybierz dokumenty do przetworzenia.'); return; }
+    if (!selectedDocs.size) { setRunError('Wybierz co najmniej jeden dokument.'); return; }
     setRunError('');
     setRunning(true);
     setRun(null);
     try {
-      const payload: Record<string, unknown> = {
-        filenames: Array.from(selectedDocs),
-        chunk_limit: chunkLimit > 0 ? chunkLimit : 0,
-      };
-      if (batchId.trim()) payload.batch_id = batchId.trim();
-      if (overrideQuality) payload.quality_threshold = qualityThreshold;
-      if (overrideTurns) payload.max_turns = maxTurns;
-      if (overrideAdversarial) payload.adversarial_ratio = adversarialRatio;
-
       const res = await fetch(`${API}/api/pipeline/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        // AI calibrator handles quality_threshold, max_turns, adversarial_ratio automatically
+        body: JSON.stringify({ filenames: Array.from(selectedDocs) }),
       });
       if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`);
       const data: PipelineRun = await res.json();
       setRun(data);
-      startPollRun(data.run_id);
+      startPoll(data.run_id);
     } catch (e: unknown) {
       setRunError(e instanceof Error ? e.message : 'Błąd uruchamiania pipeline');
       setRunning(false);
@@ -171,9 +162,7 @@ export default function AutopilotPage() {
       if (pollRef.current) clearInterval(pollRef.current);
       setRunning(false);
       setRun(null);
-    } catch { /* ignore */ } finally {
-      setCancelling(false);
-    }
+    } catch { /* ignore */ } finally { setCancelling(false); }
   };
 
   const handleNewRun = () => {
@@ -183,11 +172,7 @@ export default function AutopilotPage() {
     setRunError('');
   };
 
-  const domainColor = analysis
-    ? analysis.domain_confidence >= 0.7 ? 'badge-success'
-    : analysis.domain_confidence >= 0.4 ? 'badge-warning'
-    : 'badge-error'
-    : '';
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-8 w-full">
@@ -196,30 +181,59 @@ export default function AutopilotPage() {
         <h1 className="text-2xl font-bold text-text">AutoPilot</h1>
       </div>
 
-      {analysisError && <ErrorBanner message={analysisError} onClose={() => setAnalysisError('')} />}
-      {runError && <ErrorBanner message={runError} onClose={() => setRunError('')} />}
+      {uploadError && <ErrorBanner message={uploadError} onClose={() => setUploadError('')} />}
+      {runError    && <ErrorBanner message={runError}    onClose={() => setRunError('')} />}
 
       {/* ─── Section 1: Dokumenty ─── */}
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="section-title">
             <span className="w-6 h-6 rounded-full bg-accent text-bg-base text-xs flex items-center justify-center font-bold">1</span>
-            Wybierz dokumenty
+            Dokumenty do przetworzenia
           </h2>
-          <span className="text-sm text-text-muted">
-            {selectedDocs.size}/{docs.length} zaznaczonych
-          </span>
+          <span className="text-sm text-text-muted">{selectedDocs.size}/{docs.length} zaznaczonych</span>
         </div>
 
+        {/* Drag-drop upload zone */}
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={onDrop}
+          onClick={() => fileInputRef.current?.click()}
+          className={`
+            flex flex-col items-center justify-center gap-2 py-5 rounded-lg border-2 border-dashed cursor-pointer
+            transition-colors select-none
+            ${dragOver
+              ? 'border-accent bg-accent/5'
+              : 'border-border hover:border-accent/50 hover:bg-bg-surface2'}
+          `}
+        >
+          {uploading
+            ? <Loader2 className="w-5 h-5 text-accent animate-spin" />
+            : <UploadCloud className="w-5 h-5 text-text-muted" />}
+          <p className="text-sm text-text-muted">
+            {uploading ? 'Wgrywanie…' : 'Przeciągnij pliki PDF / DOCX / HTML lub kliknij'}
+          </p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept=".pdf,.docx,.doc,.html,.txt,.md,.mp3,.wav,.m4a,.mp4"
+            onChange={onFileChange}
+            className="hidden"
+          />
+        </div>
+
+        {/* Document checklist */}
         <div className="card p-4 space-y-2">
           {loadingDocs ? (
             <div className="space-y-2">
-              {[1,2,3].map(i => (
-                <div key={i} className="h-8 bg-bg-surface2 rounded animate-pulse" />
-              ))}
+              {[1, 2, 3].map((i) => <div key={i} className="h-8 bg-bg-surface2 rounded animate-pulse" />)}
             </div>
           ) : docs.length === 0 ? (
-            <p className="text-text-muted text-sm py-4 text-center">Brak dokumentów. Przejdź do zakładki Dokumenty, aby wgrać pliki.</p>
+            <p className="text-text-muted text-sm py-4 text-center">
+              Brak dokumentów. Wgraj pliki powyżej lub użyj <strong>Gap Scout</strong> → Ingestuj.
+            </p>
           ) : (
             <>
               <label className="flex items-center gap-2 cursor-pointer px-2 py-1.5 rounded hover:bg-bg-surface2 transition-colors">
@@ -232,7 +246,7 @@ export default function AutopilotPage() {
                 <span className="text-sm font-medium text-text">Zaznacz wszystkie</span>
               </label>
               <div className="border-t border-border" />
-              {docs.map(doc => (
+              {docs.map((doc) => (
                 <label key={doc.filename} className="flex items-center gap-2 cursor-pointer px-2 py-1.5 rounded hover:bg-bg-surface2 transition-colors">
                   <input
                     type="checkbox"
@@ -240,8 +254,8 @@ export default function AutopilotPage() {
                     onChange={() => toggleDoc(doc.filename)}
                     className="w-4 h-4"
                   />
-                  <span className="text-sm text-text flex-1">{doc.filename}</span>
-                  <span className="text-xs text-text-muted">{doc.chunk_count} ch · {doc.sample_count} Q&A</span>
+                  <span className="text-sm text-text flex-1 truncate">{doc.filename}</span>
+                  <span className="text-xs text-text-muted shrink-0">{doc.chunk_count} ch · {doc.sample_count} Q&A</span>
                 </label>
               ))}
             </>
@@ -249,213 +263,21 @@ export default function AutopilotPage() {
         </div>
       </section>
 
-      {/* ─── Section 2: Analiza ─── */}
-      <section className="space-y-3">
-        <h2 className="section-title">
-          <span className="w-6 h-6 rounded-full bg-accent text-bg-base text-xs flex items-center justify-center font-bold">2</span>
-          Analiza dokumentów
-        </h2>
-
-        <button
-          onClick={handleAnalyze}
-          disabled={analyzing || selectedDocs.size === 0}
-          className="btn-primary"
-        >
-          {analyzing ? (
-            <>
-              <div className="w-4 h-4 border-2 border-bg-base/30 border-t-bg-base rounded-full animate-spin" />
-              Analizowanie...
-            </>
-          ) : '🔍 Analizuj dokumenty'}
-        </button>
-
-        {analysis && (
-          <div className="card p-5 space-y-5">
-            {/* Language + Domain */}
-            <div className="flex flex-wrap gap-3">
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-text-muted">Język:</span>
-                <span className={`badge ${analysis.language === 'pl' || analysis.language === 'PL' ? 'badge-success' : 'badge-warning'}`}>
-                  {analysis.language.toUpperCase()}
-                  {analysis.translation_required && ' (wymaga tłumaczenia)'}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-text-muted">Domena:</span>
-                <span className={`badge ${domainColor}`}>
-                  {analysis.domain_label} — {((analysis.domain_confidence ?? 0) * 100).toFixed(0)}%
-                </span>
-              </div>
-            </div>
-
-            {/* Perspectives */}
-            {analysis.perspectives.length > 0 && (
-              <div>
-                <p className="text-sm text-text-muted mb-2">Perspektywy:</p>
-                <div className="flex flex-wrap gap-2">
-                  {analysis.perspectives.map(p => (
-                    <span key={p} className="badge badge-accent">{p}</span>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Auto-decisions */}
-            {analysis.auto_decisions.length > 0 && (
-              <div>
-                <p className="text-sm text-text-muted mb-2">Automatyczne decyzje:</p>
-                <div className="space-y-1">
-                  {analysis.auto_decisions.map((d, i) => (
-                    <div key={i} className={`text-sm px-3 py-1.5 rounded ${d.toLowerCase().includes('warn') || d.toLowerCase().includes('uwaga') ? 'alert-warning' : 'alert-info'}`}>
-                      {d}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Calibration */}
-            <div>
-              <p className="text-sm text-text-muted mb-2">Kalibracja:</p>
-              <div className="grid grid-cols-3 gap-3">
-                <MetricCard label="Próg jakości" value={(analysis.calibration?.quality_threshold ?? 0).toFixed(2)} />
-                <MetricCard label="Maks. tury" value={analysis.calibration?.max_turns ?? '—'} />
-                <MetricCard label="Adwersarial" value={((analysis.calibration?.adversarial_ratio ?? 0) * 100).toFixed(0) + '%'} />
-              </div>
-            </div>
-
-            {/* Reasoning collapsible */}
-            {analysis.calibration.reasoning && analysis.calibration.reasoning.length > 0 && (
-              <div>
-                <button
-                  onClick={() => setShowReasoning(v => !v)}
-                  className="flex items-center gap-1.5 text-sm text-text-muted hover:text-text transition-colors"
-                >
-                  {showReasoning ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                  {showReasoning ? 'Ukryj' : 'Pokaż'} uzasadnienie
-                </button>
-                {showReasoning && (
-                  <ul className="mt-2 space-y-1 pl-4">
-                    {analysis.calibration.reasoning.map((r, i) => (
-                      <li key={i} className="text-sm text-text-muted list-disc">{r}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-
-      {/* ─── Section 3: Uruchom ─── */}
+      {/* ─── Section 2: Run ─── */}
       <section className="space-y-4">
         <h2 className="section-title">
-          <span className="w-6 h-6 rounded-full bg-accent text-bg-base text-xs flex items-center justify-center font-bold">3</span>
+          <span className="w-6 h-6 rounded-full bg-accent text-bg-base text-xs flex items-center justify-center font-bold">2</span>
           Uruchom pipeline
         </h2>
 
-        {/* Advanced settings */}
-        <div className="card overflow-hidden">
-          <button
-            onClick={() => setShowAdvanced(v => !v)}
-            className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-text hover:bg-bg-surface2 transition-colors"
-          >
-            Zaawansowane ustawienia
-            {showAdvanced ? <ChevronUp className="w-4 h-4 text-text-muted" /> : <ChevronDown className="w-4 h-4 text-text-muted" />}
-          </button>
-          {showAdvanced && (
-            <div className="px-4 pb-4 space-y-4 border-t border-border pt-4">
-              {/* Quality threshold */}
-              <div className="flex items-center gap-4">
-                <label className="flex items-center gap-2 text-sm text-text-muted w-48">
-                  <input type="checkbox" checked={overrideQuality} onChange={e => setOverrideQuality(e.target.checked)} />
-                  Próg jakości
-                </label>
-                <div className="flex-1 flex items-center gap-3">
-                  <input
-                    type="range"
-                    min={0.5} max={1.0} step={0.01}
-                    value={qualityThreshold}
-                    onChange={e => setQualityThreshold(parseFloat(e.target.value))}
-                    disabled={!overrideQuality}
-                    className="flex-1"
-                  />
-                  <span className="text-sm text-text w-10 text-right">{qualityThreshold.toFixed(2)}</span>
-                </div>
-              </div>
+        <p className="text-sm text-text-muted">
+          AI automatycznie analizuje dokumenty i dobiera próg jakości, liczbę tur dialogu oraz parametry kalibracji.
+        </p>
 
-              {/* Max turns */}
-              <div className="flex items-center gap-4">
-                <label className="flex items-center gap-2 text-sm text-text-muted w-48">
-                  <input type="checkbox" checked={overrideTurns} onChange={e => setOverrideTurns(e.target.checked)} />
-                  Maks. tury dialogu
-                </label>
-                <select
-                  value={maxTurns}
-                  onChange={e => setMaxTurns(parseInt(e.target.value))}
-                  disabled={!overrideTurns}
-                  className="input-field w-24"
-                >
-                  {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
-                </select>
-              </div>
-
-              {/* Adversarial ratio */}
-              <div className="flex items-center gap-4">
-                <label className="flex items-center gap-2 text-sm text-text-muted w-48">
-                  <input type="checkbox" checked={overrideAdversarial} onChange={e => setOverrideAdversarial(e.target.checked)} />
-                  Współczynnik adwers.
-                </label>
-                <div className="flex-1 flex items-center gap-3">
-                  <input
-                    type="range"
-                    min={0} max={0.3} step={0.01}
-                    value={adversarialRatio}
-                    onChange={e => setAdversarialRatio(parseFloat(e.target.value))}
-                    disabled={!overrideAdversarial}
-                    className="flex-1"
-                  />
-                  <span className="text-sm text-text w-10 text-right">{(adversarialRatio * 100).toFixed(0)}%</span>
-                </div>
-              </div>
-
-              {/* Chunk limit */}
-              <div className="flex items-center gap-4">
-                <label className="text-sm text-text-muted w-48">Limit chunków</label>
-                <input
-                  type="number"
-                  min={0}
-                  value={chunkLimit}
-                  onChange={e => setChunkLimit(parseInt(e.target.value) || 0)}
-                  className="input-field w-32"
-                  placeholder="0 = wszystkie"
-                />
-                {chunkLimit === 0 && <span className="text-xs text-text-muted">wszystkie</span>}
-              </div>
-
-              {/* Batch ID */}
-              <div className="flex items-center gap-4">
-                <label className="text-sm text-text-muted w-48">Batch ID</label>
-                <input
-                  type="text"
-                  value={batchId}
-                  onChange={e => setBatchId(e.target.value)}
-                  className="input-field w-64"
-                  placeholder="auto-generowany"
-                />
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Summary */}
         <div className="text-sm text-text-muted">
-          Uruchomi: <strong className="text-text">{selectedDocs.size}</strong> dok. ·
-          limit <strong className="text-text">{chunkLimit > 0 ? chunkLimit : '∞'}</strong> chunków
-          {batchId && <> · batch: <strong className="text-text">{batchId}</strong></>}
+          Uruchomi: <strong className="text-text">{selectedDocs.size}</strong> dok. · limit <strong className="text-text">∞</strong> chunków
         </div>
 
-        {/* Run button */}
         {!running && !run && (
           <button
             onClick={handleRun}
@@ -473,7 +295,6 @@ export default function AutopilotPage() {
           </button>
         )}
 
-        {/* Progress */}
         {(running || run) && (
           <div className="card p-5 space-y-5">
             <div className="flex items-center justify-between">
@@ -485,7 +306,7 @@ export default function AutopilotPage() {
                 {running && (
                   <button onClick={handleCancel} disabled={cancelling} className="btn-danger flex items-center gap-1.5 text-sm">
                     <Square className="w-3.5 h-3.5" />
-                    {cancelling ? 'Anulowanie...' : 'Anuluj'}
+                    {cancelling ? 'Anulowanie…' : 'Anuluj'}
                   </button>
                 )}
                 {!running && (
@@ -497,39 +318,25 @@ export default function AutopilotPage() {
               </div>
             </div>
 
-            {/* Metrics */}
             {run && (
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                <MetricCard
-                  label="Chunki"
-                  value={`${run.chunks_done}/${run.chunks_total}`}
-                />
-                <MetricCard
-                  label="Postęp"
-                  value={`${(run.progress_pct ?? 0).toFixed(1)}%`}
-                />
-                <MetricCard
-                  label="Q&A gotowych"
-                  value={run.records_written}
-                />
-                <MetricCard
-                  label="Pary DPO"
-                  value={run.dpo_pairs}
-                />
+                <MetricCard label="Chunki" value={`${run.chunks_done}/${run.chunks_total}`} />
+                <MetricCard label="Postęp" value={`${(run.progress_pct ?? 0).toFixed(1)}%`} />
+                <MetricCard label="Q&A gotowych" value={run.records_written} />
+                <MetricCard label="Pary DPO" value={run.dpo_pairs} />
               </div>
             )}
 
-            {/* Progress bar + ETA */}
             {run && (() => {
               const elapsed = run.elapsed_seconds ?? 0;
               const done = run.chunks_done ?? 0;
               const total = run.chunks_total ?? 0;
-              const speed = elapsed > 0 && done > 0 ? done / elapsed : null; // chunks/s
+              const speed = elapsed > 0 && done > 0 ? done / elapsed : null;
               const remaining = total - done;
               const etaSec = speed && remaining > 0 ? Math.round(remaining / speed) : null;
               const etaStr = etaSec == null ? null
                 : etaSec > 3600 ? `${Math.floor(etaSec / 3600)}h ${Math.floor((etaSec % 3600) / 60)}min`
-                : etaSec > 60  ? `${Math.floor(etaSec / 60)}min ${etaSec % 60}s`
+                : etaSec > 60 ? `${Math.floor(etaSec / 60)}min ${etaSec % 60}s`
                 : `${etaSec}s`;
               const barStatus = run.status === 'error' ? 'error' : run.status === 'done' ? 'done' : 'running';
               return (
@@ -547,10 +354,7 @@ export default function AutopilotPage() {
               );
             })()}
 
-            {/* Live log */}
-            {run && (
-              <LiveLog runId={run.run_id} apiBase={API} />
-            )}
+            {run && <LiveLog runId={run.run_id} apiBase={API} />}
           </div>
         )}
       </section>
