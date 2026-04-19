@@ -554,22 +554,26 @@ async def _process_domain(
 
     await _log(f"Scanning: {domain[:60]}")
 
+    # Lazy import avoids circular dependency (layer_a imports ScoutSource from this module)
+    from agents.crawlers.layer_a import run_layer_a
+
     gathered = await asyncio.gather(
-        _fetch_arxiv(domain),
-        _fetch_openalex(domain),
-        _fetch_hackernews(domain),
-        _fetch_eurlex(domain),
+        run_layer_a(domain),          # Layer A: 14 science/research crawlers
+        _fetch_openalex(domain),      # cross-layer aggregator (kept for coverage)
+        _fetch_hackernews(domain),    # Layer D social signal (full integration in Step 9)
+        _fetch_eurlex(domain),        # Layer B legislation (full integration in Step 6)
         _probe_llm_uncertainty(domain),
         return_exceptions=True,
     )
 
-    arxiv_srcs  = gathered[0] if not isinstance(gathered[0], Exception) else []
-    oa_srcs     = gathered[1] if not isinstance(gathered[1], Exception) else []
-    hn_srcs     = gathered[2] if not isinstance(gathered[2], Exception) else []
-    el_srcs     = gathered[3] if not isinstance(gathered[3], Exception) else []
-    uncertainty = gathered[4] if not isinstance(gathered[4], Exception) else 0.5
+    layer_a_srcs = gathered[0] if not isinstance(gathered[0], Exception) else []
+    oa_srcs      = gathered[1] if not isinstance(gathered[1], Exception) else []
+    hn_srcs      = gathered[2] if not isinstance(gathered[2], Exception) else []
+    el_srcs      = gathered[3] if not isinstance(gathered[3], Exception) else []
+    uncertainty  = gathered[4] if not isinstance(gathered[4], Exception) else 0.5
 
-    all_sources: list[ScoutSource] = [*arxiv_srcs, *oa_srcs, *hn_srcs, *el_srcs]
+    # Merge: Layer A first (highest quality), then cross-layer, then social, then legislation
+    all_sources: list[ScoutSource] = [*layer_a_srcs, *oa_srcs, *hn_srcs, *el_srcs]
 
     # Batch-verify sources not yet confirmed (e.g. OpenAlex oa_url can be any domain)
     unverified = [s for s in all_sources if not s.verified]

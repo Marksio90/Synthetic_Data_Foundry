@@ -241,6 +241,15 @@ class Settings(BaseSettings):
         le=100,
         description="Maximum number of source crawlers running concurrently via asyncio.",
     )
+    # API keys for Layer A crawlers that require authentication
+    ieee_api_key: str = Field(
+        "",
+        description="IEEE Xplore API key (free registration at developer.ieee.org).",
+    )
+    core_api_key: str = Field(
+        "",
+        description="CORE.ac.uk API key (free registration at core.ac.uk/services/api).",
+    )
 
     # ------------------------------------------------------------------
     # API / UI service
