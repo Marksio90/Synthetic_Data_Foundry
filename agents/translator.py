@@ -83,10 +83,11 @@ def _retry(func):
 # ---------------------------------------------------------------------------
 
 @_retry
-def _translate_deepl(text: str, source_lang: str) -> str:
+def _translate_deepl(text: str, source_lang: str, api_key: str = "") -> str:
     """Tłumaczy tekst przez DeepL API (bezpłatna lub płatna wersja)."""
+    key = api_key or settings.deepl_api_key
     # Klucze Free kończą się na :fx → api-free.deepl.com; płatne → api.deepl.com
-    if settings.deepl_api_key.endswith(":fx"):
+    if key.endswith(":fx"):
         url = "https://api-free.deepl.com/v2/translate"
     else:
         url = "https://api.deepl.com/v2/translate"
@@ -95,11 +96,14 @@ def _translate_deepl(text: str, source_lang: str) -> str:
         "en": "EN", "de": "DE", "fr": "FR",
         "es": "ES", "it": "IT", "pt": "PT",
         "nl": "NL", "pl": "PL",
+        # języki skanowane przez Gap Scout (warstwy A–E)
+        "ja": "JA", "zh": "ZH", "ko": "KO",
+        "ru": "RU", "ar": "AR",
     }
     src = deepl_lang_map.get(source_lang.lower(), source_lang.upper())
     response = httpx.post(
         url,
-        headers={"Authorization": f"DeepL-Auth-Key {settings.deepl_api_key.strip()}"},
+        headers={"Authorization": f"DeepL-Auth-Key {key.strip()}"},
         data={
             "text": text,
             "source_lang": src,
@@ -165,10 +169,15 @@ def _is_already_polish(text: str) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def translate_text(text: str, source_lang: str = "en") -> str:
+def translate_text(text: str, source_lang: str = "en", *, for_scout: bool = False) -> str:
     """
     Przetłumacz tekst na język polski.
     Pomija tłumaczenie jeśli tekst jest już po polsku (auto-detekcja).
+
+    Args:
+        text:        Tekst do przetłumaczenia.
+        source_lang: Kod języka źródłowego (BCP-47, np. 'en', 'de', 'ja').
+        for_scout:   True = używa scout_deepl_api_key zamiast globalnego deepl_api_key.
     """
     if not text or not text.strip():
         return text
@@ -188,10 +197,14 @@ def translate_text(text: str, source_lang: str = "en") -> str:
         )
         text = text[:_MAX_CHUNK_CHARS]
 
+    # Scout może używać osobnego klucza DeepL (wyższy limit / inny plan)
+    scout_key = getattr(settings, "scout_deepl_api_key", "")
+    effective_deepl_key = (scout_key or settings.deepl_api_key) if for_scout else settings.deepl_api_key
+
     try:
-        if settings.deepl_api_key:
+        if effective_deepl_key:
             try:
-                translated = _translate_deepl(text, source_lang)
+                translated = _translate_deepl(text, source_lang, api_key=effective_deepl_key)
                 logger.debug("Translated via DeepL (%d → %d chars)", len(text), len(translated))
                 return translated
             except Exception as deepl_exc:
