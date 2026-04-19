@@ -203,35 +203,54 @@ class ScoutManager:
         if rec is not None:
             rec.log_lines.append(line)
 
+    def _make_scout_topic(self, t: Any) -> "ScoutTopic":
+        return ScoutTopic(
+            topic_id=t.topic_id,
+            title=t.title,
+            summary=t.summary,
+            score=t.score,
+            recency_score=t.recency_score,
+            llm_uncertainty=t.llm_uncertainty,
+            source_count=t.source_count,
+            social_signal=t.social_signal,
+            sources=[
+                {
+                    "url": s.url,
+                    "title": s.title,
+                    "published_at": s.published_at,
+                    "source_type": s.source_type,
+                    "verified": s.verified,
+                }
+                for s in t.sources
+            ],
+            domains=t.domains,
+            discovered_at=t.discovered_at,
+        )
+
+    def add_single_topic(self, scout_id: str, topic_data: Any) -> None:
+        """Add one topic immediately when discovered (progressive streaming)."""
+        rec = self._runs.get(scout_id)
+        if rec is None:
+            return
+        if topic_data.topic_id in self._topics:
+            return  # already added
+        topic = self._make_scout_topic(topic_data)
+        rec.topics.append(topic)
+        self._topics[topic.topic_id] = topic
+        rec.topics_found = len(rec.topics)
+
     def add_topics(self, scout_id: str, topic_data_list: list) -> None:
-        """Accept list[ScoutTopicData] from agents/topic_scout.py and persist."""
+        """Accept list[ScoutTopicData] from agents/topic_scout.py and persist.
+        Idempotent: skips topics already added via add_single_topic."""
         rec = self._runs.get(scout_id)
         if rec is None:
             return
         self._evict_old_topics()
+        existing_ids = {t.topic_id for t in rec.topics}
         for t in topic_data_list:
-            topic = ScoutTopic(
-                topic_id=t.topic_id,
-                title=t.title,
-                summary=t.summary,
-                score=t.score,
-                recency_score=t.recency_score,
-                llm_uncertainty=t.llm_uncertainty,
-                source_count=t.source_count,
-                social_signal=t.social_signal,
-                sources=[
-                    {
-                        "url": s.url,
-                        "title": s.title,
-                        "published_at": s.published_at,
-                        "source_type": s.source_type,
-                        "verified": s.verified,
-                    }
-                    for s in t.sources
-                ],
-                domains=t.domains,
-                discovered_at=t.discovered_at,
-            )
+            if t.topic_id in existing_ids:
+                continue
+            topic = self._make_scout_topic(t)
             rec.topics.append(topic)
             self._topics[topic.topic_id] = topic
         rec.topics_found = len(rec.topics)
