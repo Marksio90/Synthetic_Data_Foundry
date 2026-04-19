@@ -227,6 +227,14 @@ class Settings(BaseSettings):
         "",
         description="HMAC-SHA256 secret for verifying incoming WebSub/PubSubHubbub callbacks.",
     )
+    scout_webhook_callback_url: str = Field(
+        "",
+        description=(
+            "Publicly accessible URL for the WebSub callback endpoint, e.g. "
+            "'https://api.example.com/api/scout/webhook'. "
+            "Empty = Tier 1 WebSub disabled (Tier 2 polling still active)."
+        ),
+    )
     scout_deepl_api_key: str = Field(
         "",
         description="DeepL API key for scout-specific translation (overrides deepl_api_key).",
