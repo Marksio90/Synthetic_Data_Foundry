@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 import re
 import statistics
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -227,3 +229,54 @@ def calibrate(chunks: list[dict[str, Any]]) -> CalibrationResult:
         logger.debug("  %s", line)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Adaptive calibrator — adjusts threshold in real time from judge scores
+# ---------------------------------------------------------------------------
+
+class AdaptiveCalibrator:
+    """
+    Tracks live judge quality scores and adjusts quality_threshold between chunks.
+    Thread-safe: designed to be updated from the main thread after each chunk batch.
+
+    Logic:
+      - avg_score well above threshold (>+0.15) → raise threshold by 0.01 (stricter)
+      - avg_score barely above threshold (<+0.03) → lower threshold by 0.01 (permissive)
+      - Re-calibrates every `recalibrate_every` recorded scores.
+    """
+
+    def __init__(self, initial_threshold: float, window: int = 30, recalibrate_every: int = 10) -> None:
+        self.threshold = initial_threshold
+        self._window = window
+        self._every = recalibrate_every
+        self._scores: deque[float] = deque(maxlen=window)
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def record(self, score: float) -> None:
+        with self._lock:
+            self._scores.append(score)
+            self._count += 1
+            if self._count % self._every == 0:
+                self._recalibrate()
+
+    def _recalibrate(self) -> None:
+        if len(self._scores) < self._window // 2:
+            return
+        avg = sum(self._scores) / len(self._scores)
+        old = self.threshold
+        if avg > self.threshold + 0.15:
+            self.threshold = min(round(self.threshold + 0.01, 2), 0.92)
+        elif avg < self.threshold + 0.03:
+            self.threshold = max(round(self.threshold - 0.01, 2), 0.72)
+        if self.threshold != old:
+            logger.info(
+                "AdaptiveCalibrator: threshold %.2f → %.2f (window_avg=%.3f, n=%d)",
+                old, self.threshold, avg, len(self._scores),
+            )
+
+    @property
+    def current_threshold(self) -> float:
+        with self._lock:
+            return self.threshold

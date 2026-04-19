@@ -25,6 +25,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import chatbot, documents, pipeline, samples, scout, training
+from api.monitoring import get_metrics_payload, is_available as metrics_available
 
 logger = logging.getLogger(__name__)
 
@@ -121,3 +122,16 @@ app.include_router(scout.router,     prefix="/api/scout",     tags=["scout"])
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "foundry-api"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    from fastapi.responses import Response
+    if not metrics_available():
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=501,
+            detail="prometheus-client not installed. Run: pip install prometheus-client",
+        )
+    payload, content_type = get_metrics_payload()
+    return Response(content=payload, media_type=content_type)

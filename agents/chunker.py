@@ -85,8 +85,40 @@ def _split_by_headings(markdown: str) -> list[tuple[str, str]]:
     return [("", markdown.strip())]
 
 
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+(?=[A-ZĄĆĘŁŃÓŚŹŻ\"\(\[])")
+
+
+def _split_by_sentences(text: str, max_chars: int) -> list[str]:
+    """Split on sentence boundaries, respecting max_chars. Avoids cutting mid-sentence."""
+    sentences = _SENTENCE_END_RE.split(text)
+    chunks: list[str] = []
+    current = ""
+    for sent in sentences:
+        if len(current) + len(sent) + 1 <= max_chars:
+            current = (current + " " + sent).strip() if current else sent.strip()
+        else:
+            if current:
+                chunks.append(current)
+            # Sentence itself longer than max → hard split at word boundary
+            if len(sent) > max_chars:
+                words = sent.split()
+                current = ""
+                for word in words:
+                    if len(current) + len(word) + 1 <= max_chars:
+                        current = (current + " " + word).strip() if current else word
+                    else:
+                        if current:
+                            chunks.append(current)
+                        current = word
+            else:
+                current = sent.strip()
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
 def _split_long_section(body: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
-    """Split body on paragraph breaks if it exceeds max_chars."""
+    """Split body on paragraph breaks, then sentence boundaries if still too long."""
     if len(body) <= max_chars:
         return [body]
     paragraphs = re.split(r"\n{2,}", body)
@@ -98,10 +130,37 @@ def _split_long_section(body: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[st
         else:
             if current:
                 chunks.append(current)
-            current = para.strip()
+            # Paragraph itself too long → split by sentences
+            if len(para) > max_chars:
+                chunks.extend(_split_by_sentences(para, max_chars))
+                current = ""
+            else:
+                current = para.strip()
     if current:
         chunks.append(current)
     return chunks or [body]
+
+
+def _merge_small_chunks(raw: list[tuple[str, str]], min_chars: int) -> list[tuple[str, str]]:
+    """
+    Merge consecutive chunks that are too short (< min_chars) with the next chunk.
+    Prevents tiny orphan chunks that confuse the LLM.
+    """
+    if not raw:
+        return raw
+    merged: list[tuple[str, str]] = []
+    i = 0
+    while i < len(raw):
+        heading, body = raw[i]
+        # Merge forward while current chunk is too small and next exists
+        while len(body) < min_chars and i + 1 < len(raw):
+            i += 1
+            next_heading, next_body = raw[i]
+            sep = f"\n\n## {next_heading}\n\n" if next_heading else "\n\n"
+            body = body + sep + next_body
+        merged.append((heading, body))
+        i += 1
+    return merged
 
 
 def _add_overlap(chunks: list[str], overlap_chars: int) -> list[str]:
@@ -147,8 +206,13 @@ def chunk_document(
 
     for heading, body in sections:
         for part in _split_long_section(body):
-            if len(part.strip()) >= _MIN_CHUNK_CHARS:
+            if len(part.strip()) >= _MIN_CHUNK_CHARS // 2:  # looser pre-merge filter
                 raw_chunks.append((heading, part.strip()))
+
+    # Merge orphan short chunks before embedding
+    raw_chunks = _merge_small_chunks(raw_chunks, _MIN_CHUNK_CHARS)
+    # Final filter after merge
+    raw_chunks = [(h, b) for h, b in raw_chunks if len(b) >= _MIN_CHUNK_CHARS]
 
     if not raw_chunks:
         logger.warning("No usable chunks extracted from doc %s", source_doc_id)
