@@ -558,13 +558,16 @@ async def _process_domain(
     from agents.crawlers.layer_a import run_layer_a
     from agents.crawlers.layer_b import run_layer_b
     from agents.crawlers.layer_c import run_layer_c
+    from agents.crawlers.layer_d import run_layer_d
+    from agents.crawlers.layer_e import run_layer_e
 
     gathered = await asyncio.gather(
         run_layer_a(domain),           # Layer A: 14 science/research crawlers
         run_layer_b(domain),           # Layer B: 10 legislation/regulatory crawlers
         run_layer_c(domain),           # Layer C: 10 finance/economic data crawlers
+        run_layer_d(domain),           # Layer D:  6 tech/social signal crawlers
+        run_layer_e(domain),           # Layer E:  6 multimedia/archive crawlers
         _fetch_openalex(domain),       # cross-layer aggregator (kept for coverage)
-        _fetch_hackernews(domain),     # Layer D social signal (full integration in Step 9)
         _probe_llm_uncertainty(domain),
         return_exceptions=True,
     )
@@ -572,13 +575,15 @@ async def _process_domain(
     layer_a_srcs = gathered[0] if not isinstance(gathered[0], Exception) else []
     layer_b_srcs = gathered[1] if not isinstance(gathered[1], Exception) else []
     layer_c_srcs = gathered[2] if not isinstance(gathered[2], Exception) else []
-    oa_srcs      = gathered[3] if not isinstance(gathered[3], Exception) else []
-    hn_srcs      = gathered[4] if not isinstance(gathered[4], Exception) else []
-    uncertainty  = gathered[5] if not isinstance(gathered[5], Exception) else 0.5
+    layer_d_srcs = gathered[3] if not isinstance(gathered[3], Exception) else []
+    layer_e_srcs = gathered[4] if not isinstance(gathered[4], Exception) else []
+    oa_srcs      = gathered[5] if not isinstance(gathered[5], Exception) else []
+    uncertainty  = gathered[6] if not isinstance(gathered[6], Exception) else 0.5
 
-    # Merge: Layer A (science) → B (legislation) → C (finance) → cross-layer → social
+    # Merge: A (science) → B (legislation) → C (finance) → D (social) → E (multimedia) → OA
     all_sources: list[ScoutSource] = [
-        *layer_a_srcs, *layer_b_srcs, *layer_c_srcs, *oa_srcs, *hn_srcs,
+        *layer_a_srcs, *layer_b_srcs, *layer_c_srcs,
+        *layer_d_srcs, *layer_e_srcs, *oa_srcs,
     ]
 
     # 5-point Anti-Hallucination & Verification Firewall
@@ -601,7 +606,8 @@ async def _process_domain(
 
     recency      = _compute_recency(verified)
     density      = min(1.0, len(verified) / 10.0)
-    social_count = sum(1 for s in verified if s.source_type == "hackernews")
+    _SOCIAL_TYPES = frozenset({"hackernews", "reddit", "mastodon", "producthunt"})
+    social_count = sum(1 for s in verified if s.source_type in _SOCIAL_TYPES)
     social       = min(1.0, social_count / 5.0)
 
     best = max(

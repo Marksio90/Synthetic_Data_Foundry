@@ -106,8 +106,10 @@ class PollingScheduler:
         from agents.crawlers.layer_a import _CRAWLERS as A
         from agents.crawlers.layer_b import _CRAWLERS as B
         from agents.crawlers.layer_c import _CRAWLERS as C
+        from agents.crawlers.layer_d import _CRAWLERS as D
+        from agents.crawlers.layer_e import _CRAWLERS as E
 
-        all_crawlers: dict[str, CrawlerBase] = {**A, **B, **C}
+        all_crawlers: dict[str, CrawlerBase] = {**A, **B, **C, **D, **E}
 
         if enabled:
             crawlers = [all_crawlers[sid] for sid in enabled if sid in all_crawlers]

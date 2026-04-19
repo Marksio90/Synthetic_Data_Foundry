@@ -250,6 +250,27 @@ class Settings(BaseSettings):
         "",
         description="CORE.ac.uk API key (free registration at core.ac.uk/services/api).",
     )
+    # API keys for Layer D / E crawlers
+    producthunt_api_key: str = Field(
+        "",
+        description="Product Hunt developer token (OAuth 2.0 Bearer, optional).",
+    )
+    youtube_api_key: str = Field(
+        "",
+        description="YouTube Data API v3 key (free, 10 000 units/day).",
+    )
+    podcast_index_api_key: str = Field(
+        "",
+        description="Podcast Index API key (free at podcastindex.org).",
+    )
+    podcast_index_api_secret: str = Field(
+        "",
+        description="Podcast Index API secret (paired with podcast_index_api_key).",
+    )
+    europeana_api_key: str = Field(
+        "",
+        description="Europeana API key (free at pro.europeana.eu; falls back to 'api2demo').",
+    )
     # Verification firewall — tunable cutoff dates (ISO-8601 YYYY-MM-DD)
     scout_cutoff_gpt4o: str = Field(
         "2024-04-01",
