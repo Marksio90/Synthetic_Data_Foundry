@@ -145,6 +145,10 @@ export interface ScoutSource {
   published_at: string;
   source_type: 'arxiv' | 'openalex' | 'hackernews' | 'eurlex' | string;
   verified: boolean;
+  // new fields (optional for backwards compat)
+  source_tier?: 'S' | 'A' | 'B' | 'C';
+  language?: string;
+  snippet?: string;
 }
 
 export interface ScoutTopic {
@@ -159,6 +163,15 @@ export interface ScoutTopic {
   sources: ScoutSource[];
   domains: string[];
   discovered_at: string;
+  // new fields (optional for backwards compat)
+  knowledge_gap_score?: number;
+  cutoff_model_targets?: string[];
+  format_types?: string[];
+  languages?: string[];
+  citation_velocity?: number;
+  source_tier?: 'S' | 'A' | 'B' | 'C';
+  estimated_tokens?: number;
+  ingest_ready?: boolean;
 }
 
 export interface ScoutRun {

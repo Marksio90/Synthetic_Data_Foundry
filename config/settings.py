@@ -199,6 +199,50 @@ class Settings(BaseSettings):
     calibration_samples: int = Field(50, ge=10, le=500)
 
     # ------------------------------------------------------------------
+    # Gap Scout — expanded source crawler configuration
+    # ------------------------------------------------------------------
+    scout_sources_enabled: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit allowlist of crawler IDs to activate. "
+            "Empty list = all crawlers enabled. "
+            "Example: [\"arxiv\",\"eurlex\",\"hackernews\",\"openalex\"]"
+        ),
+    )
+    scout_min_gap_score: float = Field(
+        0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum KNOWLEDGE_GAP_SCORE for a topic to be surfaced in results.",
+    )
+    scout_model_targets: List[str] = Field(
+        default_factory=lambda: ["gpt-4o", "claude-3.5-sonnet", "llama-3", "gemini-1.5", "mistral"],
+        description="LLM identifiers used when computing cross-model divergence and cutoff targets.",
+    )
+    scout_languages: List[str] = Field(
+        default_factory=lambda: ["en", "de", "fr", "ja", "zh", "ko", "ar", "ru", "pt", "es"],
+        description="Active language codes for multilingual content scanning (BCP-47).",
+    )
+    scout_webhook_secret: str = Field(
+        "",
+        description="HMAC-SHA256 secret for verifying incoming WebSub/PubSubHubbub callbacks.",
+    )
+    scout_deepl_api_key: str = Field(
+        "",
+        description="DeepL API key for scout-specific translation (overrides deepl_api_key).",
+    )
+    scout_serpapi_key: str = Field(
+        "",
+        description="SerpAPI key used for niche_penetration scoring (Google Search results count).",
+    )
+    scout_max_concurrent_crawlers: int = Field(
+        20,
+        ge=1,
+        le=100,
+        description="Maximum number of source crawlers running concurrently via asyncio.",
+    )
+
+    # ------------------------------------------------------------------
     # API / UI service
     # ------------------------------------------------------------------
     data_dir: str = Field("/app/data")

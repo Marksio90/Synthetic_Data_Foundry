@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
@@ -54,6 +54,34 @@ except ImportError:
 # Trusted-domain whitelist  (anti-hallucination firewall)
 # ---------------------------------------------------------------------------
 
+# Domain trust tiers for verification firewall (Part 5, Step 4)
+_TIER_S_DOMAINS = frozenset({
+    "arxiv.org", "export.arxiv.org",
+    "eur-lex.europa.eu", "ec.europa.eu", "publications.europa.eu",
+    "pubmed.ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov",
+    "sec.gov", "wipo.int", "who.int", "imf.org",
+    "federalregister.gov", "biorxiv.org", "medrxiv.org",
+    "semanticscholar.org", "api.semanticscholar.org",
+})
+
+_TIER_A_DOMAINS = frozenset({
+    "openalex.org", "api.openalex.org",
+    "europepmc.org", "core.ac.uk",
+    "ieee.org", "ieeexplore.ieee.org",
+    "ssrn.com", "philpapers.org",
+    "worldbank.org", "data.worldbank.org",
+    "oecd.org", "oecd-ilibrary.org",
+})
+
+_TIER_B_DOMAINS = frozenset({
+    "reuters.com", "ft.com", "bloomberg.com",
+    "nature.com", "science.org",
+    "bbc.com", "bbc.co.uk",
+    "news.ycombinator.com", "hn.algolia.com",
+    "github.com",
+    "paperswithcode.com",
+})
+
 _TRUSTED_DOMAINS = frozenset({
     "eur-lex.europa.eu",
     "ec.europa.eu",
@@ -76,6 +104,39 @@ _TRUSTED_DOMAINS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Domain tier resolver (used in verification firewall)
+# ---------------------------------------------------------------------------
+
+
+def _get_source_tier(url: str) -> str:
+    """Return S/A/B/C trust tier for a URL based on its domain."""
+    try:
+        host = urlparse(url).netloc.lstrip("www.")
+    except Exception:
+        return "C"
+    if any(host == d or host.endswith("." + d) for d in _TIER_S_DOMAINS):
+        return "S"
+    if any(host == d or host.endswith("." + d) for d in _TIER_A_DOMAINS):
+        return "A"
+    # .edu / .gov / .ac.uk automatically get tier A
+    if host.endswith(".edu") or host.endswith(".gov") or host.endswith(".ac.uk"):
+        return "A"
+    if any(host == d or host.endswith("." + d) for d in _TIER_B_DOMAINS):
+        return "B"
+    return "C"
+
+
+_TIER_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3}
+
+
+def _best_tier(tiers: list[str]) -> str:
+    """Return the highest-quality tier from a list ('S' beats 'A' beats 'B' beats 'C')."""
+    if not tiers:
+        return "C"
+    return min(tiers, key=lambda t: _TIER_ORDER.get(t, 3))
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -85,8 +146,12 @@ class ScoutSource:
     url: str
     title: str
     published_at: str        # ISO-8601 from source metadata, "" if unknown
-    source_type: str         # eurlex | arxiv | openalex | hackernews
+    source_type: str         # eurlex | arxiv | openalex | hackernews | ...
     verified: bool = False
+    # --- new fields (backwards-compatible, all have defaults) ---
+    source_tier: str = "C"   # S | A | B | C  (domain trust level)
+    language: str = ""       # BCP-47 code detected from content, "" = unknown
+    snippet: str = ""        # up to 500-char content preview (no full text stored)
 
 
 @dataclass
@@ -102,6 +167,15 @@ class ScoutTopicData:
     sources: list[ScoutSource]
     domains: list[str]
     discovered_at: str       # ISO-8601
+    # --- new fields (backwards-compatible, all have defaults) ---
+    knowledge_gap_score: float = 0.0          # 8-component unified score (Part 2)
+    cutoff_model_targets: list[str] = field(default_factory=list)  # ["gpt-4o", "claude-3.5", ...]
+    format_types: list[str] = field(default_factory=list)          # ["pdf", "html", "video", ...]
+    languages: list[str] = field(default_factory=list)             # detected languages in sources
+    citation_velocity: float = 0.0            # Semantic Scholar weekly/quarterly ratio
+    source_tier: str = "C"                    # best tier across all verified sources
+    estimated_tokens: int = 0                 # rough token budget for ingest
+    ingest_ready: bool = False                # True when ≥1 verified source present
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +506,34 @@ TopicCallback = Callable[["ScoutTopicData"], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
+# Format inference from URL/content-type (extended in Part 4)
+# ---------------------------------------------------------------------------
+
+_FORMAT_PATTERNS: list[tuple[str, str]] = [
+    (".pdf", "pdf"),
+    (".docx", "docx"),
+    (".xlsx", "xlsx"),
+    (".pptx", "pptx"),
+    ("/pdf/", "pdf"),
+    ("youtube.com/watch", "video"),
+    ("youtu.be/", "video"),
+    (".mp3", "audio"),
+    (".mp4", "video"),
+    (".srt", "srt"),
+    (".csv", "csv"),
+    (".json", "json"),
+]
+
+
+def _infer_format(url: str) -> str:
+    url_lower = url.lower()
+    for pattern, fmt in _FORMAT_PATTERNS:
+        if pattern in url_lower:
+            return fmt
+    return "html"
+
+
+# ---------------------------------------------------------------------------
 # Per-domain processing (runs in parallel)
 # ---------------------------------------------------------------------------
 
@@ -478,6 +580,11 @@ async def _process_domain(
         for src, ok in zip(unverified, ok_results):
             src.verified = ok is True
 
+    # Assign trust tier to each verified source
+    for s in all_sources:
+        if s.verified:
+            s.source_tier = _get_source_tier(s.url)
+
     verified = [s for s in all_sources if s.verified]
     if not verified:
         await _log(f"  {domain[:40]}: no verified sources — skipped")
@@ -502,8 +609,14 @@ async def _process_domain(
         default=verified[0],
     )
 
+    # Derive new metadata fields
+    best_tier    = _best_tier([s.source_tier for s in verified])
+    fmt_types    = list({_infer_format(s.url) for s in verified})
+    langs        = list({s.language for s in verified if s.language})
+    est_tokens   = len(verified) * 800  # rough estimate until full extraction (Part 4)
+
     await _log(
-        f"  {domain[:40]}: score={score:.2f} "
+        f"  {domain[:40]}: score={score:.2f} tier={best_tier} "
         f"sources={len(verified)} uncertainty={float(uncertainty):.2f}"
     )
 
@@ -519,6 +632,13 @@ async def _process_domain(
         sources=verified[:10],
         domains=[domain],
         discovered_at=datetime.now(tz=timezone.utc).isoformat(),
+        # new fields
+        knowledge_gap_score=score,  # bootstrapped; replaced by 8-component scorer in Step 5
+        format_types=fmt_types,
+        languages=langs,
+        source_tier=best_tier,
+        estimated_tokens=est_tokens,
+        ingest_ready=True,
     )
 
     if topic_callback:

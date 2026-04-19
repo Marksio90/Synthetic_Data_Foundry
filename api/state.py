@@ -10,7 +10,7 @@ Thread-safe for use from asyncio background tasks.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field  # noqa: F401 — field used by ScoutTopic
 from typing import Any, Optional
 
 
@@ -141,6 +141,15 @@ class ScoutTopic:
     sources: list[dict]          # serialised ScoutSource dicts
     domains: list[str]
     discovered_at: str           # ISO-8601
+    # --- new fields (backwards-compatible, all have defaults) ---
+    knowledge_gap_score: float = 0.0
+    cutoff_model_targets: list = field(default_factory=list)
+    format_types: list = field(default_factory=list)
+    languages: list = field(default_factory=list)
+    citation_velocity: float = 0.0
+    source_tier: str = "C"
+    estimated_tokens: int = 0
+    ingest_ready: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -155,6 +164,15 @@ class ScoutTopic:
             "sources": self.sources,
             "domains": self.domains,
             "discovered_at": self.discovered_at,
+            # new fields
+            "knowledge_gap_score": self.knowledge_gap_score,
+            "cutoff_model_targets": self.cutoff_model_targets,
+            "format_types": self.format_types,
+            "languages": self.languages,
+            "citation_velocity": self.citation_velocity,
+            "source_tier": self.source_tier,
+            "estimated_tokens": self.estimated_tokens,
+            "ingest_ready": self.ingest_ready,
         }
 
 
@@ -220,11 +238,23 @@ class ScoutManager:
                     "published_at": s.published_at,
                     "source_type": s.source_type,
                     "verified": s.verified,
+                    "source_tier": getattr(s, "source_tier", "C"),
+                    "language": getattr(s, "language", ""),
+                    "snippet": getattr(s, "snippet", ""),
                 }
                 for s in t.sources
             ],
             domains=t.domains,
             discovered_at=t.discovered_at,
+            # new fields — getattr for backwards compat with older ScoutTopicData instances
+            knowledge_gap_score=getattr(t, "knowledge_gap_score", t.score),
+            cutoff_model_targets=getattr(t, "cutoff_model_targets", []),
+            format_types=getattr(t, "format_types", []),
+            languages=getattr(t, "languages", []),
+            citation_velocity=getattr(t, "citation_velocity", 0.0),
+            source_tier=getattr(t, "source_tier", "C"),
+            estimated_tokens=getattr(t, "estimated_tokens", 0),
+            ingest_ready=getattr(t, "ingest_ready", False),
         )
 
     def add_single_topic(self, scout_id: str, topic_data: Any) -> None:
