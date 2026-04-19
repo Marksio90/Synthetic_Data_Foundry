@@ -9,6 +9,7 @@ Thread-safe for use from asyncio background tasks.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field  # noqa: F401 — field used by ScoutTopic
 from typing import Any, Optional
@@ -177,6 +178,15 @@ class ScoutTopic:
 
 
 @dataclass
+class FeedbackRecord:
+    topic_id: str
+    rating: int       # 1-5
+    helpful: bool
+    comment: str
+    submitted_at: str
+
+
+@dataclass
 class ScoutRecord:
     scout_id: str
     status: str = "starting"     # starting | running | done | error
@@ -199,6 +209,8 @@ class ScoutManager:
     def __init__(self) -> None:
         self._runs: dict[str, ScoutRecord] = {}
         self._topics: dict[str, ScoutTopic] = {}   # topic_id → latest version
+        self._sse_queues: set = set()
+        self._feedback: list = []
 
     def create(self, scout_id: str) -> ScoutRecord:
         rec = ScoutRecord(scout_id=scout_id)
@@ -268,6 +280,14 @@ class ScoutManager:
         rec.topics.append(topic)
         self._topics[topic.topic_id] = topic
         rec.topics_found = len(rec.topics)
+        self.broadcast_event({"event": "topic", "data": topic.to_dict()})
+        try:
+            from api.monitoring import topics_discovered_total, scout_topics_per_source
+            topics_discovered_total.inc()
+            for src_dict in topic.sources[:1]:
+                scout_topics_per_source.labels(source=src_dict.get("source_type", "unknown")).inc()
+        except Exception:
+            pass
 
     def add_topics(self, scout_id: str, topic_data_list: list) -> None:
         """Accept list[ScoutTopicData] from agents/topic_scout.py and persist.
@@ -309,6 +329,69 @@ class ScoutManager:
 
     def list_runs(self) -> list[ScoutRecord]:
         return list(self._runs.values())
+
+    def latest_run(self) -> Optional[ScoutRecord]:
+        """Return the most-recently started scout run, or None if no runs exist."""
+        if not self._runs:
+            return None
+        return max(self._runs.values(), key=lambda r: r.started_at)
+
+    # ------------------------------------------------------------------
+    # SSE broadcast — real-time source / topic stream
+    # ------------------------------------------------------------------
+
+    def register_sse_subscriber(self, queue: asyncio.Queue) -> None:
+        self._sse_queues.add(queue)
+
+    def unregister_sse_subscriber(self, queue: asyncio.Queue) -> None:
+        self._sse_queues.discard(queue)
+
+    def broadcast_event(self, event: dict) -> None:
+        """Push event to all active SSE subscriber queues (non-blocking, drop on overflow)."""
+        dead = []
+        for q in list(self._sse_queues):
+            try:
+                q.put_nowait(event)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            self._sse_queues.discard(q)
+
+    # ------------------------------------------------------------------
+    # Human feedback store
+    # ------------------------------------------------------------------
+
+    def add_feedback(
+        self,
+        topic_id: str,
+        rating: int,
+        helpful: bool,
+        comment: str = "",
+    ) -> None:
+        from datetime import datetime, timezone
+        fb = FeedbackRecord(
+            topic_id=topic_id,
+            rating=max(1, min(5, rating)),
+            helpful=helpful,
+            comment=comment[:500],
+            submitted_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._feedback.append(fb)
+        if len(self._feedback) > 1000:
+            self._feedback = self._feedback[-1000:]
+        try:
+            from api.monitoring import scout_feedback_total
+            scout_feedback_total.labels(helpful="yes" if helpful else "no").inc()
+        except Exception:
+            pass
+
+    def list_feedback(self, topic_id: Optional[str] = None) -> list:
+        if topic_id:
+            return [f for f in self._feedback if f.topic_id == topic_id]
+        return list(self._feedback)
+
+    def sse_subscriber_count(self) -> int:
+        return len(self._sse_queues)
 
 
 # Singleton imported by scout router

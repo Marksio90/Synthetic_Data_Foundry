@@ -103,6 +103,27 @@ try:
         registry=_registry,
     )
 
+    # ------------------------------------------------------------------
+    # KROK 11 — additional Gap Scout observability
+    # ------------------------------------------------------------------
+    scout_websub_deliveries_total = Counter(
+        "foundry_scout_websub_deliveries_total",
+        "Total WebSub content deliveries received (verified + injected)",
+        labelnames=["source_type"],
+        registry=_registry,
+    )
+    scout_sse_subscribers = Gauge(
+        "foundry_scout_sse_subscribers",
+        "Currently active SSE /live stream subscribers",
+        registry=_registry,
+    )
+    scout_feedback_total = Counter(
+        "foundry_scout_feedback_total",
+        "Total human feedback submissions on discovered topics",
+        labelnames=["helpful"],
+        registry=_registry,
+    )
+
 except ImportError:
     _AVAILABLE = False
     _registry = None  # type: ignore

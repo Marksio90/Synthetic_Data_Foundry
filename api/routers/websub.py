@@ -115,6 +115,13 @@ async def websub_delivery(
     # Inject into live Gap Scout state
     _inject_realtime_sources(verified, topic)
 
+    try:
+        from api.monitoring import scout_websub_deliveries_total
+        for src in verified:
+            scout_websub_deliveries_total.labels(source_type=src.source_type).inc()
+    except Exception:
+        pass
+
     logger.info(
         "[websub] delivery injected: topic=%s verified=%d/%d",
         topic[:80], len(verified), len(sources),
