@@ -58,6 +58,7 @@ class ReviewSummary:
     rejected: int
     approve_threshold: float
     review_threshold: float
+    priority_preview: list[dict[str, object]]
 
     @property
     def approval_rate(self) -> float:
@@ -118,6 +119,7 @@ def run_auto_review(
     batch_id: Optional[str] = None,
     approve_threshold: float = APPROVE_THRESHOLD,
     review_threshold: float = REVIEW_THRESHOLD,
+    priority_limit: int = 20,
     dry_run: bool = False,
 ) -> ReviewSummary:
     """
@@ -131,6 +133,7 @@ def run_auto_review(
         batch_id:          If set, only process samples from this batch.
         approve_threshold: Score above which samples are auto-approved.
         review_threshold:  Score below which samples are auto-rejected.
+        priority_limit:    Limit rekordów zwracanych w podglądzie kolejki review.
         dry_run:           If True, compute decisions without writing to DB.
 
     Returns:
@@ -148,6 +151,8 @@ def run_auto_review(
 
     approved_ids: list = []
     rejected_ids: list = []
+    queued_ids: list = []
+    queued_scores: dict = {}
     queued = 0
 
     for s in samples:
@@ -160,6 +165,8 @@ def run_auto_review(
             rejected_ids.append(s.id)
         else:
             queued += 1
+            queued_ids.append(s.id)
+            queued_scores[s.id] = float(s.quality_score or 0.0)
 
         logger.debug(
             "AutoReview [%s]: chunk=%s score=%.2f → %s",
@@ -188,6 +195,23 @@ def run_auto_review(
         rejected=len(rejected_ids),
         approve_threshold=approve_threshold,
         review_threshold=review_threshold,
+        priority_preview=[
+            {
+                "sample_id": str(sid),
+                "score": round(queued_scores.get(sid, 0.0), 4),
+                "distance_to_midpoint": round(
+                    abs(queued_scores.get(sid, 0.0) - ((approve_threshold + review_threshold) / 2.0)),
+                    4,
+                ),
+            }
+            for sid in sorted(
+                queued_ids,
+                key=lambda sid: abs(
+                    queued_scores.get(sid, 0.0)
+                    - ((approve_threshold + review_threshold) / 2.0)
+                ),
+            )[: max(1, priority_limit)]
+        ],
     )
     summary.log()
     return summary

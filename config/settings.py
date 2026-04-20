@@ -180,6 +180,22 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     hybrid_vector_weight: float = Field(0.5, ge=0.0, le=1.0)
     hybrid_bm25_weight: float = Field(0.5, ge=0.0, le=1.0)
+    adaptive_hybrid_weights: bool = Field(
+        True,
+        description="True = dynamicznie dostosuj wagi Vector/BM25 do typu pytania.",
+    )
+    adaptive_weight_scope_bonus: float = Field(
+        0.10,
+        ge=0.0,
+        le=0.5,
+        description="Ile dodać do BM25 dla pytań scope/compliance.",
+    )
+    adaptive_weight_comparative_bonus: float = Field(
+        0.10,
+        ge=0.0,
+        le=0.5,
+        description="Ile dodać do komponentu wektorowego dla pytań comparative/process.",
+    )
 
     # ------------------------------------------------------------------
     # Tenacity — API backoff

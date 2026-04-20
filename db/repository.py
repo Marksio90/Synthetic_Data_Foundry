@@ -169,6 +169,8 @@ def hybrid_search(
     query_text: str,
     top_k: int = 5,
     diversify_by_section: bool = False,
+    vector_weight: Optional[float] = None,
+    bm25_weight: Optional[float] = None,
 ) -> List[DirectiveChunk]:
     """
     Zaawansowane wyszukiwanie hybrydowe: Cosine Similarity (pgvector) + Full-Text Search (BM25).
@@ -176,8 +178,21 @@ def hybrid_search(
     """
     start_time = time.perf_counter()
     from config.settings import settings as _s
-    vec_w = _s.hybrid_vector_weight
-    bm25_w = _s.hybrid_bm25_weight
+    vec_w_raw = _s.hybrid_vector_weight if vector_weight is None else vector_weight
+    bm25_w_raw = _s.hybrid_bm25_weight if bm25_weight is None else bm25_weight
+    try:
+        vec_w = max(0.0, float(vec_w_raw))
+    except (TypeError, ValueError):
+        vec_w = 0.5
+    try:
+        bm25_w = max(0.0, float(bm25_w_raw))
+    except (TypeError, ValueError):
+        bm25_w = 0.5
+    weight_sum = vec_w + bm25_w
+    if weight_sum <= 0:
+        vec_w, bm25_w = 0.5, 0.5
+    else:
+        vec_w, bm25_w = vec_w / weight_sum, bm25_w / weight_sum
 
     # Pobieramy szerszą pule kandydatów jeśli wymagana jest dywersyfikacja semantyczna
     fetch_k = top_k * 4 if diversify_by_section else top_k
@@ -204,8 +219,8 @@ def hybrid_search(
         ),
         combined AS (
             SELECT COALESCE(v.id, f.id)                                      AS id,
-                   COALESCE(v.vec_score, 0) * {vec_w}
-                   + COALESCE(f.bm25_score, 0) * {bm25_w}                    AS score
+                   COALESCE(v.vec_score, 0) * :vec_w
+                   + COALESCE(f.bm25_score, 0) * :bm25_w                    AS score
             FROM   vec v
             FULL   OUTER JOIN fts f ON v.id = f.id
         )
@@ -218,7 +233,9 @@ def hybrid_search(
     ).bindparams(
         bindparam("emb", value=str(query_embedding)),
         bindparam("q", value=query_text),
-        bindparam("fetch_k", value=fetch_k)
+        bindparam("fetch_k", value=fetch_k),
+        bindparam("vec_w", value=vec_w),
+        bindparam("bm25_w", value=bm25_w),
     )
     
     rows = session.execute(sql).fetchall()
