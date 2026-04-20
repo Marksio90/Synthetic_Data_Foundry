@@ -25,7 +25,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import text, update
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from db.models import GeneratedSample
@@ -139,7 +139,7 @@ def run_auto_review(
     Returns:
         ReviewSummary with counts.
     """
-    from sqlalchemy import select, and_
+    from sqlalchemy import select
 
     query = select(GeneratedSample).where(
         GeneratedSample.human_reviewed.is_(None)
@@ -196,21 +196,14 @@ def run_auto_review(
         approve_threshold=approve_threshold,
         review_threshold=review_threshold,
         priority_preview=[
-            {
-                "sample_id": str(sid),
-                "score": round(queued_scores.get(sid, 0.0), 4),
-                "distance_to_midpoint": round(
-                    abs(queued_scores.get(sid, 0.0) - ((approve_threshold + review_threshold) / 2.0)),
-                    4,
-                ),
-            }
+            str(sid)
             for sid in sorted(
                 queued_ids,
                 key=lambda sid: abs(
                     queued_scores.get(sid, 0.0)
                     - ((approve_threshold + review_threshold) / 2.0)
                 ),
-            )[: max(1, priority_limit)]
+            )[:20]
         ],
     )
     summary.log()

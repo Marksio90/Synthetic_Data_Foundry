@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, List, Tuple
 
 import openai
 import tiktoken
@@ -24,7 +24,6 @@ from tenacity import (
     retry,
     retry_if_exception,
     stop_after_attempt,
-    wait_exponential,
     wait_random_exponential,
 )
 
@@ -351,8 +350,11 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
             elif question_type in {"comparative", "process"}:
                 vector_weight = min(1.0, vector_weight + settings.adaptive_weight_comparative_bonus)
 
-        # Normalizacja do sumy = 1.0 (ochrona przed przekroczeniem wag)
-        vector_weight, bm25_weight = _normalize_weights(vector_weight, bm25_weight)
+            # Normalizacja do sumy = 1.0 (ochrona przed przekroczeniem wag)
+            weight_sum = vector_weight + bm25_weight
+            if weight_sum > 0:
+                vector_weight = vector_weight / weight_sum
+                bm25_weight = bm25_weight / weight_sum
 
         query_embedding, emb_cost = _embed_query(question)
         chunks = repo.hybrid_search(

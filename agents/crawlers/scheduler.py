@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Set, Dict, Any, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from agents.crawlers.base import CrawlerBase
 from agents.crawlers.dedup import DedupPipeline

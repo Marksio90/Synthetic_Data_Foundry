@@ -73,7 +73,7 @@ def with_db_retries(max_retries: int = 3, initial_wait: float = 0.2) -> Callable
                     session.rollback()
                     logger.error(f"Błąd silnika DB w '{func.__name__}': {e}", exc_info=True)
                     raise
-                except Exception as e:
+                except Exception:
                     # Błędy aplikacji również wymagają cofnięcia stanu sesji
                     session.rollback()
                     raise
@@ -178,21 +178,8 @@ def hybrid_search(
     """
     start_time = time.perf_counter()
     from config.settings import settings as _s
-    vec_w_raw = _s.hybrid_vector_weight if vector_weight is None else vector_weight
-    bm25_w_raw = _s.hybrid_bm25_weight if bm25_weight is None else bm25_weight
-    try:
-        vec_w = max(0.0, float(vec_w_raw))
-    except (TypeError, ValueError):
-        vec_w = 0.5
-    try:
-        bm25_w = max(0.0, float(bm25_w_raw))
-    except (TypeError, ValueError):
-        bm25_w = 0.5
-    weight_sum = vec_w + bm25_w
-    if weight_sum <= 0:
-        vec_w, bm25_w = 0.5, 0.5
-    else:
-        vec_w, bm25_w = vec_w / weight_sum, bm25_w / weight_sum
+    vec_w = _s.hybrid_vector_weight if vector_weight is None else vector_weight
+    bm25_w = _s.hybrid_bm25_weight if bm25_weight is None else bm25_weight
 
     # Pobieramy szerszą pule kandydatów jeśli wymagana jest dywersyfikacja semantyczna
     fetch_k = top_k * 4 if diversify_by_section else top_k

@@ -26,11 +26,11 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Set, Any
+from typing import Optional, List
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
-from agents.topic_scout import ScoutSource, _get_source_tier
+from agents.topic_scout import ScoutSource
 
 logger = logging.getLogger("foundry.agents.crawlers.layer_b")
 
@@ -303,12 +303,14 @@ class ESMACrawler(CrawlerBase):
             "https://www.esma.europa.eu/search-documents"
             f"?q={quote_plus(query)}&type=all&language=en&size=8"
         )
-        resp = await self._fetch(url, use_cache_headers=False)
+        search_resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
-        
-        if resp.status_code == 200:
+        if search_resp.status_code != 200:
+            logger.debug("[esma] primary search status: %s", search_resp.status_code)
+
+        if search_resp.status_code == 200:
             try:
-                data = resp.json()
+                data = search_resp.json()
                 results = data.get("results", data.get("items", []))
                 for r in results[:8]:
                     link = r.get("url") or r.get("link", "")
@@ -429,12 +431,14 @@ class OECDCrawler(CrawlerBase):
             f"https://www.oecd-ilibrary.org/search/search-results.json"
             f"?q={quote_plus(query)}&lang=en&cr=oecd&dy=2023&sort=relevance&n=8"
         )
-        resp = await self._fetch(url, use_cache_headers=False)
+        search_resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
-        
-        if resp.status_code == 200:
+        if search_resp.status_code != 200:
+            logger.debug("[oecd] primary search status: %s", search_resp.status_code)
+
+        if search_resp.status_code == 200:
             try:
-                data = resp.json()
+                data = search_resp.json()
                 items = data.get("items", data.get("results", []))
                 for item in items[:8]:
                     link = item.get("url") or item.get("link", "")
@@ -508,8 +512,10 @@ class WTOCrawler(CrawlerBase):
             "https://www.wto.org/english/res_e/search_e/search_e.htm"
             f"?q={quote_plus(query)}&langFlt=&maxRec=8&SortBy=date&SortOrder=desc"
         )
-        resp = await self._fetch(url, use_cache_headers=False)
+        search_resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
+        if search_resp.status_code != 200:
+            logger.debug("[wto] primary search status: %s", search_resp.status_code)
 
         # Try WTO news RSS as more reliable fallback
         rss_url = "https://www.wto.org/rss/english/news_e.rss"

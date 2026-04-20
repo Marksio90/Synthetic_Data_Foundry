@@ -145,7 +145,6 @@ def calibrate(chunks: list[dict[str, Any]]) -> CalibrationResult:
     # ── Core metrics ─────────────────────────────────────────────────────────
     lengths = [len(t) for t in contents if t]
     avg_len = statistics.mean(lengths) if lengths else 300
-    median_len = statistics.median(lengths) if lengths else 300
 
     # Vocabulary richness on a combined sample (first 10k chars per chunk, max 30 chunks)
     sample_text = " ".join(c[:10_000] for c in contents[:30])

@@ -26,3 +26,4 @@ ollama_models/
 
 # TypeScript build cache
 *.tsbuildinfo
+frontend/node_modules/
