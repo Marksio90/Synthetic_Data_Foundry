@@ -58,7 +58,7 @@ class ReviewSummary:
     rejected: int
     approve_threshold: float
     review_threshold: float
-    priority_preview: list[str]
+    priority_preview: list[dict[str, object]]
 
     @property
     def approval_rate(self) -> float:
