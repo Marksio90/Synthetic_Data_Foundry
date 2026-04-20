@@ -73,7 +73,7 @@ def with_db_retries(max_retries: int = 3, initial_wait: float = 0.2) -> Callable
                     session.rollback()
                     logger.error(f"Błąd silnika DB w '{func.__name__}': {e}", exc_info=True)
                     raise
-                except Exception as e:
+                except Exception:
                     # Błędy aplikacji również wymagają cofnięcia stanu sesji
                     session.rollback()
                     raise

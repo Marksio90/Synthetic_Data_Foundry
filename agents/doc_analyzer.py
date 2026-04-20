@@ -186,7 +186,6 @@ def detect_language(text: str) -> str:
 
     # Fallback: stopword frequency
     words = re.findall(r"\b[a-z]{2,}\b", sample)
-    word_count = max(len(words), 1)
     word_set = set(words)
 
     stopword_scores: dict[str, float] = {}

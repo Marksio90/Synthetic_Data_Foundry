@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, List, Tuple
 
 import openai
 import tiktoken
@@ -24,7 +24,6 @@ from tenacity import (
     retry,
     retry_if_exception,
     stop_after_attempt,
-    wait_exponential,
     wait_random_exponential,
 )
 

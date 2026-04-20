@@ -30,7 +30,7 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Set, Any
+from typing import Optional, List
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
@@ -664,7 +664,7 @@ class BASECrawler(CrawlerBase):
             links = doc.get("dclink") or doc.get("dcidentifier") or []
             if isinstance(links, str):
                 links = [links]
-            link = next((l for l in links if l.startswith("http")), "")
+            link = next((url_candidate for url_candidate in links if url_candidate.startswith("http")), "")
             if not link:
                 continue
             title_raw = doc.get("dctitle") or doc.get("dcsubject") or ""

@@ -25,7 +25,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import text, update
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from db.models import GeneratedSample
@@ -136,7 +136,7 @@ def run_auto_review(
     Returns:
         ReviewSummary with counts.
     """
-    from sqlalchemy import select, and_
+    from sqlalchemy import select
 
     query = select(GeneratedSample).where(
         GeneratedSample.human_reviewed.is_(None)

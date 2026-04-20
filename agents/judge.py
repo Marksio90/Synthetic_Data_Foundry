@@ -13,10 +13,9 @@ Ten plik implementuje zaawansowaną logikę oceny LLM-as-a-Judge z wykorzystanie
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 
 import openai
 import tiktoken

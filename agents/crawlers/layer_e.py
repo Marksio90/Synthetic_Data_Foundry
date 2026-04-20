@@ -20,16 +20,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import logging
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Set, Any
+from typing import Optional, List
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
-from agents.topic_scout import ScoutSource, _get_source_tier
+from agents.topic_scout import ScoutSource
 
 logger = logging.getLogger("foundry.agents.crawlers.layer_e")
 
@@ -333,15 +332,6 @@ class InternetArchiveCrawler(CrawlerBase):
                 if not ident:
                     continue
                 link = f"https://archive.org/details/{ident}"
-                media = doc.get("mediatype", "texts")
-                # Map mediatype to our format taxonomy
-                fmt = {
-                    "audio": "audio",
-                    "movies": "video",
-                    "texts": "pdf",
-                    "software": "html",
-                    "image": "html",
-                }.get(media, "html")
                 title_raw = doc.get("title", ident)
                 title = (title_raw[0] if isinstance(title_raw, list) else title_raw).strip()
                 date_raw = doc.get("date", "")

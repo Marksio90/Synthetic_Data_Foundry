@@ -26,11 +26,11 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Set, Any
+from typing import Optional, List
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
-from agents.topic_scout import ScoutSource, _get_source_tier
+from agents.topic_scout import ScoutSource
 
 logger = logging.getLogger("foundry.agents.crawlers.layer_c")
 
@@ -231,11 +231,13 @@ class FREDCrawler(CrawlerBase):
             f"?search_text={quote_plus(query)}&limit=8&order_by=popularity&sort_order=desc"
             f"&file_type=json{key_param}"
         )
-        resp = await self._fetch(url, use_cache_headers=False)
+        search_resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
-        if resp.status_code == 200:
+        if search_resp.status_code != 200:
+            logger.debug("[fred] primary search status: %s", search_resp.status_code)
+        if search_resp.status_code == 200:
             try:
-                data = resp.json()
+                data = search_resp.json()
             except ValueError:
                 return []
                 
@@ -476,8 +478,10 @@ class UNCrawler(CrawlerBase):
             f"https://digitallibrary.un.org/search?p={quote_plus(query)}"
             f"&of=jm&action=search&rm=&ln=en&rg=8&sc=0&c=Resource+Type%3AResolution"
         )
-        resp = await self._fetch(url, use_cache_headers=False)
+        search_resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
+        if search_resp.status_code != 200:
+            logger.debug("[undl] primary search status: %s", search_resp.status_code)
 
         # Fallback: UN News RSS
         rss_url = "https://news.un.org/en/feed/topic/sustainable-development-goals/feed.rss"
