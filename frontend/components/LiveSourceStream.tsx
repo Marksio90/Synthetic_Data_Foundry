@@ -132,6 +132,11 @@ export default function LiveSourceStream({ className = '' }: { className?: strin
             data?: ScoutTopic;
           };
 
+          if (payload.event === 'replay_end') {
+            isFirstBatch = false;
+            return;
+          }
+
           if (payload.event === 'heartbeat') {
             setEvents((prev) =>
               [{
@@ -159,8 +164,6 @@ export default function LiveSourceStream({ className = '' }: { className?: strin
           }
         } catch {
           /* ignoruj błędy parsowania */
-        } finally {
-          isFirstBatch = false;
         }
       };
 
