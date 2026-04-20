@@ -19,17 +19,18 @@ import sys
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
 from api.state import runs
+from api.security import require_admin_api_key
 from config.settings import settings
 from training.hardware_inspector import inspect as hw_inspect
 from training.quality_gate import check_dataset
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_api_key)])
 
 OUTPUT_DIR = Path(settings.output_file).parent
 _PYTHON = sys.executable
@@ -124,7 +125,6 @@ async def start_training(req: TrainingRunRequest) -> dict:
 
     # Auto-tune config
     from training.auto_tuner import compute_config
-    import json
 
     n_samples = 0
     jpath = Path(jsonl_path)
@@ -312,7 +312,7 @@ async def export_model(req: ExportRequest) -> dict:
     from training.export import merge_lora, convert_to_gguf, build_client_package
 
     export_run_id = "export-" + uuid.uuid4().hex[:8]
-    rec = runs.create(export_run_id, f"export:{req.model_name}")
+    runs.create(export_run_id, f"export:{req.model_name}")
     runs.update(export_run_id, status="running")
 
     async def _do_export():
@@ -337,7 +337,7 @@ async def export_model(req: ExportRequest) -> dict:
             runs.append_log(export_run_id, "[Export] Buduję paczkę dla klienta...")
             n_records = 0
             if jsonl.exists():
-                n_records = sum(1 for l in jsonl.open("r", encoding="utf-8") if l.strip())
+                n_records = sum(1 for line in jsonl.open("r", encoding="utf-8") if line.strip())
 
             zip_path = build_client_package(
                 gguf_path=gguf,

@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from agents.calibrator import calibrate
 from agents.doc_analyzer import analyze_documents
 from api.db import get_session
+from api.security import require_admin_api_key
 from api.schemas import (
     AnalysisResponse,
     CalibrationInfo,
@@ -43,7 +44,7 @@ from api.state import runs
 from config.settings import settings
 from db.models import DirectiveChunk, SourceDocument
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_api_key)])
 
 DATA_DIR = Path(settings.data_dir)
 _PYTHON = sys.executable  # same interpreter as the API
@@ -55,8 +56,13 @@ _PYTHON = sys.executable  # same interpreter as the API
 
 def _resolve_paths(filenames: list[str]) -> list[Path]:
     paths = []
+    base = DATA_DIR.resolve()
     for fn in filenames:
-        p = DATA_DIR / fn
+        if not fn or Path(fn).name != fn:
+            raise HTTPException(status_code=400, detail=f"Invalid filename: {fn}")
+        p = (DATA_DIR / fn).resolve()
+        if base not in p.parents:
+            raise HTTPException(status_code=400, detail=f"Invalid path: {fn}")
         if not p.exists():
             raise HTTPException(status_code=404, detail=f"File not found in data/: {fn}")
         paths.append(p)

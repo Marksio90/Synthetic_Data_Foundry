@@ -210,7 +210,7 @@ sft_dir   = '$OUTPUT_DIR/sft'
 dpo_dir   = '$OUTPUT_DIR/dpo'
 model_dir = dpo_dir if os.path.isdir(dpo_dir) else sft_dir
 print(f'  Używam modelu: {model_dir}')
-merged = merge_lora(model_dir, '/app/output/models/merged')
+merged = merge_lora('$BASE_MODEL', model_dir, '/app/output/models/merged')
 gguf   = convert_to_gguf(merged, '/app/output/models/gguf')
 pkg    = build_client_package(
     model_name='$MODEL_NAME',

@@ -317,11 +317,42 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     data_dir: str = Field("/app/data")
     ollama_url: str = Field("http://localhost:11434")
+    admin_api_key: str = Field(
+        "",
+        description=(
+            "Admin API key required by sensitive endpoints "
+            "(X-API-Key header). Empty = protected endpoints return 503."
+        ),
+    )
+    max_upload_bytes: int = Field(
+        25 * 1024 * 1024,
+        ge=1,
+        description="Maximum single uploaded file size in bytes.",
+    )
+    cors_origins: List[str] = Field(
+        default_factory=lambda: ["http://localhost:3000", "http://localhost:8501"],
+        description="Explicit CORS allow-list. Avoid '*' in production.",
+    )
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     log_level: str = Field("INFO")
+    state_max_log_lines: int = Field(
+        5000,
+        ge=100,
+        description="Max number of log lines kept per in-memory run/scout record.",
+    )
+    state_max_runs: int = Field(
+        300,
+        ge=10,
+        description="Max number of pipeline/training runs retained in memory.",
+    )
+    state_max_scout_runs: int = Field(
+        100,
+        ge=10,
+        description="Max number of scout runs retained in memory.",
+    )
 
     # ------------------------------------------------------------------
     # Batch ID (overridable from CLI; also readable from env)
@@ -346,6 +377,17 @@ class Settings(BaseSettings):
                 return _json.loads(v)
             return [p.strip() for p in v.split(",") if p.strip()]
         return list(v)  # type: ignore[arg-type]
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: object) -> list[str]:
+        if isinstance(v, str):
+            import json as _json
+            s = v.strip()
+            if s.startswith("["):
+                return [str(item).strip() for item in _json.loads(s)]
+            return [p.strip() for p in s.split(",") if p.strip()]
+        return [str(item).strip() for item in list(v)]  # type: ignore[arg-type]
 
 
 # Singleton — import this everywhere
