@@ -536,17 +536,9 @@ export default function ScoutPage() {
                     <div>
                       <p className="text-text font-medium">Brak wykrytych tematów</p>
                       <p className="text-sm text-text-muted mt-1">
-                        Kliknij <strong>Uruchom skan</strong> — AI przeskanuje 46 źródeł w 5 warstwach
+                        Kliknij <strong>Uruchom skan</strong> (przycisk u góry) — AI przeskanuje 46 źródeł w 5 warstwach
                       </p>
                     </div>
-                    <button
-                      onClick={handleRun}
-                      className="mt-2 flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium
-                        bg-accent text-bg-base hover:bg-accent/90 transition-colors"
-                    >
-                      <Telescope className="w-4 h-4" />
-                      Uruchom pierwszy skan
-                    </button>
                   </div>
                 ) : (
                   <div className="flex flex-col items-center justify-center py-24 gap-3">

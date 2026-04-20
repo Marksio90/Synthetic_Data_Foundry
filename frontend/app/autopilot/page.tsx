@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, RotateCcw, Square, UploadCloud, Zap } from 'lucide-react';
+import { Loader2, RotateCcw, Square, Trash2, UploadCloud, Zap } from 'lucide-react';
 import type { Document, PipelineRun } from '@/lib/api';
 import LiveLog from '@/components/LiveLog';
 import StatusBadge from '@/components/StatusBadge';
@@ -37,6 +37,8 @@ export default function AutopilotPage() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [deletingDoc, setDeletingDoc] = useState<string | null>(null);
+
   const [running, setRunning] = useState(false);
   const [run, setRun] = useState<PipelineRun | null>(null);
   const [runError, setRunError] = useState('');
@@ -53,8 +55,6 @@ export default function AutopilotPage() {
       const data = await res.json();
       const list: Document[] = data.documents ?? data ?? [];
       setDocs(list);
-      // Auto-select all on load (including freshly Scout-ingested files)
-      setSelectedDocs(new Set(list.map((d) => d.filename)));
     } catch {
       // ignore
     } finally {
@@ -96,6 +96,26 @@ export default function AutopilotPage() {
       setUploadError(e instanceof Error ? e.message : 'Błąd uploadu');
     } finally {
       setUploading(false);
+    }
+  };
+
+  const deleteDocument = async (filename: string) => {
+    setDeletingDoc(filename);
+    try {
+      const res = await fetch(`${API}/api/documents/${encodeURIComponent(filename)}?remove_db=true`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setDocs((prev) => prev.filter((d) => d.filename !== filename));
+      setSelectedDocs((prev) => {
+        const next = new Set(prev);
+        next.delete(filename);
+        return next;
+      });
+    } catch {
+      /* ignore — plik mógł już nie istnieć */
+    } finally {
+      setDeletingDoc(null);
     }
   };
 
@@ -247,16 +267,28 @@ export default function AutopilotPage() {
               </label>
               <div className="border-t border-border" />
               {docs.map((doc) => (
-                <label key={doc.filename} className="flex items-center gap-2 cursor-pointer px-2 py-1.5 rounded hover:bg-bg-surface2 transition-colors">
-                  <input
-                    type="checkbox"
-                    checked={selectedDocs.has(doc.filename)}
-                    onChange={() => toggleDoc(doc.filename)}
-                    className="w-4 h-4"
-                  />
-                  <span className="text-sm text-text flex-1 truncate">{doc.filename}</span>
-                  <span className="text-xs text-text-muted shrink-0">{doc.chunk_count} ch · {doc.sample_count} Q&A</span>
-                </label>
+                <div key={doc.filename} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-surface2 transition-colors group">
+                  <label className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedDocs.has(doc.filename)}
+                      onChange={() => toggleDoc(doc.filename)}
+                      className="w-4 h-4 shrink-0"
+                    />
+                    <span className="text-sm text-text flex-1 truncate">{doc.filename}</span>
+                    <span className="text-xs text-text-muted shrink-0">{doc.chunk_count} ch · {doc.sample_count} Q&A</span>
+                  </label>
+                  <button
+                    onClick={() => deleteDocument(doc.filename)}
+                    disabled={deletingDoc === doc.filename}
+                    title="Usuń dokument"
+                    className="opacity-0 group-hover:opacity-100 p-1 rounded text-text-muted/40 hover:text-error transition-all disabled:opacity-50 shrink-0"
+                  >
+                    {deletingDoc === doc.filename
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <Trash2 className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
               ))}
             </>
           )}
