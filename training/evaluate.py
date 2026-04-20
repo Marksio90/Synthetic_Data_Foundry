@@ -17,7 +17,6 @@ import logging
 import random
 import statistics
 from pathlib import Path
-from typing import Optional
 
 import openai
 

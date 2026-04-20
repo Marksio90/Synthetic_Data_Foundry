@@ -21,7 +21,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List
 
 from config.settings import settings
 from pipeline.watermark import (

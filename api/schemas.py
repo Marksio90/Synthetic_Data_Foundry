@@ -4,7 +4,6 @@ api/schemas.py — Pydantic request/response models for the Foundry API.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field

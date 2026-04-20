@@ -338,6 +338,21 @@ class Settings(BaseSettings):
     # Logging
     # ------------------------------------------------------------------
     log_level: str = Field("INFO")
+    state_max_log_lines: int = Field(
+        5000,
+        ge=100,
+        description="Max number of log lines kept per in-memory run/scout record.",
+    )
+    state_max_runs: int = Field(
+        300,
+        ge=10,
+        description="Max number of pipeline/training runs retained in memory.",
+    )
+    state_max_scout_runs: int = Field(
+        100,
+        ge=10,
+        description="Max number of scout runs retained in memory.",
+    )
 
     # ------------------------------------------------------------------
     # Batch ID (overridable from CLI; also readable from env)

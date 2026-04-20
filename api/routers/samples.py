@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.db import get_session
-from db.models import DirectiveChunk, GeneratedSample, SourceDocument
+from db.models import GeneratedSample
 
 router = APIRouter()
 
@@ -149,8 +149,6 @@ def human_review(
             'reject'  → human_reviewed=False, human_flag='human_rejected'
     """
     import uuid as _uuid
-    from sqlalchemy import update as sa_update
-
     try:
         sid = _uuid.UUID(sample_id)
     except ValueError:

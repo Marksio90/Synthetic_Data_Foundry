@@ -48,7 +48,7 @@ with st.sidebar:
     if health:
         st.success("API: połączono ✓")
     else:
-        st.error(f"API: brak połączenia ✗")
+        st.error("API: brak połączenia ✗")
         st.caption(f"Adres: {API_URL}")
 
     # Ollama health

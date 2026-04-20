@@ -10,9 +10,16 @@ Thread-safe for use from asyncio background tasks.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field  # noqa: F401 — field used by ScoutTopic
 from typing import Any, Optional
+
+from config.settings import settings
+
+_MAX_LOG_LINES = settings.state_max_log_lines
+_MAX_RUNS = settings.state_max_runs
+_MAX_SCOUT_RUNS = settings.state_max_scout_runs
 
 
 @dataclass
@@ -48,6 +55,9 @@ class RunManager:
         self._runs: dict[str, RunRecord] = {}
 
     def create(self, run_id: str, batch_id: str) -> RunRecord:
+        if len(self._runs) >= _MAX_RUNS:
+            oldest_run_id = next(iter(self._runs))
+            self._runs.pop(oldest_run_id, None)
         rec = RunRecord(run_id=run_id, batch_id=batch_id)
         self._runs[run_id] = rec
         return rec
@@ -67,6 +77,8 @@ class RunManager:
         rec = self._runs.get(run_id)
         if rec is not None:
             rec.log_lines.append(line)
+            if len(rec.log_lines) > _MAX_LOG_LINES:
+                del rec.log_lines[: len(rec.log_lines) - _MAX_LOG_LINES]
             # Parse progress hints from log lines
             _parse_progress(rec, line)
 
@@ -77,8 +89,6 @@ class RunManager:
 # ---------------------------------------------------------------------------
 # Log-line parser — extracts structured progress from main.py stdout
 # ---------------------------------------------------------------------------
-
-import re
 
 _PROGRESS_RE = re.compile(
     r"Progress:\s*(\d+)\s*chunks\s*\|\s*(\d+)\s*ready\s*\|\s*(\d+)\s*unresolvable"
@@ -213,6 +223,9 @@ class ScoutManager:
         self._feedback: list = []
 
     def create(self, scout_id: str) -> ScoutRecord:
+        if len(self._runs) >= _MAX_SCOUT_RUNS:
+            oldest_scout_id = next(iter(self._runs))
+            self._runs.pop(oldest_scout_id, None)
         rec = ScoutRecord(scout_id=scout_id)
         self._runs[scout_id] = rec
         return rec
@@ -234,6 +247,8 @@ class ScoutManager:
         rec = self._runs.get(scout_id)
         if rec is not None:
             rec.log_lines.append(line)
+            if len(rec.log_lines) > _MAX_LOG_LINES:
+                del rec.log_lines[: len(rec.log_lines) - _MAX_LOG_LINES]
 
     def _make_scout_topic(self, t: Any) -> "ScoutTopic":
         return ScoutTopic(
