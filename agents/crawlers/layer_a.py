@@ -1,5 +1,5 @@
 """
-agents/crawlers/layer_a.py — Layer A: Science & Research crawlers (14 sources)
+agents/crawlers/layer_a.py — Layer A: Science & Research crawlers (14 sources) - ENTERPRISE EDITION
 
 Sources covered:
   1.  ArxivCrawler          — Atom feed, cs.* / stat.* / econ.* / q-bio.*
@@ -17,12 +17,11 @@ Sources covered:
   13. ChemRxivCrawler       — REST JSON /api-gateway/chemrxiv (chemistry)
   14. EngrXivCrawler        — OSF SHARE API (engineering preprints)
 
-All 14 classes inherit CrawlerBase for circuit breaker, backoff, ETag caching.
-Uses stdlib xml.etree.ElementTree for Atom/RSS — no feedparser required here.
-
-Public API:
-    sources = await run_layer_a("CSRD reporting directive")
-    sources = await run_layer_a("AI safety", enabled=["arxiv", "semanticscholar"])
+Ulepszenia PRO:
+  - Bounded Concurrency (Semaphore): Limitowanie równoległych żądań do API, ochrona łącza.
+  - Global Layer Timeout: Gwarancja, że cała warstwa zwróci wyniki w skończonym czasie.
+  - Exception Unpacking: Dokładne logowanie błędów ze złączonych procesów (asyncio.gather).
+  - Safe Payload Parsing: Wzmocniona obrona przed nieprawidłowym JSON/XML przy statusie 200 OK.
 """
 
 from __future__ import annotations
@@ -31,16 +30,16 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Set, Any
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
 from agents.topic_scout import ScoutSource, _get_source_tier
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.layer_a")
 
 # ---------------------------------------------------------------------------
-# Date helpers
+# Date helpers (Zoptymalizowane)
 # ---------------------------------------------------------------------------
 
 _DATE_FMTS = (
@@ -53,7 +52,6 @@ _DATE_FMTS = (
     "%B %d, %Y",
     "%Y/%m/%d",
 )
-
 
 def _to_iso(date_str: str) -> str:
     """Normalise any recognised date string to ISO-8601. Returns '' on failure."""
@@ -69,7 +67,6 @@ def _to_iso(date_str: str) -> str:
             continue
     return date_str
 
-
 def _days_ago(n: int) -> str:
     """Return YYYY-MM-DD for n days ago (UTC)."""
     return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
@@ -82,11 +79,9 @@ def _days_ago(n: int) -> str:
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _AT = f"{{{_ATOM_NS}}}"   # shorthand: f"{_AT}entry"
 
-
 def _atom_text(el: Optional[ET.Element], tag: str) -> str:
     child = el.find(f"{_AT}{tag}") if el is not None else None
     return (child.text or "").strip() if child is not None else ""
-
 
 def _atom_link(el: ET.Element, rel: str = "alternate") -> str:
     """Return href of first <link rel=rel> or first <link> if rel not found."""
@@ -100,7 +95,6 @@ def _atom_link(el: ET.Element, rel: str = "alternate") -> str:
     lnk = el.find(f"{_AT}link")
     return lnk.get("href", "") if lnk is not None else ""
 
-
 def _rss_text(item: ET.Element, tag: str) -> str:
     el = item.find(tag)
     return (el.text or "").strip() if el is not None else ""
@@ -109,7 +103,6 @@ def _rss_text(item: ET.Element, tag: str) -> str:
 # ===========================================================================
 # 1. ArxivCrawler
 # ===========================================================================
-
 
 class ArxivCrawler(CrawlerBase):
     """arXiv Atom API — cs.*, stat.*, econ.*, q-bio.* categories."""
@@ -158,7 +151,6 @@ class ArxivCrawler(CrawlerBase):
 # 2+3. BioRxiv + MedRxiv
 # ===========================================================================
 
-
 class _BioMedRxivBase(CrawlerBase):
     _SERVER: str  # "biorxiv" or "medrxiv"
 
@@ -169,10 +161,17 @@ class _BioMedRxivBase(CrawlerBase):
         resp = await self._fetch(url)
         if resp.status_code != 200:
             return []
-        data = resp.json()
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning(f"[{self._SERVER}] Otrzymano nieprawidłowy JSON mimo statusu 200.")
+            return []
+            
         collection = data.get("collection", [])
         sources: list[ScoutSource] = []
         ql = query.lower().split()
+        
         for paper in collection[:20]:
             title: str = paper.get("title", "")
             abstract: str = paper.get("abstract", "")
@@ -211,7 +210,6 @@ class MedRxivCrawler(_BioMedRxivBase):
 # 4. SemanticScholarCrawler
 # ===========================================================================
 
-
 class SemanticScholarCrawler(CrawlerBase):
     """Semantic Scholar REST API — free, no key, 100 req/5 min."""
 
@@ -229,7 +227,13 @@ class SemanticScholarCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
-        data = resp.json()
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning("[semanticscholar] Invalid JSON payload received.")
+            return []
+            
         sources: list[ScoutSource] = []
         for paper in data.get("data", []):
             oa = paper.get("openAccessPdf") or {}
@@ -252,6 +256,7 @@ class SemanticScholarCrawler(CrawlerBase):
                 source_tier=_get_source_tier(paper_url),
                 snippet=(paper.get("abstract") or "")[:500],
             ))
+            
         if sources:
             first_id = (data.get("data") or [{}])[0].get("paperId", "")
             if first_id:
@@ -262,7 +267,6 @@ class SemanticScholarCrawler(CrawlerBase):
 # ===========================================================================
 # 5. PubMedCrawler
 # ===========================================================================
-
 
 class PubMedCrawler(CrawlerBase):
     """NCBI PubMed Central via E-utilities (esearch + efetch)."""
@@ -283,7 +287,12 @@ class PubMedCrawler(CrawlerBase):
         resp = await self._fetch(search_url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
-        esearch = resp.json()
+            
+        try:
+            esearch = resp.json()
+        except ValueError:
+            return []
+            
         ids = esearch.get("esearchresult", {}).get("idlist", [])
         if not ids:
             return []
@@ -294,7 +303,12 @@ class PubMedCrawler(CrawlerBase):
         resp2 = await self._fetch(summ_url, use_cache_headers=False)
         if resp2.status_code != 200:
             return []
-        summ = resp2.json().get("result", {})
+            
+        try:
+            summ = resp2.json().get("result", {})
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
         for pmid in ids[:8]:
             doc = summ.get(str(pmid), {})
@@ -317,7 +331,6 @@ class PubMedCrawler(CrawlerBase):
 # 6. EuroPMCCrawler
 # ===========================================================================
 
-
 class EuroPMCCrawler(CrawlerBase):
     """Europe PMC REST search — European biomedical literature."""
 
@@ -333,8 +346,15 @@ class EuroPMCCrawler(CrawlerBase):
         resp = await self._fetch(url)
         if resp.status_code != 200:
             return []
-        results = resp.json().get("resultList", {}).get("result", [])
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
+        results = data.get("resultList", {}).get("result", [])
         sources: list[ScoutSource] = []
+        
         for r in results:
             pmid = r.get("pmid") or r.get("pmcid") or ""
             if r.get("pmcid"):
@@ -361,7 +381,6 @@ class EuroPMCCrawler(CrawlerBase):
 # 7. CORECrawler
 # ===========================================================================
 
-
 class CORECrawler(CrawlerBase):
     """CORE.ac.uk API v3 — 40M+ open-access documents. Needs CORE_API_KEY."""
 
@@ -386,7 +405,12 @@ class CORECrawler(CrawlerBase):
         )
         if resp.status_code != 200:
             return []
-        data = resp.json()
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
         for work in data.get("results", []):
             link = (work.get("downloadUrl") or work.get("doi")
@@ -411,7 +435,6 @@ class CORECrawler(CrawlerBase):
 # 8. SSRNCrawler
 # ===========================================================================
 
-
 class SSRNCrawler(CrawlerBase):
     """SSRN multi-network RSS (economics, law, finance, management)."""
 
@@ -429,6 +452,7 @@ class SSRNCrawler(CrawlerBase):
         ql = query.lower().split()
         sources: list[ScoutSource] = []
         seen: set[str] = set()
+        
         for feed_url in self._FEEDS:
             try:
                 resp = await self._fetch(feed_url, use_cache_headers=True)
@@ -457,13 +481,13 @@ class SSRNCrawler(CrawlerBase):
                     ))
             except ET.ParseError as exc:
                 logger.debug("[ssrn] RSS parse error: %s", exc)
+                
         return sources[:8]
 
 
 # ===========================================================================
 # 9. PhilPapersCrawler
 # ===========================================================================
-
 
 class PhilPapersCrawler(CrawlerBase):
     """PhilPapers.org REST API — philosophy, AI ethics, alignment."""
@@ -479,9 +503,15 @@ class PhilPapersCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
-        data = resp.json()
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         entries = data if isinstance(data, list) else data.get("entries", data.get("results", []))
         sources: list[ScoutSource] = []
+        
         for entry in entries[:8]:
             link = entry.get("url") or entry.get("link", "")
             if not link:
@@ -503,7 +533,6 @@ class PhilPapersCrawler(CrawlerBase):
 # ===========================================================================
 # 10. IEEEXploreCrawler
 # ===========================================================================
-
 
 class IEEEXploreCrawler(CrawlerBase):
     """IEEE Xplore REST API — electrical engineering, AI, robotics. Needs key."""
@@ -527,8 +556,15 @@ class IEEEXploreCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
-        articles = resp.json().get("articles", [])
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
+        articles = data.get("articles", [])
         sources: list[ScoutSource] = []
+        
         for art in articles:
             link = art.get("html_url") or art.get("pdf_url", "")
             if not link:
@@ -552,7 +588,6 @@ class IEEEXploreCrawler(CrawlerBase):
 # 11. ACMCrawler
 # ===========================================================================
 
-
 class ACMCrawler(CrawlerBase):
     """ACM Digital Library — via OpenAlex venue filter (no auth required)."""
 
@@ -571,8 +606,14 @@ class ACMCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        for work in resp.json().get("results", []):
+        for work in data.get("results", []):
             oa = work.get("open_access") or {}
             link = oa.get("oa_url") or ""
             if not link:
@@ -595,7 +636,6 @@ class ACMCrawler(CrawlerBase):
 # 12. BASECrawler
 # ===========================================================================
 
-
 class BASECrawler(CrawlerBase):
     """BASE (Bielefeld Academic Search Engine) — 350M+ cross-repo documents."""
 
@@ -611,8 +651,15 @@ class BASECrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
-        docs = resp.json().get("response", {}).get("docs", [])
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
+        docs = data.get("response", {}).get("docs", [])
         sources: list[ScoutSource] = []
+        
         for doc in docs:
             links = doc.get("dclink") or doc.get("dcidentifier") or []
             if isinstance(links, str):
@@ -640,7 +687,6 @@ class BASECrawler(CrawlerBase):
 # 13. ChemRxivCrawler
 # ===========================================================================
 
-
 class ChemRxivCrawler(CrawlerBase):
     """ChemRxiv REST API — chemistry, materials science preprints."""
 
@@ -655,8 +701,15 @@ class ChemRxivCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
-        items = resp.json().get("itemHits", [])
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
+        items = data.get("itemHits", [])
         sources: list[ScoutSource] = []
+        
         for hit in items:
             item = hit.get("item", hit)
             doi = item.get("doi", "")
@@ -678,7 +731,6 @@ class ChemRxivCrawler(CrawlerBase):
 # ===========================================================================
 # 14. EngrXivCrawler
 # ===========================================================================
-
 
 class EngrXivCrawler(CrawlerBase):
     """engrXiv via OSF SHARE API — open engineering preprints."""
@@ -705,10 +757,15 @@ class EngrXivCrawler(CrawlerBase):
             if resp.status_code != 200:
                 return []
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         items = data.get("data", [])
         sources: list[ScoutSource] = []
         ql = query.lower().split()
+        
         for item in items:
             attrs = item.get("attributes", {})
             title = attrs.get("title", "").strip()
@@ -735,7 +792,7 @@ class EngrXivCrawler(CrawlerBase):
 
 
 # ===========================================================================
-# Registry + public entry-point
+# Registry + Public Entry-Point (Enterprise Edition)
 # ===========================================================================
 
 _CRAWLERS: dict[str, CrawlerBase] = {
@@ -759,14 +816,25 @@ _CRAWLERS: dict[str, CrawlerBase] = {
 }
 
 
+async def _run_single_crawler_safe(crawler: CrawlerBase, query: str, semaphore: asyncio.Semaphore) -> List[ScoutSource]:
+    """Wraper wykonujący zapytanie chronione Semaforem."""
+    async with semaphore:
+        try:
+            return await crawler.safe_crawl(query)
+        except Exception as exc:
+            # W środowisku PRO przechwytujemy krytyczne usterki klasy by nie ubić całej warstwy
+            logger.error(f"[Layer A] Fatal exception in crawler {crawler.source_id}: {exc}", exc_info=True)
+            return []
+
+
 async def run_layer_a(
     query: str,
     enabled: Optional[list[str]] = None,
 ) -> list[ScoutSource]:
     """
     Run all (or a subset of) Layer A crawlers in parallel.
-    Returns deduplicated ScoutSource list.
-
+    Zabezpieczone przez Bounded Concurrency (Semaphore) i Global Timeout.
+    
     Args:
         query:   search terms / topic string
         enabled: explicit list of source_ids to run; None = all
@@ -784,20 +852,41 @@ async def run_layer_a(
     if not crawlers:
         return []
 
-    results = await asyncio.gather(
-        *[c.safe_crawl(query) for c in crawlers],
-        return_exceptions=True,
-    )
+    # Limitujemy współbieżność, chroniąc system przed uderzeniem np. 50 crawlerów na raz
+    concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+
+    # Globalny limit czasu dla całej warstwy (zapobiega zwieszeniu się Scouta w nieskończoność)
+    layer_timeout = getattr(settings, "layer_a_timeout_seconds", 60.0)
+    
+    try:
+        # wait_for dba, by niezależnie od zachowania API zewn. proces się nie zablokował
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=layer_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[Layer A] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
+        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
-    for batch in results:
+    
+    # Dekompozycja wyników i szczegółowa identyfikacja błędów
+    for idx, batch in enumerate(results):
+        if isinstance(batch, Exception):
+            logger.error(f"[Layer A] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            continue
         if not isinstance(batch, list):
             continue
+            
         for src in batch:
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+                
     return sources
 
 
