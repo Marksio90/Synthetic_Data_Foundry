@@ -22,11 +22,6 @@ from __future__ import annotations
 
 import logging
 
-# Inicjalizacja bazowego loggera dla całego pakietu crawlerów.
-# Submoduły powinny używać: logger = logging.getLogger(__name__)
-logger = logging.getLogger("foundry.agents.crawlers")
-logger.debug("Inicjalizacja modułu akwizycji danych (Gap Scout Crawlers)...")
-
 # ---------------------------------------------------------------------------
 # Importy Komponentów Bazowych i Infrastruktury
 # ---------------------------------------------------------------------------
@@ -43,6 +38,11 @@ from agents.crawlers.layer_b import get_crawler_status_b, run_layer_b
 from agents.crawlers.layer_c import get_crawler_status_c, run_layer_c
 from agents.crawlers.layer_d import get_crawler_status_d, run_layer_d
 from agents.crawlers.layer_e import get_crawler_status_e, run_layer_e
+
+# Inicjalizacja bazowego loggera dla całego pakietu crawlerów.
+# Submoduły powinny używać: logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers")
+logger.debug("Inicjalizacja modułu akwizycji danych (Gap Scout Crawlers)...")
 
 
 # ---------------------------------------------------------------------------

@@ -22,11 +22,11 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Set, Any
+from typing import Optional, List
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
-from agents.topic_scout import ScoutSource, _get_source_tier
+from agents.topic_scout import ScoutSource
 
 logger = logging.getLogger("foundry.agents.crawlers.layer_d")
 

@@ -28,7 +28,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
