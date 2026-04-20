@@ -98,6 +98,9 @@ x-app-env: &app-env
   HF_TOKEN: ${HF_TOKEN:-}
   HF_DATASET_REPO: ${HF_DATASET_REPO:-}
   HF_MODEL_REPO: ${HF_MODEL_REPO:-}
+  ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+  CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://localhost:8501"]}
 
 services:
 
