@@ -1,5 +1,5 @@
 """
-agents/crawlers/layer_b.py — Layer B: Legislation & Regulatory crawlers (10 sources)
+agents/crawlers/layer_b.py — Layer B: Legislation & Regulatory crawlers (10 sources) - ENTERPRISE EDITION
 
 Sources covered:
   1.  EurLexCrawler          — EUR-Lex Atom/RSS (EU regulations, directives)
@@ -13,12 +13,11 @@ Sources covered:
   9.  WIPOCrawler            — WIPO PATENTSCOPE / IP Portal JSON
   10. EPOCrawler             — EPO Espacenet / OPS REST API
 
-All classes inherit CrawlerBase (circuit breaker, backoff, ETag caching).
-Uses stdlib xml.etree.ElementTree for Atom/RSS — no feedparser dependency.
-
-Public API:
-    sources = await run_layer_b("CSRD reporting directive")
-    sources = await run_layer_b("AI Act", enabled=["eurlex", "federalregister"])
+Ulepszenia PRO:
+  - Bounded Concurrency (Semaphore): Limitowanie równoległych żądań do API instytucjonalnych.
+  - Global Layer Timeout: Ochrona przed nieskończonym oczekiwaniem na odpowiedź rządowych serwerów.
+  - Exception Unpacking: Dokładne logowanie błędów ze złączonych procesów (asyncio.gather).
+  - Safe Payload Parsing: Wzmocniona obrona przed nieprawidłowym JSON/XML przy statusie 200 OK.
 """
 
 from __future__ import annotations
@@ -27,13 +26,13 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Set, Any
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
 from agents.topic_scout import ScoutSource, _get_source_tier
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.layer_b")
 
 # ---------------------------------------------------------------------------
 # Date helpers (mirror layer_a)
@@ -51,7 +50,6 @@ _DATE_FMTS = (
     "%Y",
 )
 
-
 def _to_iso(date_str: str) -> str:
     if not date_str:
         return ""
@@ -65,7 +63,6 @@ def _to_iso(date_str: str) -> str:
             continue
     return date_str
 
-
 def _days_ago(n: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
 
@@ -77,11 +74,9 @@ def _days_ago(n: int) -> str:
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _AT = f"{{{_ATOM_NS}}}"
 
-
 def _atom_text(el: Optional[ET.Element], tag: str) -> str:
     child = el.find(f"{_AT}{tag}") if el is not None else None
     return (child.text or "").strip() if child is not None else ""
-
 
 def _atom_link(el: ET.Element, rel: str = "alternate") -> str:
     for link in el.findall(f"{_AT}link"):
@@ -93,7 +88,6 @@ def _atom_link(el: ET.Element, rel: str = "alternate") -> str:
     lnk = el.find(f"{_AT}link")
     return lnk.get("href", "") if lnk is not None else ""
 
-
 def _rss_text(item: ET.Element, tag: str) -> str:
     el = item.find(tag)
     return (el.text or "").strip() if el is not None else ""
@@ -102,7 +96,6 @@ def _rss_text(item: ET.Element, tag: str) -> str:
 # ===========================================================================
 # 1. EurLexCrawler
 # ===========================================================================
-
 
 class EurLexCrawler(CrawlerBase):
     """EUR-Lex RSS search — EU regulations, directives, decisions (Tier S)."""
@@ -146,7 +139,6 @@ class EurLexCrawler(CrawlerBase):
 # ===========================================================================
 # 2. CURIACrawler
 # ===========================================================================
-
 
 class CURIACrawler(CrawlerBase):
     """CURIA — Court of Justice of the EU recent judgments and opinions RSS."""
@@ -198,7 +190,6 @@ class CURIACrawler(CrawlerBase):
 # 3. FederalRegisterCrawler
 # ===========================================================================
 
-
 class FederalRegisterCrawler(CrawlerBase):
     """US Federal Register JSON API — proposed rules, final rules, notices."""
 
@@ -218,8 +209,14 @@ class FederalRegisterCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        for art in resp.json().get("results", []):
+        for art in data.get("results", []):
             link = art.get("html_url", "")
             if not link:
                 continue
@@ -238,7 +235,6 @@ class FederalRegisterCrawler(CrawlerBase):
 # ===========================================================================
 # 4. SECEdgarCrawler
 # ===========================================================================
-
 
 class SECEdgarCrawler(CrawlerBase):
     """SEC EDGAR full-text search — 10-K, 10-Q, 8-K, DEF 14A filings."""
@@ -262,8 +258,10 @@ class SECEdgarCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             resp = await self._fetch(url2, use_cache_headers=False)
+            
         if resp.status_code != 200:
             return []
+            
         sources: list[ScoutSource] = []
         try:
             hits = resp.json().get("hits", {}).get("hits", [])
@@ -293,7 +291,6 @@ class SECEdgarCrawler(CrawlerBase):
 # 5. ESMACrawler
 # ===========================================================================
 
-
 class ESMACrawler(CrawlerBase):
     """ESMA — European Securities and Markets Authority publications & consultations."""
 
@@ -308,6 +305,7 @@ class ESMACrawler(CrawlerBase):
         )
         resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
+        
         if resp.status_code == 200:
             try:
                 data = resp.json()
@@ -327,7 +325,8 @@ class ESMACrawler(CrawlerBase):
                         source_tier="A",
                         snippet=(r.get("description") or r.get("summary", ""))[:500],
                     ))
-                return sources
+                if sources:
+                    return sources
             except Exception:
                 pass
 
@@ -336,6 +335,7 @@ class ESMACrawler(CrawlerBase):
         resp2 = await self._fetch(rss_url, use_cache_headers=True)
         if resp2.status_code != 200:
             return []
+            
         ql = query.lower().split()
         try:
             root = ET.fromstring(resp2.text)
@@ -367,7 +367,6 @@ class ESMACrawler(CrawlerBase):
 # 6. EBACrawler
 # ===========================================================================
 
-
 class EBACrawler(CrawlerBase):
     """EBA — European Banking Authority publications and regulatory standards."""
 
@@ -383,6 +382,7 @@ class EBACrawler(CrawlerBase):
         ql = query.lower().split()
         sources: list[ScoutSource] = []
         seen: set[str] = set()
+        
         for feed_url in self._FEEDS:
             try:
                 resp = await self._fetch(feed_url, use_cache_headers=True)
@@ -418,7 +418,6 @@ class EBACrawler(CrawlerBase):
 # 7. OECDCrawler
 # ===========================================================================
 
-
 class OECDCrawler(CrawlerBase):
     """OECD iLibrary search JSON — economic policy, governance, environment."""
 
@@ -432,9 +431,11 @@ class OECDCrawler(CrawlerBase):
         )
         resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
+        
         if resp.status_code == 200:
             try:
-                items = resp.json().get("items", resp.json().get("results", []))
+                data = resp.json()
+                items = data.get("items", data.get("results", []))
                 for item in items[:8]:
                     link = item.get("url") or item.get("link", "")
                     if link and not link.startswith("http"):
@@ -466,7 +467,13 @@ class OECDCrawler(CrawlerBase):
         resp2 = await self._fetch(url2, use_cache_headers=False)
         if resp2.status_code != 200:
             return []
-        for work in resp2.json().get("results", []):
+            
+        try:
+            data = resp2.json()
+        except ValueError:
+            return []
+            
+        for work in data.get("results", []):
             oa = work.get("open_access") or {}
             link = oa.get("oa_url") or ""
             if not link:
@@ -488,7 +495,6 @@ class OECDCrawler(CrawlerBase):
 # ===========================================================================
 # 8. WTOCrawler
 # ===========================================================================
-
 
 class WTOCrawler(CrawlerBase):
     """WTO document gateway — trade policy, dispute settlement, agreements."""
@@ -547,7 +553,12 @@ class WTOCrawler(CrawlerBase):
         )
         resp3 = await self._fetch(url3, use_cache_headers=False)
         if resp3.status_code == 200:
-            for work in resp3.json().get("results", []):
+            try:
+                data = resp3.json()
+            except ValueError:
+                return sources[:8]
+                
+            for work in data.get("results", []):
                 oa = work.get("open_access") or {}
                 link = oa.get("oa_url") or ""
                 if not link:
@@ -570,7 +581,6 @@ class WTOCrawler(CrawlerBase):
 # 9. WIPOCrawler
 # ===========================================================================
 
-
 class WIPOCrawler(CrawlerBase):
     """WIPO PATENTSCOPE + IP Portal — international IP, patents, treaties."""
 
@@ -585,6 +595,7 @@ class WIPOCrawler(CrawlerBase):
         )
         resp = await self._fetch(url, use_cache_headers=False)
         sources: list[ScoutSource] = []
+        
         if resp.status_code == 200:
             try:
                 data = resp.json()
@@ -617,6 +628,7 @@ class WIPOCrawler(CrawlerBase):
         resp2 = await self._fetch(rss_url, use_cache_headers=True)
         if resp2.status_code != 200:
             return []
+            
         ql = query.lower().split()
         try:
             root = ET.fromstring(resp2.text)
@@ -648,7 +660,6 @@ class WIPOCrawler(CrawlerBase):
 # 10. EPOCrawler
 # ===========================================================================
 
-
 class EPOCrawler(CrawlerBase):
     """EPO Espacenet — European Patent Office patent search (public OPS API)."""
 
@@ -668,6 +679,7 @@ class EPOCrawler(CrawlerBase):
             use_cache_headers=False,
         )
         sources: list[ScoutSource] = []
+        
         if resp.status_code == 200:
             try:
                 data = resp.json()
@@ -718,7 +730,7 @@ class EPOCrawler(CrawlerBase):
 
 
 # ===========================================================================
-# Registry + public entry-point
+# Registry + Public Entry-Point (Enterprise Edition)
 # ===========================================================================
 
 _CRAWLERS: dict[str, CrawlerBase] = {
@@ -738,6 +750,16 @@ _CRAWLERS: dict[str, CrawlerBase] = {
 }
 
 
+async def _run_single_crawler_safe(crawler: CrawlerBase, query: str, semaphore: asyncio.Semaphore) -> List[ScoutSource]:
+    """Wraper wykonujący zapytanie chronione Semaforem z bezbłędnym przechwyceniem awarii."""
+    async with semaphore:
+        try:
+            return await crawler.safe_crawl(query)
+        except Exception as exc:
+            logger.error(f"[Layer B] Fatal exception in crawler {crawler.source_id}: {exc}", exc_info=True)
+            return []
+
+
 async def run_layer_b(
     query: str,
     enabled: Optional[list[str]] = None,
@@ -745,6 +767,7 @@ async def run_layer_b(
     """
     Run all (or a subset of) Layer B crawlers in parallel.
     Returns deduplicated ScoutSource list.
+    Zabezpieczone przez Bounded Concurrency (Semaphore) i Global Timeout.
     """
     from config.settings import settings
     active = enabled
@@ -759,20 +782,40 @@ async def run_layer_b(
     if not crawlers:
         return []
 
-    results = await asyncio.gather(
-        *[c.safe_crawl(query) for c in crawlers],
-        return_exceptions=True,
-    )
+    # Limitujemy współbieżność, chroniąc system przed limitowaniem API rządowych
+    concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+
+    # Globalny limit czasu dla całej warstwy
+    layer_timeout = getattr(settings, "layer_b_timeout_seconds", 60.0)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=layer_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[Layer B] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
+        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
-    for batch in results:
+    
+    # Dekompozycja wyników
+    for idx, batch in enumerate(results):
+        if isinstance(batch, Exception):
+            logger.error(f"[Layer B] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            continue
         if not isinstance(batch, list):
             continue
+            
         for src in batch:
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+                
     return sources
 
 
