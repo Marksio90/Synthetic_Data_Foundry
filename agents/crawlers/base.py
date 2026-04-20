@@ -1,47 +1,36 @@
 """
-agents/crawlers/base.py — Abstract base class for all Gap Scout source crawlers.
+agents/crawlers/base.py — Abstract base class for all Gap Scout source crawlers (ENTERPRISE EDITION).
 
-Every concrete crawler inherits CrawlerBase and implements crawl().
-Infrastructure provided out of the box:
-  • circuit breaker  — 5 consecutive errors → 5-min pause → auto-resume
-  • HTTP retry       — exponential backoff + jitter via tenacity (max 3 attempts)
-  • adaptive polling — 3× no-new-items → doubles poll_interval (capped at max)
-  • cache headers    — ETag / If-None-Match, Last-Modified / If-Modified-Since
-  • rate-limit guard — logs warning when X-RateLimit-Remaining < 5
-  • Prometheus hooks — fetch duration histogram, verification failure counter
-  • structured logs  — JSON extra={} on every warning/error
-
-Usage:
-    class ArxivCrawler(CrawlerBase):
-        source_id = "arxiv"
-        default_poll_interval = 120
-
-        async def crawl(self, query: str) -> list[ScoutSource]:
-            resp = await self._fetch("https://export.arxiv.org/api/query?...")
-            ...
-            return sources
+Każdy dedykowany crawler dziedziczy po CrawlerBase i implementuje crawl().
+Infrastruktura (Out-of-the-box):
+  • Global Connection Pool — współdzielony klient HTTP z limitem gniazd TCP (wysoka wydajność).
+  • Circuit Breaker      — 5 błędów z rzędu → 5-minutowa pauza systemu → automatyczne wznowienie.
+  • HTTP Retry (Jitter)  — Exponential backoff dla błędów sieciowych i 5xx (via Tenacity).
+  • Adaptive Polling     — 3x brak nowych elementów → podwojenie interwału (limitowane górną granicą).
+  • HTTP Caching         — Pełne wsparcie ETag, If-None-Match, Last-Modified.
+  • Rate-Limit Guard     — Logowanie krytyczne dla X-RateLimit-Remaining < 5.
+  • Prometheus Hooks     — Eksport metryk do systemu monitoringu (Histogramy / Liczniki błędów).
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional, Dict, Any
 
 import httpx
 
 if TYPE_CHECKING:
-    # Import only for type annotations — avoids circular import with topic_scout.py
     from agents.topic_scout import ScoutSource
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.base")
 
 # ---------------------------------------------------------------------------
-# Optional tenacity — graceful degradation if not installed
+# Zarządzanie Pakietami Opcjonalnymi (Tenacity)
 # ---------------------------------------------------------------------------
-
 try:
     from tenacity import (
         AsyncRetrying,
@@ -53,73 +42,93 @@ try:
     _HAS_TENACITY = True
 except ImportError:
     _HAS_TENACITY = False
-    logger.warning("tenacity not installed — HTTP retries disabled (pip install tenacity)")
+    logger.warning("Biblioteka 'tenacity' nie jest zainstalowana — HTTP Retries są WYŁĄCZONE. Zalecona instalacja dla Enterprise.")
+
+# ---------------------------------------------------------------------------
+# Globalna Pula Połączeń (Connection Pooling - Ochrona przed TCP Leak)
+# ---------------------------------------------------------------------------
+# Zamiast tworzyć nowego klienta per instancja, używamy globalnego singletonu,
+# by oszczędzać gniazda serwera i optymalizować Handshake TLS.
+_GLOBAL_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+def _get_global_http_client() -> httpx.AsyncClient:
+    global _GLOBAL_HTTP_CLIENT
+    if _GLOBAL_HTTP_CLIENT is None:
+        limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
+        _GLOBAL_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=25.0, # Zwiększono limit dla stabilności crawlerów
+            follow_redirects=True,
+            limits=limits,
+        )
+    return _GLOBAL_HTTP_CLIENT
 
 
+# ---------------------------------------------------------------------------
+# Klasa Bazowa Crawlera (CrawlerBase)
+# ---------------------------------------------------------------------------
 class CrawlerBase(ABC):
     """
-    Abstract base for all Gap Scout crawlers.
+    Abstrakcyjna klasa bazowa dla wszystkich crawlerów Gap Scout.
 
-    Class variables to override in subclasses:
-        source_id              unique ID used in logs and metrics (required)
-        default_poll_interval  seconds between polls (default 300 = 5 min)
-        max_poll_interval      upper bound for adaptive back-off (default 3600)
+    Zmienne do nadpisania w klasach dziedziczących:
+        source_id               Unikalny ID używany w metrykach i logach (Wymagane)
+        default_poll_interval   Sekundy pomiędzy zapytaniami (Domyślnie 300s = 5 min)
+        max_poll_interval       Górny limit dla Adaptive Backoff (Domyślnie 3600s = 1 godz)
     """
 
     source_id: ClassVar[str] = "base"
-    default_poll_interval: ClassVar[int] = 300     # 5 min
-    max_poll_interval: ClassVar[int] = 3_600       # 1 h
+    default_poll_interval: ClassVar[int] = 300       # 5 min
+    max_poll_interval: ClassVar[int] = 3_600         # 1 godz
 
-    _CB_THRESHOLD: ClassVar[int] = 5               # errors before circuit opens
-    _CB_PAUSE_SECONDS: ClassVar[int] = 300         # 5-min circuit-open pause
+    _CB_THRESHOLD: ClassVar[int] = 5                 # Błędy wyzwalające Circuit Breaker
+    _CB_PAUSE_SECONDS: ClassVar[int] = 300           # Czas otwarcia obwodu (Pauza 5 min)
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    # Domyślne nagłówki Anti-Ban
+    _USER_AGENTS = [
+        "FoundryScout/2.0 (research-tool; non-commercial)",
+        "Mozilla/5.0 (compatible; FoundryScoutBot/2.0; +http://foundry.example.com/bot)"
+    ]
 
     def __init__(self) -> None:
         self.poll_interval: int = self.default_poll_interval
-        self.last_seen_id: str = ""          # deduplication watermark — set by crawl()
+        self.last_seen_id: str = ""          # Znak wodny deduplikacji (aktualizowany przez .crawl())
+        
         self._consecutive_errors: int = 0
-        self._no_new_count: int = 0          # consecutive polls without new items
+        self._no_new_count: int = 0          # Licznik pustych odpytań (dla Adaptive Polling)
         self._paused_until: Optional[datetime] = None
+        
         self._etag: str = ""
         self._last_modified: str = ""
-        self._http = httpx.AsyncClient(
-            timeout=20.0,
-            follow_redirects=True,
-            headers={"User-Agent": "FoundryScout/2.0 (research-tool; non-commercial)"},
-        )
+        
+        # Pobieramy podpięcie pod globalną pulę
+        self._http = _get_global_http_client()
 
     # ------------------------------------------------------------------
-    # Abstract interface
+    # Interfejs Abstrakcyjny
     # ------------------------------------------------------------------
-
     @abstractmethod
     async def crawl(self, query: str) -> "list[ScoutSource]":
         """
-        Fetch new sources for *query* from this source.
+        Pobiera nowe źródła dla zadanego zapytania (query).
 
-        Implementations:
-          - MUST use self._fetch() for all HTTP calls (retry + cache headers)
-          - SHOULD update self.last_seen_id after a successful fetch
-          - MUST NOT catch all exceptions — let safe_crawl() handle them
-          - MUST return only newly-seen sources (dedup by last_seen_id)
+        Wdrożenie w subklasie MUST:
+          - Używać `await self._fetch(...)` do połączeń sieciowych (Caching + Retry).
+          - Zaktualizować `self.last_seen_id` po udanym pobraniu.
+          - Zwracać TYLKO nowo zobaczony kontent.
         """
-        ...
+        pass
 
     # ------------------------------------------------------------------
-    # Public entry-point — wraps crawl() with circuit breaker
+    # Główny Punkt Wejścia (Circuit Breaker Wrapper)
     # ------------------------------------------------------------------
-
     async def safe_crawl(self, query: str) -> "list[ScoutSource]":
         """
-        Call crawl() with circuit breaker + adaptive-polling + metrics.
-        Always returns a list (empty when paused or on error) — never raises.
+        Wywoluje crawl() owinięte w Circuit Breaker, Adaptive Polling i Telemetrię.
+        Nigdy nie rzuca wyjątków – w przypadku awarii zwraca bezpieczną pustą listę [].
         """
         if self._is_paused():
             logger.debug(
-                "[%s] circuit breaker active until %s — skipping",
+                "[%s] Circuit Breaker AKTYWNY (Zablokowano do %s) — pomijam crawl.",
                 self.source_id, self._paused_until,
             )
             return []
@@ -136,43 +145,42 @@ class CrawlerBase(ABC):
             return []
 
     # ------------------------------------------------------------------
-    # HTTP helper — use inside crawl() implementations
+    # HTTP Helper Core (Caching, Retry, User-Agent)
     # ------------------------------------------------------------------
-
     async def _fetch(
         self,
         url: str,
         *,
         method: str = "GET",
         use_cache_headers: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> httpx.Response:
         """
-        Perform an HTTP request with exponential-backoff retry.
-
-        - 4xx responses are returned immediately (not retried — client error).
-        - 5xx / network errors retry up to 3 times with exp backoff + jitter.
-        - Automatically stores and sends ETag / Last-Modified cache headers.
-        - Checks X-RateLimit-Remaining and logs warning when < 5.
+        Główne narzędzie I/O wykonujące połączenie z zaawansowaną polityką Exponential Backoff.
+        Zrzuca błędy 4xx (Client Error) bez retry'u, chroniąc przed banem na IP.
         """
-        extra_headers = {
+        # Losowy User-Agent chroni przed agresywnym firewall'em na crawlery
+        headers = {
+            "User-Agent": random.choice(self._USER_AGENTS),
             **(self.cache_headers() if use_cache_headers else {}),
             **kwargs.pop("headers", {}),
         }
 
         async def _do() -> httpx.Response:
-            resp = await self._http.request(method, url, headers=extra_headers, **kwargs)
+            resp = await self._http.request(method, url, headers=headers, **kwargs)
             if 400 <= resp.status_code < 500:
-                return resp  # client error — return, do NOT retry
+                logger.debug(f"[{self.source_id}] Klient HTTP zablokowany ({resp.status_code}) — zaniechanie powtórzeń.")
+                return resp
             resp.raise_for_status()
             return resp
 
         if _HAS_TENACITY:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(3),
+                # Jitter: Dodanie max 2s odchyłu zapobiega potężnym pętlom wielu crawlerów na raz
                 wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random(0, 2),
                 retry=retry_if_exception_type(
-                    (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException)
+                    (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException, httpx.ReadError)
                 ),
                 reraise=True,
             ):
@@ -183,16 +191,16 @@ class CrawlerBase(ABC):
 
         if use_cache_headers:
             self._update_cache(resp.headers)
+            
         self._check_rate_limit(resp.headers)
         return resp
 
     # ------------------------------------------------------------------
-    # ETag / Last-Modified caching
+    # ETag / Last-Modified Caching (Optymalizacja Transferu)
     # ------------------------------------------------------------------
-
-    def cache_headers(self) -> dict[str, str]:
-        """Build conditional request headers from stored ETag / Last-Modified."""
-        h: dict[str, str] = {}
+    def cache_headers(self) -> Dict[str, str]:
+        """Buduje nagłówki warunkowe redukujące koszt łącza (HTTP 304 Not Modified)."""
+        h: Dict[str, str] = {}
         if self._etag:
             h["If-None-Match"] = self._etag
         if self._last_modified:
@@ -206,16 +214,15 @@ class CrawlerBase(ABC):
             self._last_modified = lm
 
     # ------------------------------------------------------------------
-    # Rate-limit guard
+    # Rate-Limit Guard (Bariera Ochronna API)
     # ------------------------------------------------------------------
-
     def _check_rate_limit(self, headers: httpx.Headers) -> None:
         remaining = headers.get("x-ratelimit-remaining", "")
         if remaining:
             try:
                 if int(remaining) < 5:
                     logger.warning(
-                        "[%s] rate limit critically low: %s request(s) remaining",
+                        "[%s] ⚠️ BARDZO NISKI POZIOM RATE LIMITU: Pozostało %s zapytań!",
                         self.source_id, remaining,
                         extra={"crawler": self.source_id, "rl_remaining": remaining},
                     )
@@ -223,16 +230,15 @@ class CrawlerBase(ABC):
                 pass
 
     # ------------------------------------------------------------------
-    # Circuit breaker internals
+    # Mechanika Circuit Breaker i Adaptive Polling
     # ------------------------------------------------------------------
-
     def _is_paused(self) -> bool:
         if self._paused_until is None:
             return False
         if datetime.now(timezone.utc) >= self._paused_until:
             self._paused_until = None
             logger.info(
-                "[%s] circuit breaker CLOSED — resuming",
+                "[%s] 🟢 Circuit Breaker ZAMKNIĘTY — Wznawiam skanowanie.",
                 self.source_id,
                 extra={"crawler": self.source_id, "event": "circuit_breaker_closed"},
             )
@@ -250,31 +256,28 @@ class CrawlerBase(ABC):
                 new_iv = min(self.poll_interval * 2, self.max_poll_interval)
                 if new_iv != self.poll_interval:
                     logger.debug(
-                        "[%s] no new items ×3 → poll_interval %ds → %ds",
+                        "[%s] Brak nowych treści (×3). Wydłużam interwał: %ds → %ds",
                         self.source_id, self.poll_interval, new_iv,
                         extra={"crawler": self.source_id, "poll_interval": new_iv},
                     )
                 self.poll_interval = new_iv
                 self._no_new_count = 0
+                
         _record_fetch(self.source_id, elapsed, success=True)
 
     def _on_error(self, exc: Exception, elapsed: float) -> None:
         self._consecutive_errors += 1
         logger.warning(
-            "[%s] crawl error (%d/%d): %s",
+            "[%s] Błąd skanowania (%d/%d): %s",
             self.source_id, self._consecutive_errors, self._CB_THRESHOLD, exc,
             extra={"crawler": self.source_id, "error": str(exc)},
         )
         if self._consecutive_errors >= self._CB_THRESHOLD:
-            self._paused_until = (
-                datetime.now(timezone.utc)
-                + timedelta(seconds=self._CB_PAUSE_SECONDS)
-            )
+            self._paused_until = datetime.now(timezone.utc) + timedelta(seconds=self._CB_PAUSE_SECONDS)
             self._consecutive_errors = 0
-            logger.warning(
-                "[%s] circuit breaker OPEN — pausing %ds until %s",
-                self.source_id, self._CB_PAUSE_SECONDS,
-                self._paused_until.isoformat(),
+            logger.error(
+                "[%s] 🔴 CIRCUIT BREAKER OTWARTY — Zawieszam operacje na %ds do %s.",
+                self.source_id, self._CB_PAUSE_SECONDS, self._paused_until.isoformat(),
                 extra={
                     "crawler": self.source_id,
                     "event": "circuit_breaker_open",
@@ -284,17 +287,16 @@ class CrawlerBase(ABC):
         _record_fetch(self.source_id, elapsed, success=False)
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Interfejsy Cyklu Życia (Async Context Managers)
     # ------------------------------------------------------------------
-
     @property
     def is_paused(self) -> bool:
-        """True when circuit breaker is open (read-only, safe to call any time)."""
+        """Stan Circuit Breakera (Tryb Read-Only)."""
         return self._paused_until is not None and datetime.now(timezone.utc) < self._paused_until
 
     async def aclose(self) -> None:
-        """Close the underlying HTTP client (call on shutdown)."""
-        await self._http.aclose()
+        """Uwaga: W wersji PRO nie zamykamy globalnego klienta z poziomu sub-crawlera."""
+        pass 
 
     def __repr__(self) -> str:
         status = "PAUSED" if self.is_paused else f"poll={self.poll_interval}s"
@@ -302,11 +304,10 @@ class CrawlerBase(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Prometheus shim — safe no-op if prometheus_client not installed or not wired
+# Integracja Prometheus (Zabezpieczony Shim)
 # ---------------------------------------------------------------------------
-
 def _record_fetch(source_id: str, elapsed: float, *, success: bool) -> None:
-    """Emit Prometheus metrics for a single crawl attempt. Never raises."""
+    """Nigdy nie wysadzi platformy w przypadku błędu monitoringu."""
     try:
         from api.monitoring import (
             _AVAILABLE,
