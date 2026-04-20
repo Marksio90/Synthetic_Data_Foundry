@@ -1,5 +1,5 @@
 """
-agents/crawlers/layer_e.py — Layer E: Multimedia & Archive crawlers (6 sources)
+agents/crawlers/layer_e.py — Layer E: Multimedia & Archive crawlers (6 sources) - ENTERPRISE EDITION
 
 Sources covered:
   1.  YouTubeCrawler         — YouTube Data API v3 (needs YOUTUBE_API_KEY)
@@ -9,11 +9,11 @@ Sources covered:
   5.  JSTORCrawler           — JSTOR Text Analyzer API + OpenAlex fallback
   6.  EuropeanaCrawler       — Europeana REST API v2 (needs EUROPEANA_API_KEY)
 
-All classes inherit CrawlerBase for circuit breaker, backoff, ETag caching.
-
-Public API:
-    sources = await run_layer_e("CSRD sustainability conference talks")
-    sources = await run_layer_e("AI governance", enabled=["youtube", "ted", "archive"])
+Ulepszenia PRO:
+  - Bounded Concurrency (Semaphore): Limitowanie równoległych żądań do chronionych i płatnych API (np. YouTube API, Podcast Index).
+  - Global Layer Timeout: Ochrona przed długotrwałymi zawieszeniami serwerów zewnętrznych (np. powolne odpowiedzi od Internet Archive).
+  - Safe Payload Parsing: Zaawansowana obrona przed niepoprawnym parsowaniem ładunków (Invalid JSON Payload Protection).
+  - Exception Unpacking: Diagnostyczne logowanie wyizolowanych wyjątków z mechanizmu asyncio.gather.
 """
 
 from __future__ import annotations
@@ -25,13 +25,13 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Set, Any
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
 from agents.topic_scout import ScoutSource, _get_source_tier
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.layer_e")
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -49,7 +49,6 @@ _DATE_FMTS = (
     "%Y",
 )
 
-
 def _to_iso(date_str: str) -> str:
     if not date_str:
         return ""
@@ -63,24 +62,19 @@ def _to_iso(date_str: str) -> str:
             continue
     return date_str
 
-
 def _days_ago(n: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
-
 
 def _rss_text(item: ET.Element, tag: str) -> str:
     el = item.find(tag)
     return (el.text or "").strip() if el is not None else ""
 
-
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _AT = f"{{{_ATOM_NS}}}"
-
 
 def _atom_text(el: Optional[ET.Element], tag: str) -> str:
     child = el.find(f"{_AT}{tag}") if el is not None else None
     return (child.text or "").strip() if child is not None else ""
-
 
 def _atom_link(el: ET.Element) -> str:
     for link in el.findall(f"{_AT}link"):
@@ -93,7 +87,6 @@ def _atom_link(el: ET.Element) -> str:
 # ===========================================================================
 # 1. YouTubeCrawler
 # ===========================================================================
-
 
 class YouTubeCrawler(CrawlerBase):
     """
@@ -126,8 +119,14 @@ class YouTubeCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        for item in resp.json().get("items", []):
+        for item in data.get("items", []):
             vid_id = item.get("id", {}).get("videoId", "")
             if not vid_id:
                 continue
@@ -191,8 +190,14 @@ class PodcastIndexCrawler(CrawlerBase):
         )
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        for feed in resp.json().get("feeds", []):
+        for feed in data.get("feeds", []):
             link = feed.get("url") or feed.get("link", "")
             if not link:
                 continue
@@ -214,7 +219,6 @@ class PodcastIndexCrawler(CrawlerBase):
 # ===========================================================================
 # 3. TEDCrawler
 # ===========================================================================
-
 
 class TEDCrawler(CrawlerBase):
     """TED talks — RSS feeds for Science, Technology, Business, Global issues."""
@@ -295,7 +299,6 @@ class TEDCrawler(CrawlerBase):
 # 4. InternetArchiveCrawler
 # ===========================================================================
 
-
 class InternetArchiveCrawler(CrawlerBase):
     """
     Internet Archive full-text search — texts, audio, video, software.
@@ -316,9 +319,15 @@ class InternetArchiveCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
         try:
-            docs = resp.json().get("response", {}).get("docs", [])
+            docs = data.get("response", {}).get("docs", [])
             for doc in docs:
                 ident = doc.get("identifier", "")
                 if not ident:
@@ -355,7 +364,6 @@ class InternetArchiveCrawler(CrawlerBase):
 # ===========================================================================
 # 5. JSTORCrawler
 # ===========================================================================
-
 
 class JSTORCrawler(CrawlerBase):
     """
@@ -410,7 +418,13 @@ class JSTORCrawler(CrawlerBase):
         resp2 = await self._fetch(url2, use_cache_headers=False)
         if resp2.status_code != 200:
             return []
-        for work in resp2.json().get("results", []):
+            
+        try:
+            data = resp2.json()
+        except ValueError:
+            return []
+            
+        for work in data.get("results", []):
             oa = work.get("open_access") or {}
             link = oa.get("oa_url") or ""
             if not link:
@@ -432,7 +446,6 @@ class JSTORCrawler(CrawlerBase):
 # ===========================================================================
 # 6. EuropeanaCrawler
 # ===========================================================================
-
 
 class EuropeanaCrawler(CrawlerBase):
     """
@@ -459,9 +472,15 @@ class EuropeanaCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
         try:
-            for item in resp.json().get("items", []):
+            for item in data.get("items", []):
                 guid = item.get("guid") or ""
                 link = (
                     item.get("edmIsShownAt", [None])[0]
@@ -494,7 +513,7 @@ class EuropeanaCrawler(CrawlerBase):
 
 
 # ===========================================================================
-# Registry + public entry-point
+# Registry + Public Entry-Point (Enterprise Edition)
 # ===========================================================================
 
 _CRAWLERS: dict[str, CrawlerBase] = {
@@ -510,6 +529,16 @@ _CRAWLERS: dict[str, CrawlerBase] = {
 }
 
 
+async def _run_single_crawler_safe(crawler: CrawlerBase, query: str, semaphore: asyncio.Semaphore) -> List[ScoutSource]:
+    """Wraper wykonujący zapytanie chronione Semaforem z bezbłędnym przechwyceniem awarii."""
+    async with semaphore:
+        try:
+            return await crawler.safe_crawl(query)
+        except Exception as exc:
+            logger.error(f"[Layer E] Fatal exception in crawler {crawler.source_id}: {exc}", exc_info=True)
+            return []
+
+
 async def run_layer_e(
     query: str,
     enabled: Optional[list[str]] = None,
@@ -517,6 +546,7 @@ async def run_layer_e(
     """
     Run all (or a subset of) Layer E crawlers in parallel.
     Returns deduplicated ScoutSource list.
+    Zabezpieczone przez Bounded Concurrency (Semaphore) i Global Timeout.
     """
     from config.settings import settings
     active = enabled
@@ -531,20 +561,40 @@ async def run_layer_e(
     if not crawlers:
         return []
 
-    results = await asyncio.gather(
-        *[c.safe_crawl(query) for c in crawlers],
-        return_exceptions=True,
-    )
+    # Limitujemy współbieżność, istotne dla API limitowanych kwotowo (YouTube, PodcastIndex)
+    concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+
+    # Globalny limit czasu dla całej warstwy chroniący przed wolnymi serwerami archiwalnymi
+    layer_timeout = getattr(settings, "layer_e_timeout_seconds", 60.0)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=layer_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[Layer E] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
+        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
-    for batch in results:
+    
+    # Dekompozycja wyników i jawne logowanie ewentualnych błędów
+    for idx, batch in enumerate(results):
+        if isinstance(batch, Exception):
+            logger.error(f"[Layer E] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            continue
         if not isinstance(batch, list):
             continue
+            
         for src in batch:
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+                
     return sources
 
 
