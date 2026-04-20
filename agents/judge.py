@@ -1,24 +1,14 @@
 """
-agents/judge.py — Agent Sędzia (Wielowymiarowy Weryfikator Jakości)
+agents/judge.py — Wieloagentowy System Ewaluacji Jakości (Sędzia) - ENTERPRISE EDITION
 
 LangGraph node: judge_answer(state) → partial state update
 
-Wielowymiarowa ocena (Gods Finger v2):
-  - grounding_score:    czy odpowiedź wynika z kontekstu? (0-1)
-  - citation_score:     czy artykuły/ustępy są cytowane? (0-1)
-  - completeness_score: czy odpowiedź wyczerpuje pytanie? (0-1)
-  - language_score:     jakość języka polskiego? (0-1)
-  - hallucination_flag: czy wykryto fakty spoza kontekstu? (bool)
-  - overall_score:      ważona średnia (finalna ocena)
-  - confidence:         pewność sędziego (→ eskalacja do gpt-4o)
-
-Cascade logic:
-  1. gpt-4o-mini (fast + cheap, ~95% przypadków)
-  2. gpt-4o (gdy confidence < judge_confidence_threshold, ~5% przypadków)
-
-Adversarial fast-path:
-  - is_adversarial + refusal → score=1.0 (reguła, bez API call)
-  - is_adversarial + answer  → score=0.0 (hallucynacja)
+Ten plik implementuje zaawansowaną logikę oceny LLM-as-a-Judge z wykorzystaniem:
+1. Pydantic Structured Outputs (Gwarancja formatu JSON Schema).
+2. Pydantic Validators (Wymuszanie logiki biznesowej, np. kary za halucynacje).
+3. Tiktoken Context Management (Precyzyjne zarządzanie oknem kontekstowym).
+4. Token Economics (Dokładne wyliczanie kosztów per próbka w centach).
+5. Advanced Fallback Cascade (Przejście na GPT-4o przy niskiej pewności z użyciem Deep Think).
 """
 
 from __future__ import annotations
@@ -26,23 +16,107 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Dict, Any, Tuple, Optional
 
 import openai
+import tiktoken
+from pydantic import BaseModel, Field, model_validator
 from tenacity import (
     before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
-    wait_exponential,
+    wait_random_exponential,
 )
 
 from config.settings import settings
 from pipeline.state import FoundryState
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.judge")
 
-_REFUSAL_PHRASE = "Brak danych w dyrektywie"
+# ---------------------------------------------------------------------------
+# Inicjalizacja Klienta i Optymalizacja Zapytań
+# ---------------------------------------------------------------------------
+# Globalny klient HTTP dla OpenAI - współdzielenie puli połączeń
+client = openai.OpenAI(api_key=settings.openai_api_key)
 
+# Ekonomia: Ceny za 1M tokenów (Input / Output) w USD na rok 2024/2025
+_COSTS_PER_1M = {
+    "gpt-4o-mini": (0.150, 0.600),
+    "gpt-4o": (5.00, 15.00),
+    "o1-mini": (3.00, 12.00),
+}
+
+
+# ---------------------------------------------------------------------------
+# Pydantic Schemas & Biznesowa Walidacja Wyników
+# ---------------------------------------------------------------------------
+class JudgeDetails(BaseModel):
+    """
+    Ścisła struktura odpowiedzi Sędziego. Wykorzystuje JSON Schema do wymuszenia 
+    formatu wyjściowego od API OpenAI.
+    """
+    grounding_score: float = Field(ge=0.0, le=1.0, description="Ocena ugruntowania odpowiedzi w kontekście źródłowym (1.0 = pełne pokrycie, 0.0 = brak).")
+    citation_score: float = Field(ge=0.0, le=1.0, description="Ocena dokładności cytowania numerów artykułów/ustępów w odpowiedzi.")
+    completeness_score: float = Field(ge=0.0, le=1.0, description="Miara wyczerpania wszystkich wątków zadanych w pytaniu.")
+    language_score: float = Field(ge=0.0, le=1.0, description="Ocena naturalności, profesjonalizmu i czytelności języka polskiego.")
+    has_hallucination: bool = Field(description="Flaga krytyczna: Czy wykryto zmyślenia, fakty spoza dyrektywy lub błędne daty/kwoty?")
+    hallucination_detail: str = Field(description="Zwięzły opis zidentyfikowanej halucynacji lub słowo 'brak'.")
+    overall_score: float = Field(ge=0.0, le=1.0, description="Finalna ważona ocena matematyczna.")
+    reasoning: str = Field(description="Szczegółowe uzasadnienie werdyktu sędziowskiego (1-3 zdania po angielsku dla lepszego rozumowania LLM).")
+    confidence: float = Field(ge=0.0, le=1.0, description="Pewność modelu co do wystawionej oceny (używane do wyzwalania kaskady GPT-4o).")
+
+    @model_validator(mode='after')
+    def enforce_hallucination_penalty(self) -> 'JudgeDetails':
+        """
+        Walidator na poziomie Pythona. Model LLM może się 'pomylić' w matematyce,
+        ale Python nie wybacza. Jeśli model przyznał flagę halucynacji, ale 
+        zapomniał odjąć punktów - robimy to siłowo.
+        """
+        # Teoretyczna waga: (0.40 * grnd) + (0.25 * cite) + (0.20 * comp) + (0.15 * lang)
+        calculated_score = (
+            (0.40 * self.grounding_score) +
+            (0.25 * self.citation_score) +
+            (0.20 * self.completeness_score) +
+            (0.15 * self.language_score)
+        )
+        
+        if self.has_hallucination:
+            # Bezwzględna kara za halucynację
+            self.overall_score = min(calculated_score - 0.3, 0.3)
+            logger.debug(f"Pydantic Validator: Aplikacja kary za halucynację. Score obniżony do {self.overall_score:.2f}")
+        else:
+            # Wygładzenie ewentualnych błędów zaokrągleń modelu
+            self.overall_score = min(max(calculated_score, 0.0), 1.0)
+            
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Zarządzanie Kontekstem (Tiktoken Token Window Manager)
+# ---------------------------------------------------------------------------
+def _truncate_context_by_tokens(context: str, max_tokens: int = 8000, model: str = "gpt-4o-mini") -> str:
+    """
+    Używa oficjalnego enkodera OpenAI, aby matematycznie idealnie przyciąć 
+    kontekst dyrektywy, zapobiegając błędom 'context_length_exceeded'.
+    """
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("o200k_base") # Domyślny enkoder dla o1 i gpt-4o
+
+    tokens = encoding.encode(context)
+    if len(tokens) <= max_tokens:
+        return context
+
+    logger.warning(f"Zbyt długi kontekst ({len(tokens)} tokenów). Przycinam precyzyjnie do {max_tokens} tokenów.")
+    truncated_tokens = tokens[:max_tokens]
+    return encoding.decode(truncated_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Prompty i Analiza Tekstu
+# ---------------------------------------------------------------------------
 _REFUSAL_VARIANTS = (
     "brak danych w dyrektywie",
     "brak informacji w dyrektywie",
@@ -51,94 +125,57 @@ _REFUSAL_VARIANTS = (
     "brak danych w tekście",
 )
 
-
 def _is_refusal(text: str) -> bool:
     lower = text.lower().strip()
     return any(v in lower for v in _REFUSAL_VARIANTS)
 
-
 _REASONING_RE = re.compile(r"<reasoning>.*?</reasoning>\s*", re.DOTALL | re.IGNORECASE)
-
 
 def _strip_reasoning(text: str) -> str:
     return _REASONING_RE.sub("", text).strip()
 
+_JUDGE_SYSTEM = """Jesteś rygorystycznym audytorem jakości syntetycznych zestawów danych prawnych (ESG).
+Twoim zadaniem jest bezwzględna ocena odpowiedzi asystenta AI na podstawie twardego kontekstu z dyrektyw UE.
 
-# ---------------------------------------------------------------------------
-# Wielowymiarowy system prompt sędziego
-# ---------------------------------------------------------------------------
+KRYTERIA PUNKTACJI (Użyj pełnej skali 0.0 do 1.0 dla każdego):
+1. UGRUNTOWANIE: 1.0 = 100% twierdzeń ma pokrycie w tekście. 0.0 = totalne zmyślenie.
+2. CYTOWANIE: 1.0 = idealnie przywołane jednostki (art., ust.). 0.0 = brak przypisów prawnych.
+3. KOMPLETNOŚĆ: 1.0 = wyczerpano pytania. 0.5 = brakuje istotnego wątku.
+4. JĘZYK: 1.0 = styl prawniczy/korporacyjny, doskonała polszczyzna.
 
-_JUDGE_SYSTEM = """Jesteś rygorystycznym audytorem jakości zestawów danych ESG.
+HALUCYNACJE (has_hallucination): 
+Zaznacz True TYLKO w przypadku, gdy model podaje konkretne zmyślone fakty (np. fałszywe progi finansowe, zmyślone daty wejścia w życie dyrektywy, których nie ma w tekście).
 
-Oceniasz parę (pytanie, odpowiedź) pod kątem 5 wymiarów:
-
-1. UGRUNTOWANIE (grounding_score 0-1):
-   Czy każde twierdzenie w odpowiedzi wynika z dostarczonego kontekstu?
-   1.0 = w pełni ugruntowana | 0.0 = wymyślona/poza kontekstem
-
-2. CYTOWANIE (citation_score 0-1):
-   Czy odpowiedź cytuje numery artykułów/ustępów jako podstawę prawną?
-   1.0 = każde twierdzenie z artykułem | 0.0 = brak cytowań
-
-3. KOMPLETNOŚĆ (completeness_score 0-1):
-   Czy odpowiedź adresuje wszystkie aspekty pytania?
-   1.0 = pełna | 0.5 = częściowa | 0.0 = nie odpowiada na pytanie
-
-4. JAKOŚĆ JĘZYKOWA (language_score 0-1):
-   Czy odpowiedź jest po polsku, profesjonalna, 2-8 zdań?
-   1.0 = wzorowa | 0.5 = akceptowalna | 0.0 = nieczytelna/nie po polsku
-
-5. HALUCYNACJA (has_hallucination bool):
-   Czy wykryłeś fakty/liczby/daty spoza kontekstu?
-   true = tak (naruszenie) | false = czysta odpowiedź
-
-Oblicz overall_score jako: 0.40*grounding + 0.25*citation + 0.20*completeness + 0.15*language
-Jeśli has_hallucination=true, odejmij 0.3 od overall_score (min 0.0).
-
-Odpowiedz WYŁĄCZNIE w formacie JSON (bez żadnego innego tekstu):
-{
-  "grounding_score": <0.0-1.0>,
-  "citation_score": <0.0-1.0>,
-  "completeness_score": <0.0-1.0>,
-  "language_score": <0.0-1.0>,
-  "has_hallucination": <true|false>,
-  "hallucination_detail": "<co konkretnie jest halucynacją lub 'none'>",
-  "overall_score": <0.0-1.0>,
-  "reasoning": "<1-2 zdania po angielsku — główne uzasadnienie>",
-  "confidence": <0.0-1.0>
-}
+Wypełnij precyzyjnie obiekt JSON. Wymagam bezstronnej i surowej oceny.
 """
 
-_JUDGE_USER_TEMPLATE = """KONTEKST DYREKTYWY:
+_JUDGE_USER_TEMPLATE = """[KONTEKST ZRODŁOWY - DYREKTYWY UE]
 {context}
 
-PYTANIE:
+[ZAPYTANIE UŻYTKOWNIKA]
 {question}
 
-ODPOWIEDŹ DO OCENY:
+[ODPOWIEDŹ ASYSTENTA DO OCENY]
 {answer}
-
-Oceń zgodnie z instrukcją systemową."""
+"""
 
 
 # ---------------------------------------------------------------------------
-# Retry decorator
+# System Odporności Sieciowej (Resilience & Retry)
 # ---------------------------------------------------------------------------
-
 def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, openai.RateLimitError):
+    if isinstance(exc, (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError)):
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
         return True
     return False
 
-
 def _retry_openai(func):
     return retry(
         reraise=True,
         retry=retry_if_exception(_is_retryable),
-        wait=wait_exponential(
-            multiplier=1,
+        wait=wait_random_exponential(
+            multiplier=1.5,
             min=settings.tenacity_initial_wait,
             max=settings.tenacity_max_wait,
         ),
@@ -147,187 +184,174 @@ def _retry_openai(func):
     )(func)
 
 
+# ---------------------------------------------------------------------------
+# Wykonanie API i Ekonomia (Koszty)
+# ---------------------------------------------------------------------------
 @_retry_openai
-def _call_judge_model(model: str, messages: list[dict]) -> str:
-    client = openai.OpenAI(api_key=settings.openai_api_key)
-    kwargs: dict = dict(model=model, messages=messages, temperature=0.0)
-    if "o1" in model:
-        kwargs["max_completion_tokens"] = 512
-    else:
-        kwargs["max_tokens"] = 512
-    response = client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content.strip()
-
-
-def _parse_judge_response(raw: str) -> dict:
-    cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+def _call_structured_judge(model: str, messages: list[dict], enforce_deep_think: bool = False) -> Tuple[JudgeDetails, float]:
+    """
+    Wywołuje API OpenAI wymuszając zwrot w Pydantic (Structured Outputs).
+    Oblicza precyzyjnie koszt wykorzystania tokenów.
+    """
+    # Tryb "Deep Think" dla eskalacji (GPT-4o z wyższą temperaturą by przełamać blokadę myślową)
+    temperature = 0.3 if enforce_deep_think else 0.0
+    
     try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group())
-            except json.JSONDecodeError:
-                logger.error("Failed to parse judge response: %s", raw[:200])
-                return _fallback_parse_result()
-        else:
-            logger.error("No JSON found in judge response: %s", raw[:200])
-            return _fallback_parse_result()
-    return data
+        response = client.beta.chat.completions.parse(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            response_format=JudgeDetails,
+            # Zabezpieczenie przed ucięciem wyjścia przez LLM
+            max_completion_tokens=1024,
+        )
+    except Exception as api_err:
+        # Przechwycenie LengthFinishReasonError i innych błędów parsowania OpenAI
+        logger.error(f"Structured Output API Error w modelu {model}: {api_err}")
+        raise
+
+    # Telemetria: Obliczanie kosztów zapytania
+    usage = response.usage
+    cost_cents = 0.0
+    if usage and model in _COSTS_PER_1M:
+        cost_in, cost_out = _COSTS_PER_1M[model]
+        cost_cents = ((usage.prompt_tokens / 1_000_000) * cost_in * 100) + \
+                     ((usage.completion_tokens / 1_000_000) * cost_out * 100)
+
+    parsed_result = response.choices[0].message.parsed
+    if not parsed_result:
+        raise ValueError("Model odmówił wygenerowania struktury JSON (Refusal przy użyciu Structured Outputs).")
+        
+    return parsed_result, cost_cents
 
 
-def _fallback_parse_result() -> dict:
-    return {
-        "grounding_score": 0.0,
-        "citation_score": 0.0,
-        "completeness_score": 0.0,
-        "language_score": 0.0,
-        "has_hallucination": True,
-        "hallucination_detail": "parse error",
-        "overall_score": 0.0,
-        "reasoning": "parse error",
-        "confidence": 0.0,
-    }
+def _fallback_parse_result(reasoning: str) -> JudgeDetails:
+    """Tworzy awaryjny, pusty obiekt w przypadku absolutnej klęski API, zapobiegając usterce całego grafu."""
+    return JudgeDetails(
+        grounding_score=0.0, citation_score=0.0, completeness_score=0.0,
+        language_score=0.0, has_hallucination=True, hallucination_detail="FATAL API ERROR",
+        overall_score=0.0, reasoning=f"System Fallback: {reasoning}", confidence=0.0
+    )
 
 
-def _safe_score(raw_score: object) -> float:
-    try:
-        s = float(raw_score)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, s))
-
-
+# ---------------------------------------------------------------------------
+# Główny Węzeł Orkiestratora LangGraph
+# ---------------------------------------------------------------------------
 _MIN_ANSWER_CHARS = 30
 
-
-def _build_messages(state: FoundryState) -> list[dict]:
-    context_parts = state.get("retrieved_context", [state["chunk"]["content"]])
-    context_raw = "\n---\n".join(context_parts)
-    if len(context_raw) > 8000:
-        logger.warning("Judge context TRUNCATED from %d to 8000 chars", len(context_raw))
-        context_raw = context_raw[:8000]
-    answer_for_eval = _strip_reasoning(state["answer"])
-    user_content = _JUDGE_USER_TEMPLATE.format(
-        context=context_raw,
-        question=state["question"],
-        answer=answer_for_eval,
-    )
-    return [
-        {"role": "system", "content": _JUDGE_SYSTEM},
-        {"role": "user", "content": user_content},
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Public node
-# ---------------------------------------------------------------------------
-
-def judge_answer(state: FoundryState) -> dict:
+def judge_answer(state: FoundryState) -> Dict[str, Any]:
     """
-    LangGraph node.
-    Returns {
-      "quality_score": float,
-      "judge_model": str,
-      "judge_reasoning": str,
-      "judge_details": dict  ← nowe: grounding/citation/completeness/language/hallucination
-    }
+    Główny punkt wejścia LangGraph.
+    Ocenia odpowiedź przy użyciu modeli AI, wdrażając ścieżki Fast-Path dla prostych zapytań 
+    oraz głęboką analizę (kaskadę) dla skomplikowanych zagadnień prawnych.
     """
     is_adversarial = state.get("is_adversarial", False)
     answer = state.get("answer", "")
     answer_eval = _strip_reasoning(answer)
+    chunk_id_short = state.get("chunk", {}).get("id", "UNKNOWN")[:8]
+    turn_count = state.get("turn_count", 0)
 
-    # Fast-path: trivially short non-adversarial answers
+    # =========================================================
+    # FAZA 1: FILTRY ZASADOWE (RULE-BASED FAST-PATHS)
+    # =========================================================
+    
     if not is_adversarial and len(answer_eval) < _MIN_ANSWER_CHARS:
-        logger.warning("Answer too short (%d chars) — rejecting", len(answer_eval))
+        logger.warning(f"[JUDGE:{chunk_id_short}] Odpowiedź za krótka ({len(answer_eval)} znaków). Fast-Reject.")
         return {
             "quality_score": 0.0,
-            "judge_model": "rule-based",
-            "judge_reasoning": f"Answer too short ({len(answer_eval)} chars < {_MIN_ANSWER_CHARS}).",
-            "judge_details": {},
+            "judge_model": "rule-based-fastpath",
+            "judge_reasoning": f"Niewystarczająca długość odpowiedzi ({len(answer_eval)} znaków < wymaganych {_MIN_ANSWER_CHARS}).",
+            "judge_details": {"fast_path": True, "reason": "too_short"},
         }
 
-    # Fast-path: adversarial samples
     if is_adversarial:
         if _is_refusal(answer_eval):
-            logger.debug("Adversarial: correct refusal → score=1.0")
+            logger.debug(f"[JUDGE:{chunk_id_short}] Adversarial Prawidłowo Zablokowany -> score 1.0")
             return {
                 "quality_score": 1.0,
-                "judge_model": "rule-based",
-                "judge_reasoning": "Correct refusal for adversarial question.",
+                "judge_model": "rule-based-adversarial",
+                "judge_reasoning": "Model poprawnie zastosował odmowę ('Brak danych w dyrektywie') dla zapytania adwersaryjnego.",
                 "judge_details": {"adversarial": True, "refused": True},
             }
         else:
-            logger.warning("Adversarial: answered instead of refused → score=0.0 (hallucination)")
+            logger.warning(f"[JUDGE:{chunk_id_short}] Adversarial ZŁAMANY (Halucynacja na pułapce) -> score 0.0")
             return {
                 "quality_score": 0.0,
-                "judge_model": "rule-based",
-                "judge_reasoning": "Adversarial question answered instead of refused — hallucination.",
-                "judge_details": {"adversarial": True, "refused": False},
+                "judge_model": "rule-based-adversarial",
+                "judge_reasoning": "Model złamał wytyczne i udzielił odpowiedzi na pytanie celowo wprowadzające w błąd.",
+                "judge_details": {"adversarial": True, "refused": False, "has_hallucination": True},
             }
 
-    # Normal path: wywołaj gpt-4o-mini z wielowymiarowym promptem
-    messages = _build_messages(state)
-    try:
-        raw = _call_judge_model(settings.openai_primary_model, messages)
-        result = _parse_judge_response(raw)
-        score: float = _safe_score(result.get("overall_score", 0.0))
-        confidence: float = _safe_score(result.get("confidence", 1.0))
-        judge_model = settings.openai_primary_model
+    # =========================================================
+    # FAZA 2: PRZYGOTOWANIE KONTEKSTU (TIKTOKEN OPTIMIZATION)
+    # =========================================================
+    context_parts = state.get("retrieved_context", [state.get("chunk", {}).get("content", "")])
+    raw_context = "\n---\n".join(context_parts)
+    
+    # Ucinanie Tokenowe, a nie znakowe! Gwarancja braku błędu przepełnienia
+    safe_context = _truncate_context_by_tokens(raw_context, max_tokens=10000, model=settings.openai_primary_model)
 
-        # Cascade: eskaluj gdy pewność sędziego niska
-        if confidence < settings.judge_confidence_threshold:
+    messages = [
+        {"role": "system", "content": _JUDGE_SYSTEM},
+        {"role": "user", "content": _JUDGE_USER_TEMPLATE.format(
+            context=safe_context, question=state.get("question", ""), answer=answer_eval
+        )},
+    ]
+
+    # =========================================================
+    # FAZA 3: INTELIGENTNA EWALUACJA (LLM CASCADE)
+    # =========================================================
+    total_cost_cents = 0.0
+    judge_model = settings.openai_primary_model
+    
+    try:
+        # Krok 1: Próba tanim modelem (gpt-4o-mini)
+        result_obj, cost = _call_structured_judge(judge_model, messages)
+        total_cost_cents += cost
+
+        # Krok 2: Kaskada w przypadku niskiej pewności Sędziego
+        if result_obj.confidence < settings.judge_confidence_threshold:
+            fallback_model = settings.openai_fallback_model
             logger.info(
-                "Judge confidence %.2f < %.2f — escalating to %s",
-                confidence, settings.judge_confidence_threshold, settings.openai_fallback_model,
+                f"[JUDGE:{chunk_id_short}] Sędzia {judge_model} niepewny (Confidence: {result_obj.confidence:.2f}). "
+                f"Wyzwalam kaskadę Deep Think na model {fallback_model}."
             )
             try:
-                raw2 = _call_judge_model(settings.openai_fallback_model, messages)
-                result = _parse_judge_response(raw2)
-                score = _safe_score(result.get("overall_score", 0.0))
-                judge_model = settings.openai_fallback_model
+                # Wymuszamy głębsze myślenie (temperature 0.3) przy re-ewaluacji
+                result_obj_fallback, cost_fallback = _call_structured_judge(fallback_model, messages, enforce_deep_think=True)
+                total_cost_cents += cost_fallback
+                
+                # Tylko jeśli nowy Sędzia jest pewniejszy, nadpisujemy wynik
+                if result_obj_fallback.confidence >= result_obj.confidence:
+                    result_obj = result_obj_fallback
+                    judge_model = fallback_model
+                else:
+                    logger.debug(f"[JUDGE:{chunk_id_short}] Fallback był jeszcze mniej pewny. Zostaję przy pierwszej ocenie.")
+                    
             except Exception as cascade_exc:
-                logger.warning(
-                    "Fallback judge (%s) failed: %s — keeping primary result",
-                    settings.openai_fallback_model, cascade_exc,
-                )
+                logger.warning(f"[JUDGE:{chunk_id_short}] Błąd Kaskady Fallback ({fallback_model}): {cascade_exc}. Użyto oceny pierwotnej.")
 
     except Exception as exc:
-        logger.error("Judge failed for chunk %s: %s", state["chunk"]["id"], exc)
-        score = 0.0
-        result = _fallback_parse_result()
-        result["reasoning"] = str(exc)
-        judge_model = "error"
+        logger.error(f"[JUDGE:{chunk_id_short}] ZAWALENIE SYSTEMU SĘDZIOWSKIEGO: {exc}", exc_info=True)
+        result_obj = _fallback_parse_result(reasoning=str(exc))
+        judge_model = "FATAL_ERROR"
 
-    # Structured log z wszystkimi wymiarami
+    # =========================================================
+    # FAZA 4: TELEMETRIA I AKTUALIZACJA STANU
+    # =========================================================
+    judge_details_dict = result_obj.model_dump()
+    judge_details_dict["eval_cost_cents"] = round(total_cost_cents, 4)
+
     logger.info(
-        "JUDGE chunk=%s turn=%d perspective=%s model=%s "
-        "score=%.3f grnd=%.2f cite=%.2f comp=%.2f lang=%.2f halluc=%s",
-        state["chunk"]["id"][:8],
-        state.get("turn_count", 0),
-        state.get("perspective", "?"),
-        judge_model,
-        score,
-        _safe_score(result.get("grounding_score", 0)),
-        _safe_score(result.get("citation_score", 0)),
-        _safe_score(result.get("completeness_score", 0)),
-        _safe_score(result.get("language_score", 0)),
-        result.get("has_hallucination", False),
+        f"⚖️ [VERDICT] {chunk_id_short} | Turn:{turn_count} | Mdl:{judge_model} | "
+        f"Score:{result_obj.overall_score:.2f} (G:{result_obj.grounding_score:.2f}, "
+        f"C:{result_obj.citation_score:.2f}, L:{result_obj.language_score:.2f}) | "
+        f"Koszt: {total_cost_cents:.4f}¢ | Halluc:{result_obj.has_hallucination}"
     )
 
-    judge_details = {
-        "grounding_score": _safe_score(result.get("grounding_score", 0)),
-        "citation_score": _safe_score(result.get("citation_score", 0)),
-        "completeness_score": _safe_score(result.get("completeness_score", 0)),
-        "language_score": _safe_score(result.get("language_score", 0)),
-        "has_hallucination": bool(result.get("has_hallucination", False)),
-        "hallucination_detail": result.get("hallucination_detail", ""),
-    }
-
     return {
-        "quality_score": score,
+        "quality_score": result_obj.overall_score,
         "judge_model": judge_model,
-        "judge_reasoning": result.get("reasoning", ""),
-        "judge_details": judge_details,
+        "judge_reasoning": result_obj.reasoning,
+        "judge_details": judge_details_dict,
     }
