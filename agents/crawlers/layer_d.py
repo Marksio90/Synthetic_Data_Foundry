@@ -1,5 +1,5 @@
 """
-agents/crawlers/layer_d.py — Layer D: Tech & Social Signal crawlers (6 sources)
+agents/crawlers/layer_d.py — Layer D: Tech & Social Signal crawlers (6 sources) - ENTERPRISE EDITION
 
 Sources covered:
   1.  GitHubSearchCrawler   — GitHub Search API (repos, releases; 60 req/h no key)
@@ -9,11 +9,11 @@ Sources covered:
   5.  PapersWithCodeCrawler — Papers With Code REST API (ML + code, no key)
   6.  MastodonCrawler       — Mastodon v2 search API (mastodon.social + sigmoid.social)
 
-All classes inherit CrawlerBase for circuit breaker, backoff, ETag caching.
-
-Public API:
-    sources = await run_layer_d("EU AI Act compliance")
-    sources = await run_layer_d("ESG", enabled=["github", "reddit", "paperswithcode"])
+Ulepszenia PRO:
+  - Bounded Concurrency (Semaphore): Limitowanie równoległych żądań do delikatnych i ściśle limitowanych API społecznościowych.
+  - Global Layer Timeout: Ochrona przed tzw. "zombie connections" od sfederowanych instancji Mastodona.
+  - Exception Unpacking: Jawne logowanie wyjątków w operacjach wsadowych (asyncio.gather).
+  - Safe Payload Parsing: Ochrona przed nieprawidłowymi zwrotami JSON przy obciążeniu API (np. Reddit Overload).
 """
 
 from __future__ import annotations
@@ -22,13 +22,13 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Set, Any
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
 from agents.topic_scout import ScoutSource, _get_source_tier
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.layer_d")
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -43,7 +43,6 @@ _DATE_FMTS = (
     "%a, %d %b %Y %H:%M:%S GMT",
 )
 
-
 def _to_iso(date_str: str) -> str:
     if not date_str:
         return ""
@@ -57,10 +56,8 @@ def _to_iso(date_str: str) -> str:
             continue
     return date_str
 
-
 def _days_ago(n: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
-
 
 def _unix_to_iso(ts: int | float | str) -> str:
     try:
@@ -68,7 +65,6 @@ def _unix_to_iso(ts: int | float | str) -> str:
         return dt.isoformat()
     except Exception:
         return ""
-
 
 def _rss_text(item: ET.Element, tag: str) -> str:
     el = item.find(tag)
@@ -78,7 +74,6 @@ def _rss_text(item: ET.Element, tag: str) -> str:
 # ===========================================================================
 # 1. GitHubSearchCrawler
 # ===========================================================================
-
 
 class GitHubSearchCrawler(CrawlerBase):
     """
@@ -103,8 +98,14 @@ class GitHubSearchCrawler(CrawlerBase):
         )
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        for repo in resp.json().get("items", []):
+        for repo in data.get("items", []):
             link = repo.get("html_url", "")
             if not link:
                 continue
@@ -132,7 +133,6 @@ _REDDIT_SUBS = [
     "govtech", "legaltech", "fintech", "datasciencenews",
 ]
 
-
 class RedditCrawler(CrawlerBase):
     """Reddit JSON search API — no auth required for read-only queries."""
 
@@ -152,8 +152,14 @@ class RedditCrawler(CrawlerBase):
         )
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        children = resp.json().get("data", {}).get("children", [])
+        children = data.get("data", {}).get("children", [])
         for child in children:
             post = child.get("data", {})
             url_post = post.get("url") or post.get("permalink", "")
@@ -179,7 +185,6 @@ class RedditCrawler(CrawlerBase):
 
 _SE_SITES = ["stackoverflow", "datascience", "ai", "law", "economics"]
 
-
 class StackExchangeCrawler(CrawlerBase):
     """Stack Exchange API v2.3 — high-voted questions across relevant sites."""
 
@@ -201,8 +206,10 @@ class StackExchangeCrawler(CrawlerBase):
             resp = await self._fetch(url, use_cache_headers=False)
             if resp.status_code != 200:
                 continue
+                
             try:
-                items = resp.json().get("items", [])
+                data = resp.json()
+                items = data.get("items", [])
                 for item in items:
                     link = item.get("link", "")
                     if not link or link in seen:
@@ -226,7 +233,6 @@ class StackExchangeCrawler(CrawlerBase):
 # ===========================================================================
 # 4. ProductHuntCrawler
 # ===========================================================================
-
 
 class ProductHuntCrawler(CrawlerBase):
     """Product Hunt — new products/tools via public RSS and GraphQL API."""
@@ -262,9 +268,9 @@ class ProductHuntCrawler(CrawlerBase):
                     use_cache_headers=False,
                 )
                 if resp.status_code == 200:
+                    data = resp.json()
                     edges = (
-                        resp.json()
-                        .get("data", {})
+                        data.get("data", {})
                         .get("posts", {})
                         .get("edges", [])
                     )
@@ -323,7 +329,6 @@ class ProductHuntCrawler(CrawlerBase):
 # 5. PapersWithCodeCrawler
 # ===========================================================================
 
-
 class PapersWithCodeCrawler(CrawlerBase):
     """Papers With Code REST API — ML papers + GitHub repos. No key needed."""
 
@@ -338,8 +343,14 @@ class PapersWithCodeCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
-        for paper in resp.json().get("results", []):
+        for paper in data.get("results", []):
             # Prefer arxiv URL, then paper URL
             link = paper.get("arxiv_id", "")
             if link:
@@ -370,7 +381,6 @@ _MASTODON_INSTANCES = [
     "scholar.social",       # academics & researchers
 ]
 
-
 class MastodonCrawler(CrawlerBase):
     """Mastodon API v2 search — academic and tech federated social signals."""
 
@@ -390,7 +400,10 @@ class MastodonCrawler(CrawlerBase):
                 resp = await self._fetch(url, use_cache_headers=False)
                 if resp.status_code != 200:
                     continue
-                statuses = resp.json().get("statuses", [])
+                    
+                data = resp.json()
+                statuses = data.get("statuses", [])
+                
                 for st in statuses:
                     link = st.get("url", "")
                     if not link or link in seen:
@@ -420,7 +433,7 @@ class MastodonCrawler(CrawlerBase):
 
 
 # ===========================================================================
-# Registry + public entry-point
+# Registry + Public Entry-Point (Enterprise Edition)
 # ===========================================================================
 
 _CRAWLERS: dict[str, CrawlerBase] = {
@@ -436,6 +449,16 @@ _CRAWLERS: dict[str, CrawlerBase] = {
 }
 
 
+async def _run_single_crawler_safe(crawler: CrawlerBase, query: str, semaphore: asyncio.Semaphore) -> List[ScoutSource]:
+    """Wraper wykonujący zapytanie chronione Semaforem z bezbłędnym przechwyceniem awarii."""
+    async with semaphore:
+        try:
+            return await crawler.safe_crawl(query)
+        except Exception as exc:
+            logger.error(f"[Layer D] Fatal exception in crawler {crawler.source_id}: {exc}", exc_info=True)
+            return []
+
+
 async def run_layer_d(
     query: str,
     enabled: Optional[list[str]] = None,
@@ -443,6 +466,7 @@ async def run_layer_d(
     """
     Run all (or a subset of) Layer D crawlers in parallel.
     Returns deduplicated ScoutSource list.
+    Zabezpieczone przez Bounded Concurrency (Semaphore) i Global Timeout.
     """
     from config.settings import settings
     active = enabled
@@ -457,20 +481,40 @@ async def run_layer_d(
     if not crawlers:
         return []
 
-    results = await asyncio.gather(
-        *[c.safe_crawl(query) for c in crawlers],
-        return_exceptions=True,
-    )
+    # Limitujemy współbieżność (kluczowe przy API społecznościowych)
+    concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+
+    # Globalny limit czasu dla całej warstwy
+    layer_timeout = getattr(settings, "layer_d_timeout_seconds", 60.0)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=layer_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[Layer D] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
+        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
-    for batch in results:
+    
+    # Dekompozycja wyników
+    for idx, batch in enumerate(results):
+        if isinstance(batch, Exception):
+            logger.error(f"[Layer D] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            continue
         if not isinstance(batch, list):
             continue
+            
         for src in batch:
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+                
     return sources
 
 
