@@ -290,18 +290,20 @@ def get_all_sources() -> dict:
     try:
         from api.monitoring import scout_sources_active
         for c in crawlers:
-            is_active = c.get("status") not in ("paused", "error", "circuit_open")
-            scout_sources_active.labels(source=c.get("name", "unknown")).set(1 if is_active else 0)
+            is_active = not c.get("is_paused", False) and c.get("consecutive_errors", 0) < 5
+            scout_sources_active.labels(source=c.get("source_id", "unknown")).set(1 if is_active else 0)
     except Exception:
         pass
 
     sub = WebSubSubscriber.instance()
+    active_count = sum(
+        1 for c in crawlers
+        if not c.get("is_paused", False) and c.get("consecutive_errors", 0) < 5
+    )
     return {
         "crawlers": crawlers,
         "total_crawlers": len(crawlers),
-        "active_crawlers": sum(
-            1 for c in crawlers if c.get("status") not in ("paused", "error", "circuit_open")
-        ),
+        "active_crawlers": active_count,
         "websub_subscriptions": sub.status(),
         "websub_stats": sub.stats(),
     }
@@ -458,9 +460,10 @@ async def live_stream(request: Request) -> StreamingResponse:
 
     async def _generator():
         try:
-            # Replay recent topics for new subscribers
+            # Replay recent topics for new subscribers, then signal end-of-replay
             for topic in scouts.latest_topics(limit=20):
                 yield f"data: {json.dumps({'event': 'topic', 'data': topic.to_dict()})}\n\n"
+            yield "data: {\"event\": \"replay_end\"}\n\n"
 
             # Stream live events
             while not await request.is_disconnected():
