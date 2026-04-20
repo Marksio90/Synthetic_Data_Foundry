@@ -58,6 +58,7 @@ class ReviewSummary:
     rejected: int
     approve_threshold: float
     review_threshold: float
+    priority_preview: list[str]
 
     @property
     def approval_rate(self) -> float:
@@ -148,6 +149,8 @@ def run_auto_review(
 
     approved_ids: list = []
     rejected_ids: list = []
+    queued_ids: list = []
+    queued_scores: dict = {}
     queued = 0
 
     for s in samples:
@@ -160,6 +163,8 @@ def run_auto_review(
             rejected_ids.append(s.id)
         else:
             queued += 1
+            queued_ids.append(s.id)
+            queued_scores[s.id] = float(s.quality_score or 0.0)
 
         logger.debug(
             "AutoReview [%s]: chunk=%s score=%.2f → %s",
@@ -188,6 +193,16 @@ def run_auto_review(
         rejected=len(rejected_ids),
         approve_threshold=approve_threshold,
         review_threshold=review_threshold,
+        priority_preview=[
+            str(sid)
+            for sid in sorted(
+                queued_ids,
+                key=lambda sid: abs(
+                    queued_scores.get(sid, 0.0)
+                    - ((approve_threshold + review_threshold) / 2.0)
+                ),
+            )[:20]
+        ],
     )
     summary.log()
     return summary

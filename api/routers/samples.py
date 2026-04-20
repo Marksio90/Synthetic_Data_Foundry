@@ -133,6 +133,7 @@ def auto_review(
         "queued": summary.queued,
         "rejected": summary.rejected,
         "approval_rate": round(summary.approval_rate, 3),
+        "priority_preview": summary.priority_preview,
     }
 
 
