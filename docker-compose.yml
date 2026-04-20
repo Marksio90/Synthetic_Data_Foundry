@@ -87,11 +87,17 @@ x-app-env: &app-env
   LLAMA_PARSE_API_KEY: ${LLAMA_PARSE_API_KEY:-}
   OUTPUT_FILE: /app/output/dataset_esg_v1.jsonl
   DPO_OUTPUT_FILE: /app/output/dataset_esg_v1_dpo.jsonl
+  ORPO_OUTPUT_FILE: /app/output/dataset_esg_v1_orpo.jsonl
+  KTO_OUTPUT_FILE: /app/output/dataset_esg_v1_kto.jsonl
   CLIENT_ID: ${CLIENT_ID:-dev_client}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
   TENACITY_MAX_ATTEMPTS: ${TENACITY_MAX_ATTEMPTS:-6}
   TENACITY_INITIAL_WAIT: ${TENACITY_INITIAL_WAIT:-2.0}
   TENACITY_MAX_WAIT: ${TENACITY_MAX_WAIT:-64.0}
+  REPLICATE_API_KEY: ${REPLICATE_API_KEY:-}
+  HF_TOKEN: ${HF_TOKEN:-}
+  HF_DATASET_REPO: ${HF_DATASET_REPO:-}
+  HF_MODEL_REPO: ${HF_MODEL_REPO:-}
 
 services:
 
@@ -202,10 +208,39 @@ services:
     restart: unless-stopped
     environment:
       <<: *app-env
-      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
       DATA_DIR: /app/data
       POSTGRES_USER: ${POSTGRES_USER:-esg_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Translation
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      TRANSLATE_CHUNKS: ${TRANSLATE_CHUNKS:-false}
+      TRANSLATE_SOURCE_LANG: ${TRANSLATE_SOURCE_LANG:-en}
+      # Gap Scout — core
+      SCOUT_SOURCES_ENABLED: ${SCOUT_SOURCES_ENABLED:-[]}
+      SCOUT_MIN_GAP_SCORE: ${SCOUT_MIN_GAP_SCORE:-0.35}
+      SCOUT_MODEL_TARGETS: ${SCOUT_MODEL_TARGETS:-["gpt-4o","claude-3.5-sonnet","llama-3","gemini-1.5","mistral"]}
+      SCOUT_LANGUAGES: ${SCOUT_LANGUAGES:-["en","de","fr","ja","zh","ko","ar","ru","pt","es"]}
+      SCOUT_MAX_CONCURRENT_CRAWLERS: ${SCOUT_MAX_CONCURRENT_CRAWLERS:-20}
+      SCOUT_VERIFICATION_MAX_CONCURRENT: ${SCOUT_VERIFICATION_MAX_CONCURRENT:-8}
+      # Gap Scout — cutoff dates
+      SCOUT_CUTOFF_GPT4O: ${SCOUT_CUTOFF_GPT4O:-2024-04-01}
+      SCOUT_CUTOFF_CLAUDE35: ${SCOUT_CUTOFF_CLAUDE35:-2024-04-01}
+      SCOUT_CUTOFF_LLAMA3: ${SCOUT_CUTOFF_LLAMA3:-2024-03-01}
+      SCOUT_CUTOFF_GEMINI15: ${SCOUT_CUTOFF_GEMINI15:-2024-02-01}
+      # Gap Scout — WebSub Tier 1 (optional)
+      SCOUT_WEBHOOK_CALLBACK_URL: ${SCOUT_WEBHOOK_CALLBACK_URL:-}
+      SCOUT_WEBHOOK_SECRET: ${SCOUT_WEBHOOK_SECRET:-}
+      # Gap Scout — external API keys (all optional)
+      SCOUT_DEEPL_API_KEY: ${SCOUT_DEEPL_API_KEY:-}
+      SCOUT_SERPAPI_KEY: ${SCOUT_SERPAPI_KEY:-}
+      SCOUT_WHISPER_MODEL: ${SCOUT_WHISPER_MODEL:-base}
+      IEEE_API_KEY: ${IEEE_API_KEY:-}
+      CORE_API_KEY: ${CORE_API_KEY:-}
+      PRODUCTHUNT_API_KEY: ${PRODUCTHUNT_API_KEY:-}
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+      PODCAST_INDEX_API_KEY: ${PODCAST_INDEX_API_KEY:-}
+      PODCAST_INDEX_API_SECRET: ${PODCAST_INDEX_API_SECRET:-}
+      EUROPEANA_API_KEY: ${EUROPEANA_API_KEY:-}
     ports:
       - "8080:8080"
     volumes:
