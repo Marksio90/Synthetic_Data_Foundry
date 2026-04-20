@@ -31,6 +31,7 @@ from tenacity import (
 from config.settings import settings
 from db import repository as repo
 from pipeline.state import FoundryState
+from utils.classifier import classify_question
 
 logger = logging.getLogger("foundry.agents.expert")
 
@@ -163,6 +164,26 @@ def _count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     except KeyError:
         enc = tiktoken.get_encoding("cl100k_base")
     return len(enc.encode(text))
+
+
+def _normalize_weights(vector_weight: float, bm25_weight: float) -> tuple[float, float]:
+    """
+    Normalizuje wagi hybrydowe do zakresu [0, 1] i sumy 1.0.
+    Zabezpiecza przed wartościami ujemnymi, NaN i zerową sumą.
+    """
+    try:
+        vw = max(0.0, float(vector_weight))
+    except (TypeError, ValueError):
+        vw = 0.0
+    try:
+        bw = max(0.0, float(bm25_weight))
+    except (TypeError, ValueError):
+        bw = 0.0
+
+    weight_sum = vw + bw
+    if weight_sum <= 0.0:
+        return 0.5, 0.5
+    return vw / weight_sum, bw / weight_sum
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +342,18 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
         top_k = max(3, top_k // 2)
 
     try:
+        vector_weight = settings.hybrid_vector_weight
+        bm25_weight = settings.hybrid_bm25_weight
+        question_type, _difficulty = classify_question(question)
+        if settings.adaptive_hybrid_weights:
+            if question_type in {"scope", "compliance"}:
+                bm25_weight = min(1.0, bm25_weight + settings.adaptive_weight_scope_bonus)
+            elif question_type in {"comparative", "process"}:
+                vector_weight = min(1.0, vector_weight + settings.adaptive_weight_comparative_bonus)
+
+        # Normalizacja do sumy = 1.0 (ochrona przed przekroczeniem wag)
+        vector_weight, bm25_weight = _normalize_weights(vector_weight, bm25_weight)
+
         query_embedding, emb_cost = _embed_query(question)
         chunks = repo.hybrid_search(
             session,
@@ -328,6 +361,8 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
             query_text=question,
             top_k=top_k,
             diversify_by_section=is_retry,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
         )
         
         # Wprowadzenie XML Tagging dla silniejszego trzymania kontekstu
@@ -337,7 +372,14 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
             context_texts.append(f"<document index=\"{idx}\" ref=\"{source_id}\">\n{c.content.strip()}\n</document>")
             
         context_ids = [str(c.id) for c in chunks]
-        logger.debug(f"[RAG] Pobrano {len(chunks)} fragmentów. Koszt wektoryzacji: {emb_cost:.4f}¢")
+        logger.debug(
+            "[RAG] Pobrano %d fragmentów. typ=%s vec_w=%.2f bm25_w=%.2f koszt_embed=%.4f¢",
+            len(chunks),
+            question_type,
+            vector_weight,
+            bm25_weight,
+            emb_cost,
+        )
         
     except Exception as exc:
         logger.error(f"RAG retrieval failed: {exc}", exc_info=True)

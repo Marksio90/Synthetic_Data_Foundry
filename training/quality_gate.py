@@ -81,6 +81,7 @@ def check_dataset(
     checks: list[GateCheck] = []
     warnings: list[str] = []
     path = Path(jsonl_path)
+    invalid_json_lines = 0
 
     if not path.exists():
         return GateResult(
@@ -98,9 +99,11 @@ def check_dataset(
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
-                pass
+                invalid_json_lines += 1
 
     n = len(records)
+    if invalid_json_lines:
+        warnings.append(f"Pominięto {invalid_json_lines} uszkodzonych linii JSONL")
 
     # Check 1: minimum records
     checks.append(GateCheck(
@@ -151,8 +154,19 @@ def check_dataset(
         if any(REFUSAL in m.get("content", "") for m in asst_msgs):
             refusal_count += 1
 
-    # Avg score check — approximate from refusal rate
-    # If we have scores in metadata use them; otherwise skip
+        # Score from metadata (preferowane do gate)
+        score = meta.get("quality_score")
+        if score is None:
+            score = meta.get("judge_score")
+        if isinstance(score, (int, float)):
+            scores.append(float(score))
+        elif isinstance(score, str):
+            try:
+                scores.append(float(score))
+            except ValueError:
+                pass
+
+    # Avg score check — use metadata quality score if available
     if scores:
         avg_score = statistics.mean(scores)
     else:
