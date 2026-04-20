@@ -165,6 +165,26 @@ def _count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     return len(enc.encode(text))
 
 
+def _normalize_weights(vector_weight: float, bm25_weight: float) -> tuple[float, float]:
+    """
+    Normalizuje wagi hybrydowe do zakresu [0, 1] i sumy 1.0.
+    Zabezpiecza przed wartościami ujemnymi, NaN i zerową sumą.
+    """
+    try:
+        vw = max(0.0, float(vector_weight))
+    except (TypeError, ValueError):
+        vw = 0.0
+    try:
+        bw = max(0.0, float(bm25_weight))
+    except (TypeError, ValueError):
+        bw = 0.0
+
+    weight_sum = vw + bw
+    if weight_sum <= 0.0:
+        return 0.5, 0.5
+    return vw / weight_sum, bw / weight_sum
+
+
 # ---------------------------------------------------------------------------
 # Odporność sieciowa (Resilience)
 # ---------------------------------------------------------------------------

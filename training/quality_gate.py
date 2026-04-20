@@ -81,6 +81,7 @@ def check_dataset(
     checks: list[GateCheck] = []
     warnings: list[str] = []
     path = Path(jsonl_path)
+    invalid_json_lines = 0
 
     if not path.exists():
         return GateResult(
@@ -98,9 +99,11 @@ def check_dataset(
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
-                pass
+                invalid_json_lines += 1
 
     n = len(records)
+    if invalid_json_lines:
+        warnings.append(f"Pominięto {invalid_json_lines} uszkodzonych linii JSONL")
 
     # Check 1: minimum records
     checks.append(GateCheck(

@@ -206,8 +206,8 @@ def hybrid_search(
         ),
         combined AS (
             SELECT COALESCE(v.id, f.id)                                      AS id,
-                   COALESCE(v.vec_score, 0) * {vec_w}
-                   + COALESCE(f.bm25_score, 0) * {bm25_w}                    AS score
+                   COALESCE(v.vec_score, 0) * :vec_w
+                   + COALESCE(f.bm25_score, 0) * :bm25_w                    AS score
             FROM   vec v
             FULL   OUTER JOIN fts f ON v.id = f.id
         )
@@ -220,7 +220,9 @@ def hybrid_search(
     ).bindparams(
         bindparam("emb", value=str(query_embedding)),
         bindparam("q", value=query_text),
-        bindparam("fetch_k", value=fetch_k)
+        bindparam("fetch_k", value=fetch_k),
+        bindparam("vec_w", value=vec_w),
+        bindparam("bm25_w", value=bm25_w),
     )
     
     rows = session.execute(sql).fetchall()

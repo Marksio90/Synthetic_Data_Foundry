@@ -119,6 +119,7 @@ def run_auto_review(
     batch_id: Optional[str] = None,
     approve_threshold: float = APPROVE_THRESHOLD,
     review_threshold: float = REVIEW_THRESHOLD,
+    priority_limit: int = 20,
     dry_run: bool = False,
 ) -> ReviewSummary:
     """
@@ -132,6 +133,7 @@ def run_auto_review(
         batch_id:          If set, only process samples from this batch.
         approve_threshold: Score above which samples are auto-approved.
         review_threshold:  Score below which samples are auto-rejected.
+        priority_limit:    Limit rekordów zwracanych w podglądzie kolejki review.
         dry_run:           If True, compute decisions without writing to DB.
 
     Returns:

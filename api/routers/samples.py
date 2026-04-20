@@ -113,6 +113,7 @@ def auto_review(
     batch_id: str | None = None,
     approve_threshold: float = 0.88,
     review_threshold: float = 0.70,
+    priority_limit: int = 20,
     session: Session = Depends(get_session),
 ) -> dict:
     """
@@ -126,6 +127,7 @@ def auto_review(
         batch_id=batch_id,
         approve_threshold=approve_threshold,
         review_threshold=review_threshold,
+        priority_limit=priority_limit,
     )
     return {
         "total": summary.total,
