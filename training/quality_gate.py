@@ -151,8 +151,19 @@ def check_dataset(
         if any(REFUSAL in m.get("content", "") for m in asst_msgs):
             refusal_count += 1
 
-    # Avg score check — approximate from refusal rate
-    # If we have scores in metadata use them; otherwise skip
+        # Score from metadata (preferowane do gate)
+        score = meta.get("quality_score")
+        if score is None:
+            score = meta.get("judge_score")
+        if isinstance(score, (int, float)):
+            scores.append(float(score))
+        elif isinstance(score, str):
+            try:
+                scores.append(float(score))
+            except ValueError:
+                pass
+
+    # Avg score check — use metadata quality score if available
     if scores:
         avg_score = statistics.mean(scores)
     else:
