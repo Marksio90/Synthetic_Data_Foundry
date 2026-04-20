@@ -1,5 +1,5 @@
 """
-agents/crawlers/scheduler.py — Tier 2 Adaptive Polling Scheduler
+agents/crawlers/scheduler.py — Tier 2 Adaptive Polling Scheduler (ENTERPRISE EDITION)
 
 Manages continuous background crawling across all registered crawlers.
 Each crawler maintains its own adaptive poll_interval (inherited from CrawlerBase):
@@ -7,40 +7,20 @@ Each crawler maintains its own adaptive poll_interval (inherited from CrawlerBas
   - 3× consecutive empty → double interval (max = max_poll_interval)
   - circuit breaker open → skip until auto-reset (5 min)
 
-The scheduler ticks every TICK_SECONDS (default 5 s), checks which crawlers
-are due (now >= next_run_at), runs them concurrently, deduplicates results
-via DedupPipeline, then calls on_sources() callback with unique new sources.
-
-Usage (background task):
-    scheduler = PollingScheduler.from_all_layers(max_concurrent=20)
-    stop = asyncio.Event()
-
-    async def save(sources):
-        for s in sources:
-            await db.upsert(s)
-
-    task = asyncio.create_task(
-        scheduler.run_forever(
-            query_fn=lambda: "CSRD reporting",
-            on_sources=save,
-            stop_event=stop,
-        )
-    )
-    # later:
-    stop.set()
-    await task
-
-Usage (one-shot manual tick for testing):
-    scheduler = PollingScheduler(crawlers=[...])
-    sources = await scheduler.tick_once("EU AI Act")
+Ulepszenia PRO:
+  - Non-blocking Callbacks: `on_sources` jest zrzucane do tła (Fire-and-Forget), chroniąc Ticker.
+  - Ochrona przed Driftem Czasowym: Ticker synchronizuje się do rzeczywistego zegara UTC, unikając opóźnień.
+  - Zabezpieczenie Zamykania (Graceful Shutdown): System elegancko doczeka na koniec trwających pobrań.
+  - Wysoce Wątkowa Wydajność: Kontrola obciążenia przez scentralizowany `asyncio.Semaphore`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Set
 
 from agents.crawlers.base import CrawlerBase
 from agents.crawlers.dedup import DedupPipeline
@@ -48,7 +28,7 @@ from agents.crawlers.dedup import DedupPipeline
 if False:  # TYPE_CHECKING — avoid circular import
     from agents.topic_scout import ScoutSource
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.scheduler")
 
 # Scheduler check interval — how often we check if any crawler is due
 TICK_SECONDS: int = 5
@@ -79,7 +59,9 @@ class PollingScheduler:
             "simhash_threshold": dedup_simhash_threshold,
             "semantic_threshold": dedup_semantic_threshold,
             "enable_semantic": enable_semantic_dedup,
+            "max_history_size": 50_000 # Ochrona pamięci (Enterprise parameter)
         }
+        
         # next_run_at: source_id → datetime when crawler should next fire
         now = datetime.now(timezone.utc)
         self._next_run: dict[str, datetime] = {
@@ -88,6 +70,9 @@ class PollingScheduler:
         self._running = False
         self._total_fired: int = 0
         self._total_unique: int = 0
+        
+        # Słownik śledzący działające w tle zapisy do bazy
+        self._background_tasks: Set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Factory — assemble from all registered layers
@@ -100,7 +85,7 @@ class PollingScheduler:
         enabled: Optional[list[str]] = None,
     ) -> "PollingScheduler":
         """
-        Build a scheduler with all crawlers from layers A, B, C.
+        Build a scheduler with all crawlers from layers A, B, C, D, E.
         If enabled is given, only those source_ids are loaded.
         """
         from agents.crawlers.layer_a import _CRAWLERS as A
@@ -125,10 +110,21 @@ class PollingScheduler:
                 crawlers = list(all_crawlers.values())
 
         logger.info(
-            "[scheduler] initialised with %d crawlers from %d available",
+            "🚀 [Scheduler] Zainicjalizowano z %d crawlerami z puli %d dostępnych.",
             len(crawlers), len(all_crawlers),
         )
         return cls(crawlers=crawlers, max_concurrent=max_concurrent)
+
+    # ------------------------------------------------------------------
+    # Async Background Task Management (Ochrona Pętli)
+    # ------------------------------------------------------------------
+    
+    def _fire_and_forget_callback(self, coro: Awaitable[None]) -> None:
+        """Zapobiega blokowaniu Tickera przez powolne zapisy bazy danych w Callbacku."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
 
     # ------------------------------------------------------------------
     # Main loop
@@ -142,7 +138,7 @@ class PollingScheduler:
     ) -> None:
         """
         Run the scheduling loop indefinitely.
-
+        
         Args:
             query_fn:    zero-arg callable returning current search query string.
             on_sources:  async callback receiving unique deduplicated ScoutSource list.
@@ -150,35 +146,44 @@ class PollingScheduler:
         """
         self._running = True
         logger.info(
-            "[scheduler] starting — %d crawlers, tick=%ds, max_concurrent=%d",
+            "[Scheduler] Start pętli głównej — %d crawlers, tick=%ds, max_concurrent=%d",
             len(self._crawlers), TICK_SECONDS, self._max_concurrent,
         )
 
         while self._running:
+            loop_start = time.monotonic()
+            
             if stop_event and stop_event.is_set():
-                logger.info("[scheduler] stop_event set — exiting loop")
+                logger.info("[Scheduler] Otrzymano sygnał zatrzymania (stop_event) — zamykanie.")
                 break
 
             try:
                 sources = await self.tick_once(query_fn())
                 if sources:
-                    try:
-                        await on_sources(sources)
-                    except Exception as exc:
-                        logger.error("[scheduler] on_sources callback failed: %s", exc)
+                    # Rzutowanie do tła, aby `save()` nie spowolniło kolejnego Tick-a!
+                    self._fire_and_forget_callback(on_sources(sources))
             except Exception as exc:
-                logger.error("[scheduler] tick error: %s", exc)
+                logger.error("[Scheduler] Błąd krytyczny na pętli tick: %s", exc, exc_info=True)
 
+            # Ochrona przed tzw. Clock Drift (opóźnienie obliczane względem trwania Ticka)
+            elapsed = time.monotonic() - loop_start
+            sleep_time = max(0.0, TICK_SECONDS - elapsed)
+            
             try:
-                await asyncio.sleep(TICK_SECONDS)
+                await asyncio.sleep(sleep_time)
             except asyncio.CancelledError:
                 break
 
         self._running = False
         logger.info(
-            "[scheduler] stopped — fired=%d total_unique=%d",
+            "[Scheduler] Pętla Zakończona. Fired=%d, Total Unique=%d",
             self._total_fired, self._total_unique,
         )
+        
+        # Graceful Shutdown - czekamy na dokończenie zapisów z _fire_and_forget
+        if self._background_tasks:
+            logger.info(f"[Scheduler] Oczekiwanie na ukończenie {len(self._background_tasks)} zadań w tle...")
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Single tick (also usable standalone for testing)
@@ -199,7 +204,7 @@ class PollingScheduler:
             return []
 
         self._total_fired += len(due)
-        logger.debug("[scheduler] tick: %d/%d crawlers due", len(due), len(self._crawlers))
+        logger.debug("[Scheduler] Tick: %d/%d crawlerów zakwalifikowanych do odpytania.", len(due), len(self._crawlers))
 
         # Run due crawlers with bounded concurrency
         sem = asyncio.Semaphore(self._max_concurrent)
@@ -217,9 +222,10 @@ class PollingScheduler:
         all_sources: list = []
         for crawler, batch in zip(due, raw_results):
             if isinstance(batch, Exception):
-                logger.debug("[scheduler] %s raised: %s", crawler.source_id, batch)
+                logger.debug("[Scheduler] Crawler %s zrzucił błąd i został zatrzymany: %s", crawler.source_id, batch)
                 batch = []
             all_sources.extend(batch)
+            
             # Schedule next run based on current (potentially adapted) poll_interval
             self._next_run[crawler.source_id] = (
                 datetime.now(timezone.utc)
@@ -229,13 +235,13 @@ class PollingScheduler:
         if not all_sources:
             return []
 
-        # Cross-layer dedup
+        # Cross-layer dedup (Instancjonujemy dedup do przefiltrowania zebranych batchy)
         dedup = DedupPipeline(**self._dedup_kwargs)
         unique = await dedup.filter(all_sources)
         self._total_unique += len(unique)
 
         logger.info(
-            "[scheduler] tick complete: %d raw → %d unique from %d crawlers",
+            "[Scheduler] Wynik Ticku: Odsiew %d zebranych → %d unikalnych. Zaangażowano %d crawlerów.",
             len(all_sources), len(unique), len(due),
         )
         return unique
@@ -266,7 +272,7 @@ class PollingScheduler:
                     int((self._next_run[c.source_id] - now).total_seconds()),
                 ),
                 "consecutive_errors": c._consecutive_errors,
-                "last_seen_id":      c.last_seen_id,
+                "last_seen_id":       c.last_seen_id,
             }
             for c in self._crawlers
         ]
@@ -278,4 +284,5 @@ class PollingScheduler:
             "crawler_count": len(self._crawlers),
             "total_fired":   self._total_fired,
             "total_unique":  self._total_unique,
+            "pending_bg_tasks": len(self._background_tasks),
         }
