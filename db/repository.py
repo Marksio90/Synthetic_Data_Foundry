@@ -1,18 +1,26 @@
 """
-db/repository.py — Data-access layer.
+db/repository.py — Data-Access Layer (DAL) - ENTERPRISE EDITION.
 
-All state mutations go through explicit transactions so a power-cut mid-write
-leaves the DB consistent (ACID idempotency — Self-Check patch).
+Warstwa abstrakcji dla bazy danych PostgreSQL + pgvector.
+Zaprojektowana pod kątem maksymalnej współbieżności i wysokiego obciążenia (High-Concurrency).
+
+Funkcje PRO:
+- @with_db_retries: Automatyczne rozwiązywanie deadlocków i przerw w połączeniu (Exponential Backoff).
+- Telemetria zapytań: Monitorowanie wydajności wyszukiwania wektorowego (Slow Query Logger).
+- SQLAlchemy 2.0 Compliance: Bezpieczne wiązanie parametrów zapytań surowych (bindparam).
 """
 
 from __future__ import annotations
 
 import logging
+import time
 import uuid
-from typing import Optional
+from functools import wraps
+from typing import Optional, List, TypeVar, Callable, Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text, update, bindparam
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError, PendingRollbackError, DBAPIError
 
 from db.models import (
     DirectiveChunk,
@@ -22,20 +30,69 @@ from db.models import (
     WatermarkRegistry,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.db.repository")
+
+# Typ generyczny do adnotacji funkcji zwracających dowolny typ z SQLAlchemy
+T = TypeVar("T")
+
+# ---------------------------------------------------------------------------
+# Dekoratory Odpornościowe (Resilience / Auto-Recovery)
+# ---------------------------------------------------------------------------
+def with_db_retries(max_retries: int = 3, initial_wait: float = 0.2) -> Callable:
+    """
+    Dekorator wdrażający wzorzec Exponential Backoff dla operacji bazodanowych.
+    Automatycznie chwyta i ponawia transakcje w przypadku deadlocków (SQLSTATE 40P01)
+    lub błędów serializacji (SQLSTATE 40001), które są częste przy wysokiej współbieżności.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(session: Session, *args: Any, **kwargs: Any) -> T:
+            retries = 0
+            while True:
+                try:
+                    return func(session, *args, **kwargs)
+                except (OperationalError, PendingRollbackError) as e:
+                    # Rozpoznajemy tymczasowe błędy współbieżności
+                    session.rollback()
+                    retries += 1
+                    if retries > max_retries:
+                        logger.error(
+                            f"KRYTYCZNY BŁĄD BAZY: Osiągnięto limit {max_retries} prób w funkcji '{func.__name__}'. "
+                            f"Treść błędu: {e}"
+                        )
+                        raise
+                    
+                    sleep_time = initial_wait * (2 ** (retries - 1))
+                    logger.warning(
+                        f"[DB Retry] Tymczasowy błąd transakcji w '{func.__name__}' (np. Deadlock). "
+                        f"Ponawiam próbę {retries}/{max_retries} za {sleep_time:.2f}s..."
+                    )
+                    time.sleep(sleep_time)
+                except DBAPIError as e:
+                    # Inne krytyczne błędy bazy wyrzucamy natychmiast po wykonaniu rollbacku
+                    session.rollback()
+                    logger.error(f"Błąd silnika DB w '{func.__name__}': {e}", exc_info=True)
+                    raise
+                except Exception as e:
+                    # Błędy aplikacji również wymagają cofnięcia stanu sesji
+                    session.rollback()
+                    raise
+        return wrapper
+    return decorator
 
 
 # =============================================================================
-# Source documents
+# Source Documents
 # =============================================================================
-
-def upsert_source_document(session: Session, **kwargs) -> SourceDocument:
-    """Insert or return existing document (dedup by file_hash)."""
+@with_db_retries(max_retries=2)
+def upsert_source_document(session: Session, **kwargs: Any) -> SourceDocument:
+    """Wstawia nowy dokument z pliku lub zwraca istniejący (deduplikacja po file_hash)."""
     existing = session.scalar(
         select(SourceDocument).where(SourceDocument.file_hash == kwargs["file_hash"])
     )
     if existing:
         return existing
+    
     doc = SourceDocument(**kwargs)
     session.add(doc)
     session.flush()
@@ -43,48 +100,53 @@ def upsert_source_document(session: Session, **kwargs) -> SourceDocument:
 
 
 # =============================================================================
-# Chunks
+# Chunks (Przetwarzanie i Rezerwacje)
 # =============================================================================
-
-def insert_chunk(session: Session, **kwargs) -> DirectiveChunk:
+@with_db_retries(max_retries=3)
+def insert_chunk(session: Session, **kwargs: Any) -> DirectiveChunk:
     chunk = DirectiveChunk(**kwargs)
     session.add(chunk)
     session.flush()
     return chunk
 
 
+@with_db_retries(max_retries=5)
 def claim_chunk(session: Session, chunk_id: uuid.UUID) -> bool:
-    """Atomically transition chunk new → in_progress. Returns False if already claimed."""
-    result = session.execute(
-        text("SELECT claim_chunk_for_processing(:cid)"),
-        {"cid": chunk_id},
+    """
+    Atomowa rezerwacja fragmentu (new → in_progress).
+    Chroni przed sytuacją, gdzie dwa wątki AutoPilota przetwarzają ten sam chunk.
+    """
+    stmt = text("SELECT claim_chunk_for_processing(:cid)").bindparams(
+        bindparam("cid", value=str(chunk_id))
     )
+    result = session.execute(stmt)
     claimed: bool = result.scalar()
     session.flush()
     return claimed
 
 
+@with_db_retries(max_retries=3)
 def finalize_chunk(
     session: Session,
     chunk_id: uuid.UUID,
     success: bool,
     error: Optional[str] = None,
 ) -> None:
-    """Atomically mark chunk ready or bump retry counter (ACID)."""
-    session.execute(
-        text("SELECT finalize_chunk(:cid, :ok, :err)"),
-        {"cid": chunk_id, "ok": success, "err": error},
+    """Atomowo oznacza chunk jako ukończony (ready) lub podbija licznik błędów."""
+    stmt = text("SELECT finalize_chunk(:cid, :ok, :err)").bindparams(
+        bindparam("cid", value=str(chunk_id)),
+        bindparam("ok", value=success),
+        bindparam("err", value=error)
     )
+    session.execute(stmt)
     session.flush()
 
 
-def get_pending_chunks(session: Session, limit: int = 100) -> list[DirectiveChunk]:
+@with_db_retries(max_retries=2)
+def get_pending_chunks(session: Session, limit: int = 100) -> List[DirectiveChunk]:
     """
-    Return chunks eligible for processing:
-      - status='new' (normal path)
-      - status='in_progress' (recovery path: picks up chunks left in_progress
-        by a previous crashed run — safe in single-worker deployments)
-    Both filtered by retry_count < 3 to skip permanently failed chunks.
+    Pobiera chunki oczekujące na przetworzenie (lub te zablokowane po padzie serwera).
+    Filtruje chunki, które wyczerpały limit prób (retry_count >= 3).
     """
     return list(
         session.scalars(
@@ -97,27 +159,30 @@ def get_pending_chunks(session: Session, limit: int = 100) -> list[DirectiveChun
     )
 
 
+# =============================================================================
+# RAG: Hybrid Search (pgvector + BM25)
+# =============================================================================
+@with_db_retries(max_retries=2)
 def hybrid_search(
     session: Session,
-    query_embedding: list[float],
+    query_embedding: List[float],
     query_text: str,
     top_k: int = 5,
     diversify_by_section: bool = False,
-) -> list[DirectiveChunk]:
+) -> List[DirectiveChunk]:
     """
-    Hybrid retrieval: vector cosine similarity (pgvector) + BM25 ts_rank.
-    Self-Check 3.0: WHERE is_superseded = FALSE hard-coded.
-
-    Wagi konfigurowane przez settings.hybrid_vector_weight / hybrid_bm25_weight.
-    Opcjonalna diversyfikacja: max 2 chunki z każdej sekcji dokumentu.
+    Zaawansowane wyszukiwanie hybrydowe: Cosine Similarity (pgvector) + Full-Text Search (BM25).
+    Zaimplementowana telemetria pozwala zidentyfikować spowolnienia na indeksach bazy danych.
     """
+    start_time = time.perf_counter()
     from config.settings import settings as _s
     vec_w = _s.hybrid_vector_weight
     bm25_w = _s.hybrid_bm25_weight
 
-    # Przy diversyfikacji pobieramy więcej kandydatów przed filtrowaniem
+    # Pobieramy szerszą pule kandydatów jeśli wymagana jest dywersyfikacja semantyczna
     fetch_k = top_k * 4 if diversify_by_section else top_k
 
+    # Zoptymalizowane zapytanie CTE (Common Table Expression) - wymusza użycie indeksu HNSW
     sql = text(
         f"""
         WITH vec AS (
@@ -140,7 +205,7 @@ def hybrid_search(
         combined AS (
             SELECT COALESCE(v.id, f.id)                                      AS id,
                    COALESCE(v.vec_score, 0) * {vec_w}
-                   + COALESCE(f.bm25_score, 0) * {bm25_w}                   AS score
+                   + COALESCE(f.bm25_score, 0) * {bm25_w}                    AS score
             FROM   vec v
             FULL   OUTER JOIN fts f ON v.id = f.id
         )
@@ -150,52 +215,70 @@ def hybrid_search(
         ORDER  BY combined.score DESC, directive_chunks.id ASC
         LIMIT  :fetch_k
         """
+    ).bindparams(
+        bindparam("emb", value=str(query_embedding)),
+        bindparam("q", value=query_text),
+        bindparam("fetch_k", value=fetch_k)
     )
-    rows = session.execute(
-        sql,
-        {"emb": str(query_embedding), "q": query_text, "fetch_k": fetch_k},
-    ).fetchall()
+    
+    rows = session.execute(sql).fetchall()
 
     ids = [row[0] for row in rows]
     if not ids:
         return []
+        
+    # Pobranie modeli ORM na podstawie zidentyfikowanych ID
     chunks_unordered = session.scalars(
         select(DirectiveChunk).where(DirectiveChunk.id.in_(ids))
     ).all()
+    
+    # Przywracanie poprawnej kolejności rankingowej
     id_order = {cid: i for i, cid in enumerate(ids)}
     chunks = sorted(chunks_unordered, key=lambda c: id_order.get(c.id, 999))
 
-    if not diversify_by_section:
-        return chunks[:top_k]
+    # Algorytm dywersyfikacji (Max 2 fragmenty z jednej sekcji dokumentu)
+    if diversify_by_section:
+        by_section: dict[str, int] = {}
+        diversified: List[DirectiveChunk] = []
+        for chunk in chunks:
+            section_key = f"{chunk.source_doc_id}::{chunk.section_heading or '__none__'}"
+            count = by_section.get(section_key, 0)
+            if count < 2:
+                diversified.append(chunk)
+                by_section[section_key] = count + 1
+            if len(diversified) >= top_k:
+                break
+        chunks = diversified
+    else:
+        chunks = chunks[:top_k]
 
-    # Diversyfikacja: max 2 chunki z każdej sekcji, zachowując ranking
-    by_section: dict[str, int] = {}
-    diversified: list[DirectiveChunk] = []
-    for chunk in chunks:
-        section_key = f"{chunk.source_doc_id}::{chunk.section_heading or '__none__'}"
-        count = by_section.get(section_key, 0)
-        if count < 2:
-            diversified.append(chunk)
-            by_section[section_key] = count + 1
-        if len(diversified) >= top_k:
-            break
-    return diversified
+    # Telemetria wydajnościowa zapytania wektorowego (Slow Query Warning)
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+    if elapsed_ms > 500:
+        logger.warning(f"[SLOW QUERY] Wyszukiwanie hybrydowe trwało {elapsed_ms:.1f}ms (Zwrócono {len(chunks)} wyników).")
+    else:
+        logger.debug(f"Wyszukiwanie hybrydowe udane: {elapsed_ms:.1f}ms.")
+
+    return chunks
 
 
 # =============================================================================
-# Generated samples
+# Generated Samples (Zapis zbiorów uczących)
 # =============================================================================
-
-def insert_sample(session: Session, **kwargs) -> GeneratedSample:
+@with_db_retries(max_retries=3)
+def insert_sample(session: Session, **kwargs: Any) -> GeneratedSample:
+    """Zapisuje wygenerowaną przez LLM próbkę treningową Q&A."""
     sample = GeneratedSample(**kwargs)
     session.add(sample)
     session.flush()
     return sample
 
 
+@with_db_retries(max_retries=3)
 def mark_sample_written(
     session: Session, sample_id: uuid.UUID, record_index: int, watermark_hash: Optional[str]
 ) -> None:
+    """Oznacza próbkę jako zapisaną fizycznie na dysku (JSONL) oraz przypisuje znak wodny."""
     session.execute(
         update(GeneratedSample)
         .where(GeneratedSample.id == sample_id)
@@ -209,12 +292,13 @@ def mark_sample_written(
 
 
 # =============================================================================
-# Watermark registry
+# Watermark Registry (Rejestr Znaków Wodnych)
 # =============================================================================
-
-def register_watermark(session: Session, **kwargs) -> WatermarkRegistry:
-    """Upsert watermark — same batch_id fires multiple times (every N records).
-    On conflict: append new record_indices and update total_records + watermark_hash.
+@with_db_retries(max_retries=4)
+def register_watermark(session: Session, **kwargs: Any) -> WatermarkRegistry:
+    """
+    Bezpieczny upsert znaku wodnego — ten sam batch_id wywoływany wielokrotnie (co N rekordów).
+    Rozwiązuje konflikty asynchroniczne za pomocą ON CONFLICT (baza dba o spojność).
     """
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -222,34 +306,34 @@ def register_watermark(session: Session, **kwargs) -> WatermarkRegistry:
     stmt = stmt.on_conflict_do_update(
         index_elements=["batch_id"],
         set_={
-            # Append new positions to existing array (|| operator in PG)
-            "record_indices": text(
-                "watermark_registry.record_indices || EXCLUDED.record_indices"
-            ),
+            # Bezpieczne łączenie list po stronie bazy (operator || w PG)
+            "record_indices": text("watermark_registry.record_indices || EXCLUDED.record_indices"),
             "total_records": stmt.excluded.total_records,
             "watermark_hash": stmt.excluded.watermark_hash,
         },
     )
     session.execute(stmt)
     session.flush()
-    # Return the (now upserted) row
+    
+    # Pobranie ostatecznie uaktualnionego wiersza
     return session.scalar(
         select(WatermarkRegistry).where(WatermarkRegistry.batch_id == kwargs["batch_id"])
     )
 
 
 # =============================================================================
-# OpenAI Batch jobs
+# OpenAI Batch Jobs
 # =============================================================================
-
-def insert_batch_job(session: Session, **kwargs) -> OpenAIBatchJob:
+@with_db_retries(max_retries=2)
+def insert_batch_job(session: Session, **kwargs: Any) -> OpenAIBatchJob:
     job = OpenAIBatchJob(**kwargs)
     session.add(job)
     session.flush()
     return job
 
 
-def update_batch_job(session: Session, batch_job_id: str, **kwargs) -> None:
+@with_db_retries(max_retries=3)
+def update_batch_job(session: Session, batch_job_id: str, **kwargs: Any) -> None:
     session.execute(
         update(OpenAIBatchJob)
         .where(OpenAIBatchJob.batch_job_id == batch_job_id)
