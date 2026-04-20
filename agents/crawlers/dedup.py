@@ -18,7 +18,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import asyncio
 from typing import TYPE_CHECKING, Optional, List, Tuple, Set
 from urllib.parse import urlparse, urlunparse
 from collections import deque

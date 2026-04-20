@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 
 import openai
 import tiktoken
@@ -207,7 +207,11 @@ def constitutional_revision(state: FoundryState) -> Dict[str, Any]:
         start_time = time.perf_counter()
         critique_model = settings.openai_primary_model
         critique_result, critique_cost = _call_structured_critique(critique_model, messages)
-        elapsed_critique = time.perf_counter() - start_time
+        logger.debug(
+            "[Constitutional:%s] Audyt trwał %.2fs",
+            chunk_id_short,
+            time.perf_counter() - start_time,
+        )
     except Exception as exc:
         logger.error(f"[Constitutional:{chunk_id_short}] Błąd API podczas audytu: {exc}")
         return {}

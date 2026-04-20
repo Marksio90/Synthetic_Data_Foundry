@@ -19,7 +19,6 @@ import logging
 
 import httpx
 import openai
-from sqlalchemy import update
 from sqlalchemy.orm import Session
 from tenacity import (
     before_sleep_log,

@@ -36,12 +36,11 @@ import asyncio
 import hashlib
 import hmac
 import logging
-import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import urlencode
 
 import httpx
 

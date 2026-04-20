@@ -15,14 +15,12 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from typing import Optional
 
 import openai
 from sqlalchemy.orm import Session
 
 from config.settings import settings
 from db import repository as repo
-from db.models import DirectiveChunk
 
 logger = logging.getLogger(__name__)
 
