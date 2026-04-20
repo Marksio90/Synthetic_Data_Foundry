@@ -243,9 +243,12 @@ def make_write_node(
 
             if rejected and record_index >= 0:
                 prompt_msgs = [m for m in messages if m["role"] in ("system", "user")][:2]
-                if dpo_writer: dpo_writer.write_pair(prompt_msgs, first_asst, rejected)
-                if orpo_writer: orpo_writer.write_pair(prompt_msgs, first_asst, rejected)
-                if kto_writer: kto_writer.write_pair(prompt_msgs, first_asst, rejected)
+                if dpo_writer:
+                    dpo_writer.write_pair(prompt_msgs, first_asst, rejected)
+                if orpo_writer:
+                    orpo_writer.write_pair(prompt_msgs, first_asst, rejected)
+                if kto_writer:
+                    kto_writer.write_pair(prompt_msgs, first_asst, rejected)
 
             # Etap 3: Uzupełnienie Bazy Danych o Metadane Pliku i Znak Wodny
             repo.mark_sample_written(session, sample.id, record_index, watermark_hash)

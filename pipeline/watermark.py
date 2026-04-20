@@ -23,7 +23,6 @@ import hashlib
 import logging
 import os
 import re
-import uuid
 
 logger = logging.getLogger(__name__)
 

@@ -177,7 +177,6 @@ def generate_datacard(
 
 if __name__ == "__main__":
     import argparse
-    import sys
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     p = argparse.ArgumentParser(description="Generate dataset datacard JSON")

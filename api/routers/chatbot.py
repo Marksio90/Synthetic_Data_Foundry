@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -139,7 +138,7 @@ async def start_eval(req: EvalRequest) -> dict:
 
     jsonl_path = req.jsonl_path or str(OUTPUT_DIR / "dataset_esg_v1.jsonl")
 
-    rec = runs.create(run_id, f"eval:{req.model_name}")
+    runs.create(run_id, f"eval:{req.model_name}")
     runs.update(run_id, status="running")
     runs.append_log(run_id, f"[Eval] Run ID: {run_id}")
     runs.append_log(run_id, f"[Eval] Model: {req.model_name}")

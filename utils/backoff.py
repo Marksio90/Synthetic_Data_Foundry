@@ -16,9 +16,8 @@ import asyncio
 import json
 import logging
 import tempfile
-import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import openai
 from tenacity import (
