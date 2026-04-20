@@ -1,5 +1,5 @@
 """
-agents/crawlers/layer_c.py — Layer C: Finance & Economic Data crawlers (10 sources)
+agents/crawlers/layer_c.py — Layer C: Finance & Economic Data crawlers (10 sources) - ENTERPRISE EDITION
 
 Sources covered:
   1.  IMFCrawler            — IMF publications & working papers JSON
@@ -13,12 +13,11 @@ Sources covered:
   9.  OurWorldInDataCrawler — OWID data catalog GitHub API
   10. HDXCrawler            — CKAN Humanitarian Data Exchange API
 
-All classes inherit CrawlerBase (circuit breaker, backoff, ETag caching).
-Uses stdlib xml.etree.ElementTree for Atom/RSS — no feedparser dependency.
-
-Public API:
-    sources = await run_layer_c("carbon border adjustment mechanism")
-    sources = await run_layer_c("ESG", enabled=["imf", "worldbank", "fred"])
+Ulepszenia PRO:
+  - Bounded Concurrency (Semaphore): Limitowanie równoległych żądań HTTP do API finansowych (anti-DDoS).
+  - Global Layer Timeout: Bezpieczny limit czasu na zebranie wszystkich informacji (zabezpieczenie przed zawieszeniem).
+  - Exception Unpacking: Jawne logowanie wyjątków w operacjach wsadowych (asyncio.gather).
+  - Safe Payload Parsing: Ochrona przed niestandardowymi odpowiedziami w API mimo kodu 200 OK.
 """
 
 from __future__ import annotations
@@ -27,13 +26,13 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Set, Any
 from urllib.parse import quote_plus
 
 from agents.crawlers.base import CrawlerBase
 from agents.topic_scout import ScoutSource, _get_source_tier
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.crawlers.layer_c")
 
 # ---------------------------------------------------------------------------
 # Date helpers (mirror layer_a / layer_b)
@@ -51,7 +50,6 @@ _DATE_FMTS = (
     "%Y",
 )
 
-
 def _to_iso(date_str: str) -> str:
     if not date_str:
         return ""
@@ -65,7 +63,6 @@ def _to_iso(date_str: str) -> str:
             continue
     return date_str
 
-
 def _days_ago(n: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
 
@@ -78,14 +75,12 @@ def _atom_text(el: Optional[ET.Element], tag: str) -> str:
     child = el.find(f"{_AT}{tag}") if el is not None else None
     return (child.text or "").strip() if child is not None else ""
 
-
 def _atom_link(el: ET.Element) -> str:
     for link in el.findall(f"{_AT}link"):
         if link.get("rel", "alternate") == "alternate":
             return link.get("href", "")
     lnk = el.find(f"{_AT}link")
     return lnk.get("href", "") if lnk is not None else ""
-
 
 def _rss_text(item: ET.Element, tag: str) -> str:
     el = item.find(tag)
@@ -96,7 +91,6 @@ def _rss_text(item: ET.Element, tag: str) -> str:
 # 1. IMFCrawler
 # ===========================================================================
 
-
 class IMFCrawler(CrawlerBase):
     """IMF publications search — working papers, country reports, policy papers."""
 
@@ -104,11 +98,6 @@ class IMFCrawler(CrawlerBase):
     default_poll_interval = 3600
 
     async def crawl(self, query: str) -> list[ScoutSource]:
-        # IMF eLibrary search (public JSON API)
-        url = (
-            "https://www.imf.org/en/Publications/Search"
-            f"#q={quote_plus(query)}&sort=relevancy&f:languageFacet=[English]"
-        )
         # Use the IMF API endpoint
         api_url = (
             f"https://www.imf.org/elibrary-angular-api/search"
@@ -175,7 +164,6 @@ class IMFCrawler(CrawlerBase):
 # 2. WorldBankCrawler
 # ===========================================================================
 
-
 class WorldBankCrawler(CrawlerBase):
     """World Bank Open Data — development publications, reports, datasets."""
 
@@ -195,7 +183,12 @@ class WorldBankCrawler(CrawlerBase):
             return []
         sources: list[ScoutSource] = []
         try:
-            docs = resp.json().get("documents", {})
+            data = resp.json()
+        except ValueError:
+            return []
+            
+        try:
+            docs = data.get("documents", {})
             for doc_id, doc in list(docs.items())[:8]:
                 if not isinstance(doc, dict):
                     continue
@@ -220,7 +213,6 @@ class WorldBankCrawler(CrawlerBase):
 # 3. FREDCrawler
 # ===========================================================================
 
-
 class FREDCrawler(CrawlerBase):
     """Federal Reserve FRED — economic data series and releases."""
 
@@ -243,7 +235,12 @@ class FREDCrawler(CrawlerBase):
         sources: list[ScoutSource] = []
         if resp.status_code == 200:
             try:
-                series_list = resp.json().get("seriess", [])
+                data = resp.json()
+            except ValueError:
+                return []
+                
+            try:
+                series_list = data.get("seriess", [])
                 for s in series_list[:8]:
                     sid = s.get("id", "")
                     link = f"https://fred.stlouisfed.org/series/{sid}" if sid else ""
@@ -266,7 +263,6 @@ class FREDCrawler(CrawlerBase):
 # ===========================================================================
 # 4. ECBCrawler
 # ===========================================================================
-
 
 class ECBCrawler(CrawlerBase):
     """European Central Bank publications — working papers, research bulletins."""
@@ -345,7 +341,6 @@ class ECBCrawler(CrawlerBase):
 # 5. BISCrawler
 # ===========================================================================
 
-
 class BISCrawler(CrawlerBase):
     """BIS — Bank for International Settlements working papers and research."""
 
@@ -398,7 +393,6 @@ class BISCrawler(CrawlerBase):
 # ===========================================================================
 # 6. EurostatCrawler
 # ===========================================================================
-
 
 class EurostatCrawler(CrawlerBase):
     """Eurostat — EU statistical data releases and news."""
@@ -470,7 +464,6 @@ class EurostatCrawler(CrawlerBase):
 # 7. UNCrawler
 # ===========================================================================
 
-
 class UNCrawler(CrawlerBase):
     """UN Digital Library — UN documents, resolutions, reports."""
 
@@ -528,7 +521,12 @@ class UNCrawler(CrawlerBase):
         )
         resp3 = await self._fetch(url3, use_cache_headers=False)
         if resp3.status_code == 200:
-            for work in resp3.json().get("results", []):
+            try:
+                data = resp3.json()
+            except ValueError:
+                return []
+                
+            for work in data.get("results", []):
                 oa = work.get("open_access") or {}
                 link = oa.get("oa_url") or ""
                 if not link:
@@ -550,7 +548,6 @@ class UNCrawler(CrawlerBase):
 # ===========================================================================
 # 8. IRENACrawler
 # ===========================================================================
-
 
 class IRENACrawler(CrawlerBase):
     """IRENA — International Renewable Energy Agency publications."""
@@ -601,7 +598,13 @@ class IRENACrawler(CrawlerBase):
         resp2 = await self._fetch(url2, use_cache_headers=False)
         if resp2.status_code != 200:
             return []
-        for work in resp2.json().get("results", []):
+            
+        try:
+            data = resp2.json()
+        except ValueError:
+            return []
+            
+        for work in data.get("results", []):
             oa = work.get("open_access") or {}
             link = oa.get("oa_url") or ""
             if not link:
@@ -624,7 +627,6 @@ class IRENACrawler(CrawlerBase):
 # 9. OurWorldInDataCrawler
 # ===========================================================================
 
-
 class OurWorldInDataCrawler(CrawlerBase):
     """Our World in Data — open-access data, charts, and research articles."""
 
@@ -632,11 +634,6 @@ class OurWorldInDataCrawler(CrawlerBase):
     default_poll_interval = 7200
 
     async def crawl(self, query: str) -> list[ScoutSource]:
-        # OWID grapher search API
-        url = (
-            f"https://ourworldindata.org/search"
-            f"?q={quote_plus(query)}"
-        )
         sources: list[ScoutSource] = []
 
         # OWID posts/articles via their public Algolia API
@@ -647,7 +644,8 @@ class OurWorldInDataCrawler(CrawlerBase):
         resp = await self._fetch(algolia_url, use_cache_headers=False)
         if resp.status_code == 200:
             try:
-                hits = resp.json().get("hits", [])
+                data = resp.json()
+                hits = data.get("hits", [])
                 for hit in hits[:8]:
                     slug = hit.get("slug", "")
                     link = f"https://ourworldindata.org/{slug}" if slug else hit.get("url", "")
@@ -680,10 +678,10 @@ class OurWorldInDataCrawler(CrawlerBase):
         )
         if resp2.status_code == 200:
             try:
-                for item in resp2.json().get("items", [])[:8]:
+                data = resp2.json()
+                for item in data.get("items", [])[:8]:
                     link = item.get("html_url", "")
                     name = item.get("name", "")
-                    repo = item.get("repository", {}).get("full_name", "")
                     sources.append(ScoutSource(
                         url=link,
                         title=f"OWID dataset: {name}",
@@ -701,7 +699,6 @@ class OurWorldInDataCrawler(CrawlerBase):
 # 10. HDXCrawler
 # ===========================================================================
 
-
 class HDXCrawler(CrawlerBase):
     """HDX (Humanitarian Data Exchange) — CKAN-based humanitarian datasets."""
 
@@ -718,9 +715,15 @@ class HDXCrawler(CrawlerBase):
         resp = await self._fetch(url, use_cache_headers=False)
         if resp.status_code != 200:
             return []
+            
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+            
         sources: list[ScoutSource] = []
         try:
-            result = resp.json().get("result", {})
+            result = data.get("result", {})
             for pkg in result.get("results", []):
                 name = pkg.get("name", "")
                 link = f"https://data.humdata.org/dataset/{name}" if name else ""
@@ -741,7 +744,7 @@ class HDXCrawler(CrawlerBase):
 
 
 # ===========================================================================
-# Registry + public entry-point
+# Registry + Public Entry-Point (Enterprise Edition)
 # ===========================================================================
 
 _CRAWLERS: dict[str, CrawlerBase] = {
@@ -761,6 +764,16 @@ _CRAWLERS: dict[str, CrawlerBase] = {
 }
 
 
+async def _run_single_crawler_safe(crawler: CrawlerBase, query: str, semaphore: asyncio.Semaphore) -> List[ScoutSource]:
+    """Wraper wykonujący zapytanie chronione Semaforem z bezbłędnym przechwyceniem awarii."""
+    async with semaphore:
+        try:
+            return await crawler.safe_crawl(query)
+        except Exception as exc:
+            logger.error(f"[Layer C] Fatal exception in crawler {crawler.source_id}: {exc}", exc_info=True)
+            return []
+
+
 async def run_layer_c(
     query: str,
     enabled: Optional[list[str]] = None,
@@ -768,6 +781,7 @@ async def run_layer_c(
     """
     Run all (or a subset of) Layer C crawlers in parallel.
     Returns deduplicated ScoutSource list.
+    Zabezpieczone przez Bounded Concurrency (Semaphore) i Global Timeout.
     """
     from config.settings import settings
     active = enabled
@@ -782,20 +796,40 @@ async def run_layer_c(
     if not crawlers:
         return []
 
-    results = await asyncio.gather(
-        *[c.safe_crawl(query) for c in crawlers],
-        return_exceptions=True,
-    )
+    # Limitujemy współbieżność, chroniąc system przed dławieniem API
+    concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+
+    # Globalny limit czasu dla całej warstwy
+    layer_timeout = getattr(settings, "layer_c_timeout_seconds", 60.0)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=layer_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[Layer C] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
+        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
-    for batch in results:
+    
+    # Dekompozycja wyników i logowanie błędów
+    for idx, batch in enumerate(results):
+        if isinstance(batch, Exception):
+            logger.error(f"[Layer C] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            continue
         if not isinstance(batch, list):
             continue
+            
         for src in batch:
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+                
     return sources
 
 
