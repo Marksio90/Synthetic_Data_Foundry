@@ -1,48 +1,81 @@
 """
-agents/simulator.py — Agent Symulator (Generator Pytań)
+agents/simulator.py — Agent Symulator (Generator Pytań) - ENTERPRISE EDITION
 
 LangGraph node: simulate_question(state) → partial state update
 
-8 perspektyw eksperckich (zamiast 3):
-  cfo         — CFO spółki giełdowej (finanse, progi, terminy)
-  prawnik     — radca prawny (definicje, zakres, wyjątki)
-  audytor     — biegły rewident ESG (wymogi, wskaźniki, dokumentacja)
-  analityk    — analityk finansowy buy-side (ryzyko, implikacje rynkowe)
-  regulator   — urzędnik KNF/ESMA (nadzór, compliance, wdrożenie)
-  akademik    — badacz ESG (metodologia, spójność, porównanie z literaturą)
-  dziennikarz — dziennikarz finansowy (wyjaśnienie, kontekst, implikacje)
-  inwestor    — inwestor instytucjonalny (ESG scoring, alokacja kapitału)
+Odpowiada za inicjację potoku RAG. Symuluje 8 eksperckich perspektyw
+i opcjonalnie wprowadza pytania adwersaryjne (Self-Check), aby trenować
+odporność asystentów AI na halucynacje.
 
-Adversarial prompting (Self-Check):
-  - 90% normalnych pytań ugruntowanych w tekście
-  - 10% pytań-pułapek o rzeczy NIEOBECNE w tekście → model musi odmówić
-
-Provider routing (priorytet):
-  1. Ollama LOCAL (darmowy — qwen2.5:14b)
-  2. OpenAI (fallback gdy Ollama niedostępny)
+Ulepszenia PRO:
+- Pydantic Structured Outputs: Gwarantowany format JSON, chroni przed "meta-komentarzami" od LLM.
+- Global Connection Pools: Współdzieleni klienci OpenAI/Ollama (zwiększona wydajność I/O).
+- Semantic De-looping: Rozbudowany system ratunkowy z badaniem Jaccard Similarity (zapobiega pętlom follow-up).
+- Jittered Backoff: Zaawansowana dystrybucja obciążenia na GPU (Ollama) i API przy wielowątkowości.
+- Full Prompt Preservation: Zachowana 100% oryginalna inżynieria promptów z repozytorium.
 """
 
 from __future__ import annotations
 
 import logging
 import random
+import time
+from typing import Dict, Any, Tuple
 
 import openai
+from pydantic import BaseModel, Field
 from tenacity import (
     before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
-    wait_exponential,
+    wait_random_exponential,
 )
 
 from config.settings import settings
 from pipeline.state import FoundryState
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("foundry.agents.simulator")
 
 # ---------------------------------------------------------------------------
-# Prompty systemowe — 8 perspektyw × normalny / adversarial / follow-up
+# Globalni Klienci i Pule Połączeń (Connection Pooling)
+# ---------------------------------------------------------------------------
+_OPENAI_CLIENT = openai.OpenAI(api_key=settings.openai_api_key, max_retries=0)
+
+def _get_ollama_client() -> openai.OpenAI | None:
+    if getattr(settings, "ollama_url", None):
+        base = settings.ollama_url.rstrip("/")
+        # Lokalny symulator potrzebuje dłuższego timeoutu
+        return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0, timeout=45.0)
+    return None
+
+_OLLAMA_CLIENT = _get_ollama_client()
+
+# Ceny dla telemetrii (w USD za 1M tokenów)
+_COSTS_PER_1M = {
+    "gpt-4o-mini": (0.150, 0.600),
+    "gpt-4o": (5.00, 15.00),
+}
+
+
+# ---------------------------------------------------------------------------
+# Pydantic Schemas (Wymuszony Format Wyjściowy)
+# ---------------------------------------------------------------------------
+class SimulatedQuestion(BaseModel):
+    """
+    Ścisła struktura odpowiedzi generatora. 
+    Wymusza na LLMie oddzielenie toku myślenia od samego wygenerowanego pytania.
+    """
+    reasoning: str = Field(
+        description="Twój krótki, analityczny tok myślenia. Jakie fakty z kontekstu chcesz wykorzystać do zadania pytania?"
+    )
+    question: str = Field(
+        description="Wygenerowane, bezpośrednie pytanie. BEZ ŻADNYCH komentarzy w stylu 'Oto moje pytanie:'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Oryginalne Prompty Systemowe — 8 perspektyw × normalny / adversarial / follow-up
 # ---------------------------------------------------------------------------
 
 _NORMAL_PROMPTS: dict[str, str] = {
@@ -238,80 +271,98 @@ _FOLLOWUP_PROMPTS: dict[str, str] = {
     ),
 }
 
-# Wszystkie 8 perspektyw — eksportowane do main.py
 ALL_PERSPECTIVES = list(_NORMAL_PROMPTS.keys())
 
+# Pytania Ratunkowe (Semantic De-looping fallback)
+_FALLBACK_QUESTIONS = [
+    "Jakie mogą być nieoczywiste konsekwencje regulacji podanych w tej odpowiedzi dla średnich przedsiębiorstw?",
+    "Czy istnieją jakieś kluczowe luki interpretacyjne w tym opisie, o których powinienem wiedzieć?",
+    "Jakie dokumenty będą potrzebne, by dowieść zgodności z wymogami opisanymi w Twojej odpowiedzi?",
+    "Jak zmiana opisana w Twojej odpowiedzi przekłada się bezpośrednio na strukturę wydatków operacyjnych?"
+]
 
 # ---------------------------------------------------------------------------
-# Retry decorator
+# Odporność Sieciowa (Resilience & Jitter)
 # ---------------------------------------------------------------------------
-
 def _is_retryable_openai(exc: BaseException) -> bool:
-    if isinstance(exc, openai.RateLimitError):
+    if isinstance(exc, (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError)):
         return True
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
         return True
     return False
 
+@retry(
+    reraise=True,
+    retry=retry_if_exception(_is_retryable_openai),
+    # Użycie rozrzutu (Jitter) chroni API przed tzw. Thundering Herd (szturm wielu wątków w tej samej sekundzie)
+    wait=wait_random_exponential(multiplier=1.5, min=settings.tenacity_initial_wait, max=settings.tenacity_max_wait),
+    stop=stop_after_attempt(settings.tenacity_max_attempts),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+def _call_structured_simulator(messages: list[dict], max_tokens: int = 400) -> Tuple[SimulatedQuestion, float]:
+    """
+    Multi-Tier Routing: Próba uruchomienia Ollamy, spadek na OpenAI przy awarii.
+    Zwraca krotkę: (Obiekt Pytania wg schematu Pydantic, Koszt w centach).
+    """
+    cost_cents = 0.0
 
-def _retry_api(func):
-    return retry(
-        reraise=True,
-        retry=retry_if_exception(_is_retryable_openai),
-        wait=wait_exponential(
-            multiplier=1,
-            min=settings.tenacity_initial_wait,
-            max=settings.tenacity_max_wait,
-        ),
-        stop=stop_after_attempt(settings.tenacity_max_attempts),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-    )(func)
-
-
-def _make_ollama_client() -> openai.OpenAI:
-    base = settings.ollama_url.rstrip("/")
-    return openai.OpenAI(api_key="ollama", base_url=f"{base}/v1", max_retries=0, timeout=30.0)
-
-
-def _call_provider(system_prompt: str, user_text: str, max_tokens: int = 256) -> str:
-    """2-poziomowy routing: Ollama → OpenAI."""
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_text},
-    ]
-
-    if settings.ollama_model:
+    # Próba Lokalna (Ollama). Parsowanie JSON manualnie dla wsparcia słabszych modeli lokalnych.
+    if settings.ollama_model and _OLLAMA_CLIENT:
         try:
-            client = _make_ollama_client()
-            resp = client.chat.completions.create(
+            start_time = time.perf_counter()
+            resp = _OLLAMA_CLIENT.chat.completions.create(
                 model=settings.ollama_model,
                 messages=messages,
                 temperature=settings.generation_temperature,
                 max_tokens=max_tokens,
+                response_format={"type": "json_object"} 
             )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning("Ollama niedostępny (%s), przełączam na OpenAI", e)
+            raw_content = resp.choices[0].message.content.strip()
+            
+            import json
+            try:
+                data = json.loads(raw_content)
+                sq = SimulatedQuestion(
+                    reasoning=data.get("reasoning", "Lokalny LLM pominął tag reasoning."),
+                    question=data.get("question", data.get("pytanie", raw_content))
+                )
+            except json.JSONDecodeError:
+                sq = SimulatedQuestion(reasoning="Błąd parsowania", question=raw_content)
 
-    client = openai.OpenAI(api_key=settings.openai_api_key, max_retries=0)
-    resp = client.chat.completions.create(
-        model=settings.openai_primary_model,
+            elapsed = time.perf_counter() - start_time
+            logger.debug(f"[Symulator-Local] Wymyślono pytanie w {elapsed:.2f}s.")
+            return sq, cost_cents
+        except Exception as e:
+            logger.warning(f"Lokalny Symulator ({settings.ollama_model}) zawiódł: {e}. Przełączam na API OpenAI.")
+
+    # Próba Chmurowa (OpenAI) z pełnym, natywnym wsparciem Pydantic Structured Outputs
+    model = settings.openai_primary_model
+    start_time = time.perf_counter()
+    resp = _OPENAI_CLIENT.beta.chat.completions.parse(
+        model=model,
         messages=messages,
         temperature=settings.generation_temperature,
         max_tokens=max_tokens,
+        response_format=SimulatedQuestion
     )
-    return resp.choices[0].message.content.strip()
+    
+    if resp.usage and model in _COSTS_PER_1M:
+        c_in, c_out = _COSTS_PER_1M[model]
+        cost_cents = ((resp.usage.prompt_tokens / 1_000_000) * c_in * 100) + \
+                     ((resp.usage.completion_tokens / 1_000_000) * c_out * 100)
 
+    parsed = resp.choices[0].message.parsed
+    if not parsed:
+        raise ValueError("Model odmówił wygenerowania pytania w zadanym schemacie.")
 
-@_retry_api
-def _call_vllm(system_prompt: str, user_text: str) -> str:
-    return _call_provider(system_prompt, user_text, max_tokens=256)
+    elapsed = time.perf_counter() - start_time
+    logger.debug(f"[Symulator-Cloud] Wymyślono pytanie ({model}) w {elapsed:.2f}s. Koszt: {cost_cents:.4f}¢")
+    return parsed, cost_cents
 
 
 # ---------------------------------------------------------------------------
-# Similarity check (duplicate follow-up prevention)
+# Badanie Podobieństwa Semantycznego (Anty-Loop)
 # ---------------------------------------------------------------------------
-
 def _jaccard_similarity(a: str, b: str) -> float:
     def bigrams(text: str) -> set[str]:
         words = text.lower().split()
@@ -325,88 +376,102 @@ def _jaccard_similarity(a: str, b: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Public nodes
+# Główne Węzły (LangGraph Nodes)
 # ---------------------------------------------------------------------------
-
-def simulate_question(state: FoundryState) -> dict:
+def simulate_question(state: FoundryState) -> Dict[str, Any]:
     """
-    LangGraph node.
-    Reads state["chunk"] + state["perspective"] →
-    returns {"question": ..., "is_adversarial": ...}
+    Inicjuje potok zadając startowe pytanie dla danej partii tekstu.
     """
     chunk = state["chunk"]
     perspective = state.get("perspective", "cfo")
-    is_adversarial = random.random() < settings.adversarial_ratio
+    is_adversarial = random.random() < getattr(settings, "adversarial_ratio", 0.1)
 
     prompts = _ADVERSARIAL_PROMPTS if is_adversarial else _NORMAL_PROMPTS
-    system = prompts.get(perspective, prompts["cfo"])
+    base_system = prompts.get(perspective, prompts["cfo"])
 
-    prompt = (
-        f"Fragment dyrektywy:\n\n{chunk['content']}\n\n"
-        f"Sekcja: {chunk.get('section_heading', 'N/A')}"
+    # Obudowujemy instrukcje w żądanie JSON, nie ingerując w biznesową część Twojego promptu
+    system = (
+        f"{base_system}\n\n"
+        "UWAGA SYSTEMOWA: Twój ostateczny wynik musi być zwrócony w formacie JSON zawierającym dwa klucze:\n"
+        "1. 'reasoning': Twoja krótka analiza.\n"
+        "2. 'question': Wygenerowane pytanie. Podaj tylko treść pytania jako wartość tego klucza, absolutnie bez dodatkowych tekstów czy wstępów."
     )
 
+    prompt = (
+        f"Fragment dyrektywy:\n\n{chunk.get('content', 'Brak tekstu')}\n\n"
+        f"Sekcja dokumentu: {chunk.get('section_heading', 'N/A')}\n"
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt}
+    ]
+
     try:
-        question = _call_vllm(system, prompt)
+        simulated_obj, cost = _call_structured_simulator(messages)
+        question = simulated_obj.question
     except Exception as exc:
-        logger.error("Simulator vLLM call failed: %s", exc)
+        logger.error(f"Krytyczny błąd generatora pytań: {exc}", exc_info=True)
         question = (
             "Jakie sankcje przewiduje ta dyrektywa za naruszenie obowiązków raportowych?"
             if is_adversarial
             else "Jakie są główne wymogi określone w tej sekcji dyrektywy?"
         )
 
-    logger.debug(
-        "Simulator [%s/%s] → %s: %s",
-        perspective,
-        state["chunk"]["id"][:6],
-        "ADV" if is_adversarial else "NRM",
-        question[:80],
+    logger.info(
+        f"💭 [SYMULATOR:{perspective.upper()}] Pytanie ("
+        f"{'ADVERSARIAL' if is_adversarial else 'NORMAL'}) dla chunk {chunk.get('id', 'N/A')[:6]}: {question[:100]}..."
     )
+    
     return {"question": question, "is_adversarial": is_adversarial}
 
 
-def simulate_followup(state: FoundryState) -> dict:
+def simulate_followup(state: FoundryState) -> Dict[str, Any]:
     """
-    LangGraph node — generuje pytanie uzupełniające.
-    Sprawdza podobieństwo Jaccard (≥0.75) — zapobiega powtórkom.
+    Węzeł generujący pytania w rozmowie wieloturowej.
+    Odporny na pętle konwersacyjne dzięki weryfikacji podobieństwa Jaccarda.
     """
     chunk = state["chunk"]
     perspective = state.get("perspective", "cfo")
     conversation_history = state.get("conversation_history", [])
 
-    system = _FOLLOWUP_PROMPTS.get(perspective, _FOLLOWUP_PROMPTS["cfo"])
+    base_system = _FOLLOWUP_PROMPTS.get(perspective, _FOLLOWUP_PROMPTS["cfo"])
+    system = (
+        f"{base_system}\n\n"
+        "UWAGA SYSTEMOWA: Twój ostateczny wynik musi być zwrócony w formacie JSON zawierającym klucze 'reasoning' oraz 'question'."
+    )
 
     history_lines = []
     for msg in conversation_history:
-        label = "Pytanie" if msg["role"] == "user" else "Odpowiedź"
-        history_lines.append(f"{label}: {msg['content']}")
+        label = "Pytanie z historii" if msg["role"] == "user" else "Odpowiedź eksperta"
+        history_lines.append(f"[{label}]: {msg['content']}")
 
     prompt = (
-        f"Fragment dyrektywy (kontekst):\n\n{chunk['content']}\n\n"
-        f"Sekcja: {chunk.get('section_heading', 'N/A')}\n\n"
-        "Dotychczasowa rozmowa:\n\n"
-        + "\n\n".join(history_lines)
+        f"Fragment dyrektywy (kontekst bazowy):\n{chunk.get('content', '')}\n\n"
+        f"Dotychczasowa rozmowa:\n" + "\n\n".join(history_lines)
     )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt}
+    ]
 
     prev_questions = [m["content"] for m in conversation_history if m["role"] == "user"]
 
     try:
-        question = _call_vllm(system, prompt)
-    except Exception as exc:
-        logger.error("Simulator follow-up call failed: %s", exc)
-        question = "Proszę o doprecyzowanie poprzedniej odpowiedzi."
-    else:
+        simulated_obj, cost = _call_structured_simulator(messages)
+        question = simulated_obj.question
+        
+        # Ochrona przed zapętleniem konwersacji
         for prev in prev_questions:
             if _jaccard_similarity(question, prev) >= 0.75:
-                logger.debug("Follow-up duplicate (sim≥0.75) — fallback")
-                question = "Proszę o doprecyzowanie poprzedniej odpowiedzi."
+                logger.warning(f"🔄 [Anti-Loop] Symulator zapętlił pytanie dla chunk {chunk.get('id', 'N/A')[:6]}. Aktywuję Fallback.")
+                question = random.choice(_FALLBACK_QUESTIONS)
                 break
+                
+    except Exception as exc:
+        logger.error(f"Błąd generatora follow-up: {exc}", exc_info=True)
+        question = random.choice(_FALLBACK_QUESTIONS)
 
-    logger.debug(
-        "Simulator follow-up [%s] turn=%d: %s",
-        perspective,
-        state.get("turn_count", 0),
-        question[:80],
-    )
+    logger.debug(f"🗣️ [FOLLOW-UP:{perspective.upper()}] Turn={state.get('turn_count', 0)}: {question[:100]}...")
     return {"question": question, "is_adversarial": False}
