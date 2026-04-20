@@ -10,7 +10,6 @@ Endpoints:
 from __future__ import annotations
 
 import hashlib
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -20,12 +19,24 @@ from sqlalchemy.orm import Session
 
 from api.db import get_session
 from api.schemas import DocumentInfo, DocumentListResponse
+from api.security import require_admin_api_key
 from config.settings import settings
 from db.models import DirectiveChunk, GeneratedSample, SourceDocument
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_api_key)])
 
 DATA_DIR = Path(settings.data_dir)
+_MAX_UPLOAD_BYTES = settings.max_upload_bytes
+
+
+def _safe_data_path(name: str) -> Path:
+    if not name or Path(name).name != name:
+        raise HTTPException(status_code=400, detail=f"Invalid filename: {name}")
+    base = DATA_DIR.resolve()
+    candidate = (DATA_DIR / name).resolve()
+    if base not in candidate.parents:
+        raise HTTPException(status_code=400, detail=f"Invalid path: {name}")
+    return candidate
 
 
 def _file_md5(path: Path) -> str:
@@ -37,7 +48,7 @@ def _file_md5(path: Path) -> str:
 
 
 def _doc_info(filename: str, session: Session) -> DocumentInfo:
-    path = DATA_DIR / filename
+    path = _safe_data_path(filename)
     size = path.stat().st_size if path.exists() else 0
     mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat() if path.exists() else ""
 
@@ -80,13 +91,32 @@ async def upload_documents(
     for file in files:
         if not file.filename:
             continue
-        dest = DATA_DIR / Path(file.filename).name
-        content = await file.read()
-        dest.write_bytes(content)
+        safe_name = Path(file.filename).name
+        dest = _safe_data_path(safe_name)
+
+        total = 0
+        with dest.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_UPLOAD_BYTES:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File too large: {safe_name}. "
+                            f"Limit is {_MAX_UPLOAD_BYTES} bytes."
+                        ),
+                    )
+                out.write(chunk)
+
         uploaded.append(
             DocumentInfo(
                 filename=dest.name,
-                size_bytes=len(content),
+                size_bytes=total,
                 uploaded_at=datetime.now().isoformat(),
                 in_db=False,
                 chunk_count=0,
@@ -122,7 +152,7 @@ def delete_document(
     Delete a PDF from data/.
     If remove_db=true, also removes the SourceDocument and all derived chunks/samples.
     """
-    path = DATA_DIR / filename
+    path = _safe_data_path(filename)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 

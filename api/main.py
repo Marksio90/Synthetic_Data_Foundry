@@ -225,12 +225,13 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 3. Middleware: CORS (Cross-Origin Resource Sharing)
 # Zalecenie: W produkcji podmień ALLOWED_ORIGINS na konkretne domeny z settings.
-ALLOWED_ORIGINS = getattr(settings, "cors_origins", ["*"])
+ALLOWED_ORIGINS = settings.cors_origins or ["http://localhost:3000", "http://localhost:8501"]
+ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
