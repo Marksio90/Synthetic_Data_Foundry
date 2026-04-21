@@ -141,6 +141,18 @@ export async function apiFetch<T = unknown>(
   return res.json() as Promise<T>;
 }
 
+export function getAdminApiKey(): string {
+  return ADMIN_API_KEY;
+}
+
+export function withApiKeyHeaders(headers?: HeadersInit): Headers {
+  const merged = new Headers(headers);
+  if (ADMIN_API_KEY) {
+    merged.set('X-API-Key', ADMIN_API_KEY);
+  }
+  return merged;
+}
+
 // ─── Gap Scout Types ─────────────────────────────────────────────────────────
 
 export interface ScoutSource {
@@ -176,6 +188,11 @@ export interface ScoutTopic {
   source_tier?: 'S' | 'A' | 'B' | 'C';
   estimated_tokens?: number;
   ingest_ready?: boolean;
+  dataset_category?: string;
+  dataset_purpose?: string;
+  demand_score?: number;
+  uniqueness_score?: number;
+  quality_score?: number;
 }
 
 export interface ScoutRun {

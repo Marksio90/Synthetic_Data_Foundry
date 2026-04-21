@@ -30,6 +30,7 @@ const LAYER_MAP: Record<string, string> = {
   // Warstwa A — nauka i badania
   arxiv: 'A', openalex: 'A', semanticscholar: 'A', pubmed: 'A',
   ieee: 'A', core: 'A', hackernews: 'A', biorxiv: 'A', medrxiv: 'A', ssrn: 'A',
+  europepmc: 'A', philpapers: 'A', acm: 'A', base: 'A', chemrxiv: 'A', engrxiv: 'A',
   // Warstwa B — prawo i regulacje
   eurlex: 'B', curia: 'B', federalregister: 'B', secedgar: 'B',
   esma: 'B', eba: 'B', oecd: 'B', wto: 'B', wipo: 'B', epo: 'B',

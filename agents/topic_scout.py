@@ -178,6 +178,11 @@ class ScoutTopicData:
     source_tier: str = "C"                    # best tier across all verified sources
     estimated_tokens: int = 0                 # rough token budget for ingest
     ingest_ready: bool = False                # True when ≥1 verified source present
+    dataset_category: str = "general"         # legal_regulatory | climate_finance | ...
+    dataset_purpose: str = "qa_reasoning"     # compliance_qa | policy_tracking | ...
+    demand_score: float = 0.0                 # estimated practical demand [0..1]
+    uniqueness_score: float = 0.0             # novelty/rarity [0..1]
+    quality_score: float = 0.0                # evidence quality for dataset usefulness [0..1]
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +638,34 @@ _QUERY_ANGLES: list[str] = [
 ]
 
 
+def _select_query_angles(count: int) -> list[str]:
+    """Select mostly unique query angles to improve topical diversity per run."""
+    if count <= 0:
+        return []
+
+    # Prefer non-baseline angles so searches explore specific implementation facets.
+    non_empty = [a for a in _QUERY_ANGLES if a]
+    baseline = [a for a in _QUERY_ANGLES if not a]
+
+    # Up to 1 baseline per run; rest sampled without replacement for uniqueness.
+    baseline_slots = 1 if baseline and count >= 4 else 0
+    non_empty_needed = max(0, count - baseline_slots)
+
+    if non_empty_needed <= len(non_empty):
+        chosen = random.sample(non_empty, non_empty_needed)
+    else:
+        # If we ever request more than available unique angles, recycle with shuffle.
+        chosen = list(non_empty)
+        while len(chosen) < non_empty_needed:
+            chosen.extend(random.sample(non_empty, min(len(non_empty), non_empty_needed - len(chosen))))
+
+    if baseline_slots:
+        chosen.extend(random.sample(baseline, baseline_slots))
+
+    random.shuffle(chosen)
+    return chosen[:count]
+
+
 async def _select_domains(n: int = 6) -> list[str]:
     """Pick domains with the highest LLM knowledge gaps using DB-backed history.
 
@@ -758,6 +791,23 @@ def _infer_format(url: str) -> str:
     return "html"
 
 
+_CATEGORY_RULES: list[tuple[str, tuple[str, ...], str]] = [
+    ("legal_regulatory", ("regulation", "directive", "act", "compliance", "liability", "court"), "compliance_qa"),
+    ("climate_finance", ("taxonomy", "sfdr", "csrd", "carbon", "cbam", "esg", "emissions"), "disclosure_reporting"),
+    ("health_medtech", ("fda", "medical device", "ivdr", "mdr", "clinical", "ema"), "safety_validation"),
+    ("ai_data_governance", ("ai act", "gdpr", "privacy", "model", "data transfer", "copyright"), "risk_controls"),
+    ("capital_markets", ("mifid", "mica", "basel", "aml", "tokenization", "derivatives"), "market_surveillance"),
+]
+
+
+def _infer_dataset_profile(domain: str) -> tuple[str, str]:
+    d = domain.lower()
+    for category, markers, purpose in _CATEGORY_RULES:
+        if any(m in d for m in markers):
+            return category, purpose
+    return "general", "qa_reasoning"
+
+
 # ---------------------------------------------------------------------------
 # Per-domain processing (runs in parallel)
 # ---------------------------------------------------------------------------
@@ -871,6 +921,10 @@ async def _process_domain(
     scoring = await score_topic(ctx)
 
     # Legacy 4-component score kept for backwards compat (used in sort + old API consumers)
+    source_type_diversity = min(1.0, len({s.source_type for s in verified}) / 6.0)
+    high_tier_ratio = sum(1 for s in verified if s.source_tier in {"S", "A"}) / max(1, len(verified))
+    cutoff_coverage = min(1.0, len(post_cutoff_models) / 8.0)
+
     score = round(
         0.40 * recency
         + 0.30 * float(uncertainty)
@@ -878,11 +932,21 @@ async def _process_domain(
         + 0.10 * social,
         3,
     )
+    # Backward-compatible uplift: slightly reward stronger evidence quality and source spread.
+    score = round(min(1.0, score + 0.04 * source_type_diversity + 0.04 * high_tier_ratio), 3)
+
+    # New quality-and-demand profile used for stronger dataset triage.
+    evidence_quality = min(1.0, 0.45 * high_tier_ratio + 0.35 * source_type_diversity + 0.20 * density)
+    uniqueness_score = min(1.0, 0.50 * scoring.knowledge_gap_score + 0.30 * scoring.llm_uncertainty + 0.20 * cutoff_coverage)
+    demand_score = min(1.0, 0.55 * recency + 0.30 * cutoff_coverage + 0.15 * evidence_quality)
+    quality_score = min(1.0, 0.60 * evidence_quality + 0.40 * uniqueness_score)
+    dataset_category, dataset_purpose = _infer_dataset_profile(domain)
 
     await _log(
         f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
         f"tier={best_tier} sources={len(verified)} "
-        f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)}"
+        f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)} "
+        f"quality={quality_score:.2f} uniqueness={uniqueness_score:.2f}"
     )
 
     topic = ScoutTopicData(
@@ -905,7 +969,12 @@ async def _process_domain(
         citation_velocity=scoring.citation_velocity,
         source_tier=best_tier,
         estimated_tokens=est_tokens,
-        ingest_ready=True,
+        ingest_ready=quality_score >= 0.45,
+        dataset_category=dataset_category,
+        dataset_purpose=dataset_purpose,
+        demand_score=round(demand_score, 3),
+        uniqueness_score=round(uniqueness_score, 3),
+        quality_score=round(quality_score, 3),
     )
 
     if topic_callback:
@@ -948,9 +1017,8 @@ async def run_scout(
         domains = await _select_domains(n=6)
         await _log(f"Domains selected: {', '.join(d.split()[0] for d in domains[:4])}...")
 
-    # Assign a unique angle modifier per domain so each run crawls a different
-    # facet of the same topic (enforcement, SME impact, technical standards, …)
-    angles = random.choices(_QUERY_ANGLES, k=len(domains))
+    # Assign mostly unique angle modifiers so each domain explores a distinct facet.
+    angles = _select_query_angles(len(domains))
     angle_preview = [a if a else "(baseline)" for a in angles[:4]]
     await _log(f"Query angles: {angle_preview}...")
 
@@ -964,6 +1032,15 @@ async def run_scout(
     )
 
     results = [r for r in domain_results if isinstance(r, ScoutTopicData)]
-    results.sort(key=lambda t: t.score, reverse=True)
+    # Prioritize topics with high practical usefulness for dataset generation.
+    results.sort(
+        key=lambda t: (
+            0.45 * t.quality_score
+            + 0.25 * t.uniqueness_score
+            + 0.20 * t.knowledge_gap_score
+            + 0.10 * t.demand_score
+        ),
+        reverse=True,
+    )
     await _log(f"Scout complete — {len(results)} topics discovered.")
     return results[:max_topics]
