@@ -1,4 +1,5 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
+const ADMIN_API_KEY = process.env.NEXT_PUBLIC_ADMIN_API_KEY ?? '';
 
 // ─── Response Types ───────────────────────────────────────────────────────────
 
@@ -12,7 +13,7 @@ export interface Document {
 }
 
 export interface Sample {
-  id: number;
+  id: string;
   question: string;
   answer: string;
   perspective: string;
@@ -110,12 +111,15 @@ export async function apiFetch<T = unknown>(
   options?: RequestInit
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
+  const headers = new Headers(options?.headers);
+  headers.set('Content-Type', 'application/json');
+  if (ADMIN_API_KEY) {
+    headers.set('X-API-Key', ADMIN_API_KEY);
+  }
+
   const res = await fetch(url, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options?.headers ?? {}),
-    },
+    headers,
   });
 
   if (!res.ok) {
