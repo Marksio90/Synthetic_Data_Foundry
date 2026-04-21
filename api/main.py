@@ -8,7 +8,9 @@ Services:
   /api/training/* — Hardware inspect, quality gate, SFT/DPO training, export
   /api/chatbot/* — Chat with Ollama model, evaluation runs
   /api/scout/* — Gap Scout: automated knowledge-gap discovery
-  /health           — liveness probe
+  /health           — liveness probe (alias)
+  /health/live      — liveness probe
+  /health/ready     — readiness probe (DB + Ollama checks)
   /metrics          — prometheus metrics export
 
 Start locally:
