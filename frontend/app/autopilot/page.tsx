@@ -1,7 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { Loader2, RotateCcw, Square, Trash2, UploadCloud, Zap } from 'lucide-react';
+import { apiFetch } from '@/lib/api';
 import type { Document, PipelineRun } from '@/lib/api';
 import LiveLog from '@/components/LiveLog';
 import StatusBadge from '@/components/StatusBadge';
@@ -28,6 +30,9 @@ function MetricCard({ label, value }: { label: string; value: string | number })
 }
 
 export default function AutopilotPage() {
+  const searchParams = useSearchParams();
+  const scoutPrefix = searchParams.get('scout_prefix') ?? '';
+
   const [docs, setDocs] = useState<Document[]>([]);
   const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
   const [loadingDocs, setLoadingDocs] = useState(true);
@@ -53,25 +58,23 @@ export default function AutopilotPage() {
     setLoadingDocs(true);
     setDocsError('');
     try {
-      const res = await fetch(`${API}/api/documents`);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail ?? `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      const list: Document[] = Array.isArray(data?.documents)
-        ? data.documents
+      const data = await apiFetch<{ documents?: Document[] } | Document[]>('/api/documents');
+      const list: Document[] = Array.isArray((data as { documents?: Document[] }).documents)
+        ? (data as { documents: Document[] }).documents
         : Array.isArray(data)
-        ? data
+        ? (data as Document[])
         : [];
       setDocs(list);
+      if (scoutPrefix) {
+        setSelectedDocs(new Set(list.filter((d) => d.filename.startsWith(scoutPrefix)).map((d) => d.filename)));
+      }
     } catch (e: unknown) {
       setDocs([]);
       setDocsError(e instanceof Error ? e.message : 'Nie udało się pobrać dokumentów');
     } finally {
       setLoadingDocs(false);
     }
-  }, []);
+  }, [scoutPrefix]);
 
   useEffect(() => { loadDocs(); }, [loadDocs]);
 
@@ -169,14 +172,11 @@ export default function AutopilotPage() {
     setRunning(true);
     setRun(null);
     try {
-      const res = await fetch(`${API}/api/pipeline/run`, {
+      // AI calibrator handles quality_threshold, max_turns, adversarial_ratio automatically
+      const data = await apiFetch<PipelineRun>('/api/pipeline/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // AI calibrator handles quality_threshold, max_turns, adversarial_ratio automatically
         body: JSON.stringify({ filenames: Array.from(selectedDocs) }),
       });
-      if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`);
-      const data: PipelineRun = await res.json();
       setRun(data);
       startPoll(data.run_id);
     } catch (e: unknown) {
