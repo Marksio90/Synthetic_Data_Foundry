@@ -13,7 +13,7 @@ export interface Document {
 }
 
 export interface Sample {
-  id: number;
+  id: string;
   question: string;
   answer: string;
   perspective: string;
