@@ -172,7 +172,7 @@ function TopicCard({
       await ingestTopic(topic.topic_id);
       setIngestDone(true);
       onIngest();
-      setTimeout(() => router.push('/autopilot'), 1600);
+      setTimeout(() => router.push(`/autopilot?scout_prefix=scout_${topic.topic_id.slice(0, 8)}_`), 1600);
     } catch (e: unknown) {
       setIngestErr(e instanceof Error ? e.message : 'Błąd ingestion');
     } finally {
