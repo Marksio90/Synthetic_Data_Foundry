@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Loader2, RotateCcw, Square, Trash2, UploadCloud, Zap } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
@@ -29,7 +29,7 @@ function MetricCard({ label, value }: { label: string; value: string | number })
   );
 }
 
-export default function AutopilotPage() {
+function AutopilotPageContent() {
   const searchParams = useSearchParams();
   const scoutPrefix = searchParams.get('scout_prefix') ?? '';
 
@@ -51,6 +51,8 @@ export default function AutopilotPage() {
   const [cancelling, setCancelling] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const scopedDocs = scoutPrefix ? docs.filter((d) => d.filename.startsWith(scoutPrefix)) : docs;
+  const selectedScopedCount = scopedDocs.filter((d) => selectedDocs.has(d.filename)).length;
 
   // ── Documents ──────────────────────────────────────────────────────────────
 
@@ -86,7 +88,16 @@ export default function AutopilotPage() {
     });
 
   const toggleAll = () =>
-    setSelectedDocs(selectedDocs.size === docs.length ? new Set() : new Set(docs.map((d) => d.filename)));
+    setSelectedDocs((prev) => {
+      const next = new Set(prev);
+      const allScopedSelected = scopedDocs.length > 0 && scopedDocs.every((d) => prev.has(d.filename));
+      if (allScopedSelected) {
+        scopedDocs.forEach((d) => next.delete(d.filename));
+      } else {
+        scopedDocs.forEach((d) => next.add(d.filename));
+      }
+      return next;
+    });
 
   // ── Upload ─────────────────────────────────────────────────────────────────
 
@@ -223,8 +234,14 @@ export default function AutopilotPage() {
             <span className="w-6 h-6 rounded-full bg-accent text-bg-base text-xs flex items-center justify-center font-bold">1</span>
             Dokumenty do przetworzenia
           </h2>
-          <span className="text-sm text-text-muted">{selectedDocs.size}/{docs.length} zaznaczonych</span>
+          <span className="text-sm text-text-muted">{selectedScopedCount}/{scopedDocs.length} zaznaczonych</span>
         </div>
+
+        {scoutPrefix && (
+          <p className="text-xs text-text-muted">
+            Widzisz dokumenty dla jednego tematu Scout (<code>{scoutPrefix}</code>). Większa liczba plików oznacza wiele źródeł dla tego samego tematu.
+          </p>
+        )}
 
         {/* Drag-drop upload zone */}
         <div
@@ -262,7 +279,7 @@ export default function AutopilotPage() {
             <div className="space-y-2">
               {[1, 2, 3].map((i) => <div key={i} className="h-8 bg-bg-surface2 rounded animate-pulse" />)}
             </div>
-          ) : docs.length === 0 ? (
+          ) : scopedDocs.length === 0 ? (
             <p className="text-text-muted text-sm py-4 text-center">
               Brak dokumentów. Wgraj pliki powyżej lub użyj <strong>Gap Scout</strong> → Ingestuj.
             </p>
@@ -271,14 +288,14 @@ export default function AutopilotPage() {
               <label className="flex items-center gap-2 cursor-pointer px-2 py-1.5 rounded hover:bg-bg-surface2 transition-colors">
                 <input
                   type="checkbox"
-                  checked={selectedDocs.size === docs.length && docs.length > 0}
+                  checked={selectedScopedCount === scopedDocs.length && scopedDocs.length > 0}
                   onChange={toggleAll}
                   className="w-4 h-4"
                 />
                 <span className="text-sm font-medium text-text">Zaznacz wszystkie</span>
               </label>
               <div className="border-t border-border" />
-              {docs.map((doc) => (
+              {scopedDocs.map((doc) => (
                 <div key={doc.filename} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-surface2 transition-colors group">
                   <label className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer">
                     <input
@@ -403,5 +420,13 @@ export default function AutopilotPage() {
         )}
       </section>
     </div>
+  );
+}
+
+export default function AutopilotPage() {
+  return (
+    <Suspense fallback={<div className="w-full">Ładowanie…</div>}>
+      <AutopilotPageContent />
+    </Suspense>
   );
 }
