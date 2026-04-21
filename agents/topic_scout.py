@@ -923,7 +923,6 @@ async def _process_domain(
     # Legacy 4-component score kept for backwards compat (used in sort + old API consumers)
     source_type_diversity = min(1.0, len({s.source_type for s in verified}) / 6.0)
     high_tier_ratio = sum(1 for s in verified if s.source_tier in {"S", "A"}) / max(1, len(verified))
-    cutoff_coverage = min(1.0, len(post_cutoff_models) / 8.0)
 
     score = round(
         0.40 * recency
@@ -934,13 +933,6 @@ async def _process_domain(
     )
     # Backward-compatible uplift: slightly reward stronger evidence quality and source spread.
     score = round(min(1.0, score + 0.04 * source_type_diversity + 0.04 * high_tier_ratio), 3)
-
-    # New quality-and-demand profile used for stronger dataset triage.
-    evidence_quality = min(1.0, 0.45 * high_tier_ratio + 0.35 * source_type_diversity + 0.20 * density)
-    uniqueness_score = min(1.0, 0.50 * scoring.knowledge_gap_score + 0.30 * scoring.llm_uncertainty + 0.20 * cutoff_coverage)
-    demand_score = min(1.0, 0.55 * recency + 0.30 * cutoff_coverage + 0.15 * evidence_quality)
-    quality_score = min(1.0, 0.60 * evidence_quality + 0.40 * uniqueness_score)
-    dataset_category, dataset_purpose = _infer_dataset_profile(domain)
 
     await _log(
         f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
@@ -1032,15 +1024,7 @@ async def run_scout(
     )
 
     results = [r for r in domain_results if isinstance(r, ScoutTopicData)]
-    # Prioritize topics with high practical usefulness for dataset generation.
-    results.sort(
-        key=lambda t: (
-            0.45 * t.quality_score
-            + 0.25 * t.uniqueness_score
-            + 0.20 * t.knowledge_gap_score
-            + 0.10 * t.demand_score
-        ),
-        reverse=True,
-    )
+    # Rank by modern gap score first, keeping legacy score as a secondary stabilizer.
+    results.sort(key=lambda t: (0.70 * t.knowledge_gap_score + 0.30 * t.score), reverse=True)
     await _log(f"Scout complete — {len(results)} topics discovered.")
     return results[:max_topics]
