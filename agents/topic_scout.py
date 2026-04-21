@@ -178,6 +178,11 @@ class ScoutTopicData:
     source_tier: str = "C"                    # best tier across all verified sources
     estimated_tokens: int = 0                 # rough token budget for ingest
     ingest_ready: bool = False                # True when ≥1 verified source present
+    dataset_category: str = "general"         # legal_regulatory | climate_finance | ...
+    dataset_purpose: str = "qa_reasoning"     # compliance_qa | policy_tracking | ...
+    demand_score: float = 0.0                 # estimated practical demand [0..1]
+    uniqueness_score: float = 0.0             # novelty/rarity [0..1]
+    quality_score: float = 0.0                # evidence quality for dataset usefulness [0..1]
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +791,23 @@ def _infer_format(url: str) -> str:
     return "html"
 
 
+_CATEGORY_RULES: list[tuple[str, tuple[str, ...], str]] = [
+    ("legal_regulatory", ("regulation", "directive", "act", "compliance", "liability", "court"), "compliance_qa"),
+    ("climate_finance", ("taxonomy", "sfdr", "csrd", "carbon", "cbam", "esg", "emissions"), "disclosure_reporting"),
+    ("health_medtech", ("fda", "medical device", "ivdr", "mdr", "clinical", "ema"), "safety_validation"),
+    ("ai_data_governance", ("ai act", "gdpr", "privacy", "model", "data transfer", "copyright"), "risk_controls"),
+    ("capital_markets", ("mifid", "mica", "basel", "aml", "tokenization", "derivatives"), "market_surveillance"),
+]
+
+
+def _infer_dataset_profile(domain: str) -> tuple[str, str]:
+    d = domain.lower()
+    for category, markers, purpose in _CATEGORY_RULES:
+        if any(m in d for m in markers):
+            return category, purpose
+    return "general", "qa_reasoning"
+
+
 # ---------------------------------------------------------------------------
 # Per-domain processing (runs in parallel)
 # ---------------------------------------------------------------------------
@@ -915,7 +937,8 @@ async def _process_domain(
     await _log(
         f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
         f"tier={best_tier} sources={len(verified)} "
-        f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)}"
+        f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)} "
+        f"quality={quality_score:.2f} uniqueness={uniqueness_score:.2f}"
     )
 
     topic = ScoutTopicData(
@@ -938,7 +961,12 @@ async def _process_domain(
         citation_velocity=scoring.citation_velocity,
         source_tier=best_tier,
         estimated_tokens=est_tokens,
-        ingest_ready=True,
+        ingest_ready=quality_score >= 0.45,
+        dataset_category=dataset_category,
+        dataset_purpose=dataset_purpose,
+        demand_score=round(demand_score, 3),
+        uniqueness_score=round(uniqueness_score, 3),
+        quality_score=round(quality_score, 3),
     )
 
     if topic_callback:

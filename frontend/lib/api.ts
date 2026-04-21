@@ -188,6 +188,11 @@ export interface ScoutTopic {
   source_tier?: 'S' | 'A' | 'B' | 'C';
   estimated_tokens?: number;
   ingest_ready?: boolean;
+  dataset_category?: string;
+  dataset_purpose?: string;
+  demand_score?: number;
+  uniqueness_score?: number;
+  quality_score?: number;
 }
 
 export interface ScoutRun {
