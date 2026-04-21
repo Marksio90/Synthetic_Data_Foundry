@@ -3,7 +3,7 @@
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Loader2, RotateCcw, Square, Trash2, UploadCloud, Zap } from 'lucide-react';
-import { apiFetch } from '@/lib/api';
+import { apiFetch, withApiKeyHeaders } from '@/lib/api';
 import type { Document, PipelineRun } from '@/lib/api';
 import LiveLog from '@/components/LiveLog';
 import StatusBadge from '@/components/StatusBadge';
@@ -110,7 +110,11 @@ function AutopilotPageContent() {
       for (const file of arr) {
         const fd = new FormData();
         fd.append('files', file);
-        const res = await fetch(`${API}/api/documents/upload`, { method: 'POST', body: fd });
+        const res = await fetch(`${API}/api/documents/upload`, {
+          method: 'POST',
+          body: fd,
+          headers: withApiKeyHeaders(),
+        });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.detail ?? `HTTP ${res.status}`);
@@ -129,6 +133,7 @@ function AutopilotPageContent() {
     try {
       const res = await fetch(`${API}/api/documents/${encodeURIComponent(filename)}?remove_db=true`, {
         method: 'DELETE',
+        headers: withApiKeyHeaders(),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setDocs((prev) => prev.filter((d) => d.filename !== filename));
@@ -161,7 +166,9 @@ function AutopilotPageContent() {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`${API}/api/pipeline/status/${runId}`);
+        const res = await fetch(`${API}/api/pipeline/status/${runId}`, {
+          headers: withApiKeyHeaders(),
+        });
         if (res.ok) {
           const data: PipelineRun = await res.json();
           setRun(data);
@@ -200,7 +207,10 @@ function AutopilotPageContent() {
     if (!run) return;
     setCancelling(true);
     try {
-      await fetch(`${API}/api/pipeline/cancel/${run.run_id}`, { method: 'POST' });
+      await fetch(`${API}/api/pipeline/cancel/${run.run_id}`, {
+        method: 'POST',
+        headers: withApiKeyHeaders(),
+      });
       if (pollRef.current) clearInterval(pollRef.current);
       setRunning(false);
       setRun(null);

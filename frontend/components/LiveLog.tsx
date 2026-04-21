@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import ProgressBar from './ProgressBar';
+import { getAdminApiKey, withApiKeyHeaders } from '@/lib/api';
 
 interface LiveLogProps {
   runId: string;
@@ -92,7 +93,9 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
       if (!mountedRef.current) return;
       try {
         const base = apiBase ?? '';
-        const res = await fetch(`${base}/api/pipeline/log/${runId}?offset=${offsetRef.current}`);
+        const res = await fetch(`${base}/api/pipeline/log/${runId}?offset=${offsetRef.current}`, {
+          headers: withApiKeyHeaders(),
+        });
         if (res.ok) {
           const data = await res.json();
           if (data.lines && data.lines.length > 0) {
@@ -128,12 +131,16 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
 
     const base = apiBase ?? '';
     let wsUrl: string;
+    const apiKey = getAdminApiKey();
     if (base.startsWith('http://') || base.startsWith('https://')) {
       wsUrl = base.replace(/^http/, 'ws') + `/api/pipeline/ws/${runId}`;
     } else {
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
       wsUrl = `${protocol}//${host}/api/pipeline/ws/${runId}`;
+    }
+    if (apiKey) {
+      wsUrl += `${wsUrl.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(apiKey)}`;
     }
 
     let wsConnected = false;

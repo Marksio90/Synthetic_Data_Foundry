@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 from agents.calibrator import calibrate
 from agents.doc_analyzer import analyze_documents
 from api.db import get_session
-from api.security import require_admin_api_key
+from api.security import require_admin_api_key, require_admin_api_key_ws
 from api.schemas import (
     AnalysisResponse,
     CalibrationInfo,
@@ -44,10 +44,12 @@ from api.state import runs
 from config.settings import settings
 from db.models import DirectiveChunk, SourceDocument
 
-router = APIRouter(dependencies=[Depends(require_admin_api_key)])
+router = APIRouter()
 
 DATA_DIR = Path(settings.data_dir)
 _PYTHON = sys.executable  # same interpreter as the API
+_RUN_TASKS: dict[str, asyncio.Task] = {}
+_RUN_PROCS: dict[str, asyncio.subprocess.Process] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +94,7 @@ def _get_calibration_chunks(session: Session, filenames: list[str]) -> list:
 # POST /api/pipeline/analyze — fast preview, no pipeline started
 # ---------------------------------------------------------------------------
 
-@router.post("/analyze", response_model=AnalysisResponse)
+@router.post("/analyze", response_model=AnalysisResponse, dependencies=[Depends(require_admin_api_key)])
 def analyze(
     filenames: list[str] = Body(embed=True),
     session: Session = Depends(get_session),
@@ -133,7 +135,7 @@ def analyze(
 # POST /api/pipeline/run — start AutoPilot
 # ---------------------------------------------------------------------------
 
-@router.post("/run", response_model=PipelineRunResponse)
+@router.post("/run", response_model=PipelineRunResponse, dependencies=[Depends(require_admin_api_key)])
 async def run_pipeline(
     req: PipelineRunRequest,
     session: Session = Depends(get_session),
@@ -212,7 +214,7 @@ async def run_pipeline(
     runs.append_log(run_id, "[AutoPilot] Uruchamiam pipeline...")
 
     # Launch background task
-    asyncio.create_task(_run_subprocess(run_id, cmd, env))
+    _RUN_TASKS[run_id] = asyncio.create_task(_run_subprocess(run_id, cmd, env))
 
     return PipelineRunResponse(
         run_id=run_id,
@@ -234,6 +236,7 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
             env=env,
             cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
         )
+        _RUN_PROCS[run_id] = proc
         assert proc.stdout is not None
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").rstrip()
@@ -253,13 +256,39 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
     except Exception as exc:
         runs.update(run_id, status="error", error=str(exc))
         runs.append_log(run_id, f"[AutoPilot] ❌ Wyjątek: {exc}")
+    finally:
+        _RUN_PROCS.pop(run_id, None)
+        _RUN_TASKS.pop(run_id, None)
+
+
+@router.post("/cancel/{run_id}", dependencies=[Depends(require_admin_api_key)])
+async def cancel_run(run_id: str) -> dict[str, str]:
+    """Cancel a running pipeline subprocess."""
+    rec = runs.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    proc = _RUN_PROCS.get(run_id)
+    if proc is None or rec.status not in ("starting", "running"):
+        raise HTTPException(status_code=409, detail=f"Run is not cancellable: {run_id}")
+
+    runs.append_log(run_id, "[AutoPilot] ⏹️ Anulowanie uruchomione przez użytkownika...")
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+    runs.update(run_id, status="error", error="Cancelled by user", ended_at=datetime.datetime.now().timestamp())
+    runs.append_log(run_id, "[AutoPilot] ⏹️ Pipeline anulowany przez użytkownika.")
+    return {"run_id": run_id, "status": "cancelled"}
 
 
 # ---------------------------------------------------------------------------
 # GET /api/pipeline/status/{run_id}
 # ---------------------------------------------------------------------------
 
-@router.get("/status/{run_id}", response_model=PipelineStatusResponse)
+@router.get("/status/{run_id}", response_model=PipelineStatusResponse, dependencies=[Depends(require_admin_api_key)])
 def get_status(run_id: str) -> PipelineStatusResponse:
     rec = runs.get(run_id)
     if rec is None:
@@ -284,7 +313,7 @@ def get_status(run_id: str) -> PipelineStatusResponse:
 # GET /api/pipeline/log/{run_id} — REST polling fallback
 # ---------------------------------------------------------------------------
 
-@router.get("/log/{run_id}", response_model=LogLinesResponse)
+@router.get("/log/{run_id}", response_model=LogLinesResponse, dependencies=[Depends(require_admin_api_key)])
 def get_log(run_id: str, offset: int = 0, limit: int = 200) -> LogLinesResponse:
     """Return log lines from offset to offset+limit. Use for polling."""
     rec = runs.get(run_id)
@@ -298,7 +327,7 @@ def get_log(run_id: str, offset: int = 0, limit: int = 200) -> LogLinesResponse:
 # GET /api/pipeline/runs — list all runs (for UI history)
 # ---------------------------------------------------------------------------
 
-@router.get("/runs")
+@router.get("/runs", dependencies=[Depends(require_admin_api_key)])
 def list_runs() -> list[dict]:
     return [
         {
@@ -327,6 +356,10 @@ async def websocket_log(websocket: WebSocket, run_id: str) -> None:
     Sends one JSON message per line: {"line": "...", "status": "running"}
     Closes when the run is done or errors.
     """
+    if not require_admin_api_key_ws(websocket):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     rec = runs.get(run_id)
     if rec is None:
