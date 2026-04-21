@@ -376,6 +376,41 @@ class Settings(BaseSettings):
     batch_id: str = Field("esg-production-v1")
 
     @field_validator(
+        # All optional API key / secret fields — guard against .env.example comment
+        # text being read as actual values (e.g. "CORE_API_KEY=  # CORE.ac.uk...").
+        # Pydantic strips leading whitespace, so a comment value would start with '#'.
+        "core_api_key", "ieee_api_key", "producthunt_api_key", "youtube_api_key",
+        "podcast_index_api_key", "podcast_index_api_secret", "europeana_api_key",
+        "scout_deepl_api_key", "scout_serpapi_key", "deepl_api_key",
+        "replicate_api_key", "hf_token", "llama_parse_api_key",
+        mode="before",
+    )
+    @classmethod
+    def sanitize_api_key(cls, v: object) -> str:
+        """Return empty string if value looks like a .env comment placeholder."""
+        if not isinstance(v, str):
+            return str(v) if v else ""
+        v = v.strip()
+        if v.startswith("#"):
+            return ""
+        return v
+
+    @field_validator("scout_webhook_callback_url", mode="before")
+    @classmethod
+    def sanitize_webhook_url(cls, v: object) -> str:
+        """Accept only well-formed http/https URLs; treat anything else as empty."""
+        if not isinstance(v, str):
+            return ""
+        v = v.strip()
+        if not v or v.startswith("#"):
+            return ""
+        from urllib.parse import urlparse
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return ""
+        return v
+
+    @field_validator(
         "adversarial_ratio", "quality_threshold", "max_refusal_ratio", "dedup_threshold",
         mode="before",
     )

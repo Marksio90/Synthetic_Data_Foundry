@@ -390,7 +390,7 @@ class CORECrawler(CrawlerBase):
     async def crawl(self, query: str) -> list[ScoutSource]:
         from config.settings import settings
         api_key = getattr(settings, "core_api_key", "")
-        if not api_key:
+        if not api_key or api_key.startswith("#"):
             logger.debug("[core] CORE_API_KEY not set — skipping")
             return []
 
@@ -543,7 +543,7 @@ class IEEEXploreCrawler(CrawlerBase):
     async def crawl(self, query: str) -> list[ScoutSource]:
         from config.settings import settings
         api_key = getattr(settings, "ieee_api_key", "")
-        if not api_key:
+        if not api_key or api_key.startswith("#"):
             logger.debug("[ieee] IEEE_API_KEY not set — skipping")
             return []
 
