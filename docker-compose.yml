@@ -60,7 +60,7 @@
 #   3000  Next.js frontend   http://localhost:3000
 #   8080  FastAPI + Swagger  http://localhost:8080/docs
 #  11434  Ollama API         http://localhost:11434  (zawsze dostepne)
-#   3000  Open WebUI         http://localhost:3000   (--profile chatbot, uwaga: port = frontend)
+#   3001  Open WebUI         http://localhost:3001   (--profile chatbot)
 #   5432  PostgreSQL         (tylko wewnatrz sieci Docker)
 #
 # =============================================================================
@@ -284,6 +284,7 @@ services:
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: http://foundry-api:8080
+      NEXT_PUBLIC_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       API_URL: http://foundry-api:8080
     ports:
       - "3000:3000"
@@ -365,7 +366,7 @@ services:
   # ---------------------------------------------------------------------------
   # Open WebUI — interfejs czatu (profil chatbot)
   #
-  # Dostep: http://localhost:3000
+  # Dostep: http://localhost:3001
   # ---------------------------------------------------------------------------
   open-webui:
     profiles: [chatbot]
@@ -376,7 +377,7 @@ services:
       OLLAMA_BASE_URL: http://ollama:11434
       WEBUI_AUTH: "False"
     ports:
-      - "3000:8080"
+      - "3001:8080"
     depends_on:
       - ollama
     mem_limit: 512m

@@ -1,68 +1,156 @@
-# Performance and Code Quality Audit Report for Synthetic Data Foundry
+# Audyt ulepszeń, poprawek i wzrostu platformy Synthetic Data Foundry
 
-**Date:** 2026-04-20 17:31:48 UTC  
-**Prepared by:** Marksio90
+**Data audytu:** 2026-04-21 (UTC)  
+**Zakres:** analiza pełnego drzewa repozytorium (`REPO_FULL_TREE.txt`) + przegląd kluczowych modułów backend/frontend/DevOps.
 
-## Executive Summary
-This report presents a comprehensive audit of the performance and code quality of the Synthetic Data Foundry repository. The goal is to identify areas for improvement and provide actionable recommendations to enhance the overall quality and efficiency of the codebase.
+---
 
-## Findings
-### Performance Analysis
-- **Load Times:** 
-  - Current load times for key functionalities exceed acceptable thresholds. Further profiling may be required to pinpoint bottlenecks.
+## 1) Executive summary (stan obecny)
 
-- **Resource Utilization:**  
-  - High memory usage detected during data generation processes. This could be optimized.
+Platforma ma mocny fundament architektoniczny (modułowy backend FastAPI, osobny frontend Next.js, pipeline treningowy i crawlerowy), ale jest w fazie **"feature-rich / hardening-poor"**: dużo funkcji, za mało mechanizmów jakości i operacyjnej spójności.
 
-### Code Quality
-- **Complexity:**  
-  - Several modules exhibit high cyclomatic complexity. Refactoring is recommended to improve maintainability.
+### Najważniejsze wnioski
 
-- **Code Duplication:**  
-  - Instances of duplicated code were found across multiple files; these should be consolidated into reusable functions.
+1. **Najwyższe ryzyko operacyjne:** brak testów automatycznych (0 plików testowych), co utrudnia bezpieczne wdrażanie zmian.  
+2. **Najwyższe ryzyko produktowe:** rozjazd API ↔ frontend (typy i autoryzacja), co może generować błędy runtime mimo poprawnej kompilacji.  
+3. **Najwyższe ryzyko utrzymaniowe:** niespójności w warstwie operacyjnej (Makefile vs docker-compose, stare odwołania do serwisów/profili).  
+4. **Największa szansa wzrostu:** wykorzystanie już istniejącej orkiestracji runów/logów i Gap Scouta do wdrożenia „enterprise-grade” observability, SLA i governance danych.
 
-### Best Practices Compliance
-- **Testing:**  
-  - Insufficient unit tests in critical modules. Coverage should be improved to ensure reliability.
+---
 
-- **Documentation:**  
-  - Not all functions are adequately documented, complicating maintenance. Documentation efforts need to be enhanced.
+## 2) Co działa dobrze (mocne strony)
 
-## Recommendations
-1. **Optimize Loading Mechanisms:**  
-   - Implement lazy loading and asynchronous data fetching to improve initial load times.
+- **Czytelny podział domenowy projektu** (agents/api/training/pipeline/frontend/ui), który ułatwia skalowanie zespołowe.  
+- **Centralna konfiguracja przez `pydantic-settings`** i szeroki zakres parametrów środowiskowych.  
+- **Warstwa bezpieczeństwa dla endpointów krytycznych** przez `X-API-Key` + porównanie stałoczasowe (`hmac.compare_digest`).  
+- **Rozbudowana orkiestracja procesów długotrwałych** (run status, logi, background tasks).  
+- **Świadome elementy operacyjne**: healthcheck, GZip, CORS, scheduler, profile kontenerów.
 
-2. **Memory Management:**  
-   - Utilize memory profiling tools to identify heavy memory consumption areas, and implement necessary optimizations.
+---
 
-3. **Refactoring for Complexity Reduction:**  
-   - Identify complex functions and refactor them to reduce cyclomatic complexity, improving readability and maintainability.
+## 3) Krytyczne luki i poprawki (priorytet P0/P1)
 
-4. **Deduplicate Code:**  
-   - Create shared utility functions to eliminate redundancy in the codebase.
+## P0 — jakość i niezawodność
 
-5. **Enhance Testing Coverage:**  
-   - Increase unit tests for critical functionalities and consider integrating automated testing into the CI/CD pipeline.
+### 3.1 Brak testów automatycznych
+- W repozytorium nie ma katalogu/unit testów i brak jest plików testowych.
+- Efekt: wysoka regresyjność przy zmianach API, pipeline i crawlerów.
 
-6. **Documentation Improvement:**  
-   - Create and enforce documentation standards to ensure all functions are well documented.
+**Rekomendacja (P0):**
+- Wprowadzić minimalny pakiet testów: 
+  - API smoke tests (health, docs, auth fail/success),
+  - testy kontraktów odpowiedzi endpointów `/api/samples`, `/api/pipeline`, `/api/training`,
+  - testy jednostkowe parserów/validatorów settings.
 
-## Architectural Optimizations
-- **Microservices Approach:**  
-  - Consider breaking down large components into microservices for better scalability and maintenance.
+### 3.2 Ryzyko niedziałającego frontendu przez auth
+- Kluczowe routery backendu (`documents`, `pipeline`, `training`) wymagają `X-API-Key`.
+- Frontendowy wrapper `apiFetch` nie dokłada nagłówka `X-API-Key`.
+- Efekt: frontend może dostawać 401/503 na podstawowych flow (upload, pipeline, training).
 
-- **Database Optimization:**  
-  - Assess current database schema and indexing strategies to optimize query performance.
+**Rekomendacja (P0):**
+- Dodać obsługę admin key po stronie frontend (env + bezpieczny proxy route / server actions),
+- rozdzielić endpointy operatorskie od user-facing i wdrożyć role/zakresy uprawnień.
 
-## New Feature Proposals
-1. **User Dashboard:**  
-   - Implement a dashboard for users to visualize data generation metrics and performance analytics.
+## P1 — spójność DevOps
 
-2. **API Rate Limiting:**  
-   - Introduce rate limiting for API endpoints to enhance performance and security.
+### 3.3 Niespójny Makefile względem compose
+- `make logs-ui` odwołuje się do `foundry-ui`, którego nie ma w `docker-compose.yml`.
+- `clean` używa profilu `gpu`, choć w compose brak usług z tym profilem (występuje tylko w komentarzach).
 
-3. **Data Quality Assessment Tools:**  
-   - Develop tools to provide feedback on synthetic data quality and compliance with expected standards.
+**Rekomendacja (P1):**
+- zsynchronizować Makefile z realną definicją usług,
+- dodać automatyczny check zgodności komend operacyjnych (np. skrypt walidacyjny w CI).
 
-## Conclusion
-By implementing the recommendations and considering the architectural tweaks, the Synthetic Data Foundry repository can significantly enhance its performance and code quality. Continuous monitoring and iterative improvements will ensure the codebase remains robust and efficient as it scales.
+### 3.4 Konflikt portu 3000 (frontend vs open-webui)
+- Frontend i Open WebUI mapują hosta na port 3000.
+- Efekt: profil `chatbot` koliduje z frontendem i może powodować awarie uruchomienia.
+
+**Rekomendacja (P1):**
+- zmienić mapowanie Open WebUI na inny port hosta (np. 3001),
+- opisać to jasno w README i Makefile.
+
+---
+
+## 4) Luki architektoniczne i techniczne (P1/P2)
+
+### 4.1 Rozjazd kontraktów typów API ↔ frontend
+- `frontend/lib/api.ts` definiuje `Sample.id` jako `number`, gdy backend zwraca UUID/string.
+- Takie rozjazdy powodują błędy UI i utrudniają refaktoryzację.
+
+**Rekomendacja (P1):**
+- wygenerować klienta TS z OpenAPI (`/openapi.json`) albo wprowadzić wspólne DTO schema package.
+
+### 4.2 Nadmiar odpowiedzialności `api/main.py`
+- `api/main.py` łączy konfigurację lifecycle, scheduler, WebSub, middleware i routing.
+- Trudniej testować i rozwijać niezależnie.
+
+**Rekomendacja (P2):**
+- wydzielić moduły bootstrap (`startup.py`, `scheduler.py`, `middlewares.py`),
+- ograniczyć `main.py` do kompozycji aplikacji.
+
+### 4.3 Dwie warstwy UI (Next.js + Streamlit)
+- Repo posiada zarówno frontend Next.js, jak i rozbudowane strony Streamlit.
+- Bez jasnej strategii to zwiększa koszt utrzymania i ryzyko niespójności funkcji.
+
+**Rekomendacja (P2):**
+- zdecydować model docelowy (np. Next.js jako production UI, Streamlit jako wewnętrzne narzędzie R&D),
+- oznaczyć status komponentów i zakres wsparcia.
+
+---
+
+## 5) Plan wzrostu platformy (90 dni)
+
+## Faza 1 (0–30 dni): Stabilizacja i bezpieczeństwo zmian
+- Testy API + kontrakty odpowiedzi.
+- Naprawa auth flow frontend↔API.
+- Synchronizacja Makefile/compose i korekta konfliktów portów.
+- Ustandaryzowany pipeline CI: lint + test + typecheck + smoke docker compose.
+
+**KPI:**
+- min. 35% pokrycia krytycznych modułów,
+- 0 błędów typu „service not found” w komendach operatorskich,
+- 100% krytycznych flow frontendowych działających z auth.
+
+## Faza 2 (31–60 dni): Observability + governance danych
+- Śledzenie jakości runów (time-to-run, fail reason taxonomy, retry rate).
+- Dashboard SLO/SLA dla pipeline i training.
+- Wersjonowanie datasetów + podpisy integralności + lineage.
+
+**KPI:**
+- MTTR < 30 min dla awarii pipeline,
+- pełna identyfikowalność: run → batch → model artifact.
+
+## Faza 3 (61–90 dni): Skalowanie produktu i monetyzacja B2B
+- Feature flags per tenant (perspektywy, progi jakości, watermark policy).
+- Polityki kosztowe (budżet tokenów / run, limit równoległości).
+- Gotowe „pakiety wdrożeniowe” (compliance profile, raporty audytowe dla klienta).
+
+**KPI:**
+- skrócenie czasu onboardingu nowego klienta o 50%,
+- +30% przepustowości runów przy tym samym koszcie infrastruktury.
+
+---
+
+## 6) Backlog rekomendowanych inicjatyw
+
+### Quick wins (1 sprint)
+- [ ] Naprawić `Makefile: logs-ui` i komendy profili.
+- [ ] Ujednolicić typy `Sample` (UUID string) w frontendzie.
+- [ ] Dodać `X-API-Key` flow do frontendu.
+- [ ] Rozdzielić porty frontend/open-webui.
+
+### Mid-term (2–4 sprinty)
+- [ ] Generacja SDK frontend z OpenAPI.
+- [ ] Refaktoryzacja `api/main.py` na moduły bootstrap.
+- [ ] Testy integracyjne pipeline/training z mockami usług zewnętrznych.
+
+### Long-term (kwartał)
+- [ ] Multi-tenant billing + cost controls.
+- [ ] Rejestrowanie polityk jakości i audytowalności per klient.
+- [ ] API publiczne z limitami i planami taryfowymi.
+
+---
+
+## 7) Podsumowanie końcowe
+
+Projekt ma potencjał na platformę klasy enterprise, ale **najpierw wymaga warstwy stabilizacji**: testów, zgodności kontraktów i uporządkowania operacyjnego. Po wykonaniu tych kroków można bezpiecznie przyspieszyć rozwój funkcji wzrostowych (multi-tenant, governance, cost controls), co realnie zwiększy wartość biznesową i przewidywalność dostarczania.

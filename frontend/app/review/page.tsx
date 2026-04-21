@@ -57,7 +57,7 @@ export default function ReviewPage() {
     else { setError(msg); setTimeout(() => setError(''), 5000); }
   };
 
-  const patchSample = async (id: number, action: string, editedAnswer?: string) => {
+  const patchSample = async (id: string, action: string, editedAnswer?: string) => {
     const params: Record<string, string> = { action };
     if (editedAnswer !== undefined) params.edited_answer = editedAnswer;
     const qs = new URLSearchParams(params).toString();
@@ -68,7 +68,7 @@ export default function ReviewPage() {
     }
   };
 
-  const handleApprove = async (id: number) => {
+  const handleApprove = async (id: string) => {
     setSamples(prev => prev.map(s => s.id === id ? { ...s, saving: true } : s));
     try {
       await patchSample(id, 'approve');
@@ -80,7 +80,7 @@ export default function ReviewPage() {
     }
   };
 
-  const handleReject = async (id: number) => {
+  const handleReject = async (id: string) => {
     if (!confirm('Odrzucić tę próbkę?')) return;
     setSamples(prev => prev.map(s => s.id === id ? { ...s, saving: true } : s));
     try {
@@ -93,7 +93,7 @@ export default function ReviewPage() {
     }
   };
 
-  const handleEditToggle = (id: number) => {
+  const handleEditToggle = (id: string) => {
     setSamples(prev => prev.map(s =>
       s.id === id
         ? { ...s, editMode: !s.editMode, editText: s.editMode ? s.editText : s.answer }
@@ -101,7 +101,7 @@ export default function ReviewPage() {
     ));
   };
 
-  const handleEditSave = async (id: number) => {
+  const handleEditSave = async (id: string) => {
     const s = samples.find(x => x.id === id);
     if (!s || !s.editText) return;
     setSamples(prev => prev.map(x => x.id === id ? { ...x, saving: true } : x));
