@@ -70,11 +70,26 @@ CREATE INDEX IF NOT EXISTS idx_chunks_valid
     ON directive_chunks (is_superseded, valid_from_date DESC)
     WHERE is_superseded = FALSE;
 
--- IVFFlat ANN index — rebuild with VACUUM ANALYZE after bulk inserts
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-    ON directive_chunks
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- IVFFlat ANN index — create only when embeddings exist to avoid low-recall init warning.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM directive_chunks
+        WHERE embedding IS NOT NULL
+        LIMIT 1
+    ) THEN
+        EXECUTE '
+            CREATE INDEX IF NOT EXISTS idx_chunks_embedding
+            ON directive_chunks
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100)
+        ';
+    ELSE
+        RAISE NOTICE 'Skipping idx_chunks_embedding creation (no embeddings yet).';
+    END IF;
+END;
+$$;
 
 -- GIN trigram index for BM25-like keyword search
 CREATE INDEX IF NOT EXISTS idx_chunks_trgm
