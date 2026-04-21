@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Loader2, RotateCcw, Square, Trash2, UploadCloud, Zap } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
@@ -29,7 +29,7 @@ function MetricCard({ label, value }: { label: string; value: string | number })
   );
 }
 
-export default function AutopilotPage() {
+function AutopilotPageContent() {
   const searchParams = useSearchParams();
   const scoutPrefix = searchParams.get('scout_prefix') ?? '';
 
@@ -403,5 +403,13 @@ export default function AutopilotPage() {
         )}
       </section>
     </div>
+  );
+}
+
+export default function AutopilotPage() {
+  return (
+    <Suspense fallback={<div className="w-full">Ładowanie…</div>}>
+      <AutopilotPageContent />
+    </Suspense>
   );
 }
