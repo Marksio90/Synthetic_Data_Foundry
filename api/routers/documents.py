@@ -23,7 +23,7 @@ from api.security import require_admin_api_key
 from config.settings import settings
 from db.models import DirectiveChunk, GeneratedSample, SourceDocument
 
-router = APIRouter(dependencies=[Depends(require_admin_api_key)])
+router = APIRouter()
 
 DATA_DIR = Path(settings.data_dir)
 _MAX_UPLOAD_BYTES = settings.max_upload_bytes
@@ -83,6 +83,7 @@ def _doc_info(filename: str, session: Session) -> DocumentInfo:
 @router.post("/upload")
 async def upload_documents(
     files: list[UploadFile] = File(...),
+    _admin_auth: None = Depends(require_admin_api_key),
     session: Session = Depends(get_session),
 ) -> dict:
     """Upload one or more PDF files to the data/ directory."""
@@ -146,6 +147,7 @@ def list_documents(session: Session = Depends(get_session)) -> DocumentListRespo
 def delete_document(
     filename: str,
     remove_db: bool = False,
+    _admin_auth: None = Depends(require_admin_api_key),
     session: Session = Depends(get_session),
 ) -> dict:
     """
