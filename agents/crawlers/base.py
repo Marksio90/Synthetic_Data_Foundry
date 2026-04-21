@@ -17,9 +17,10 @@ from __future__ import annotations
 import logging
 import random
 import time
+import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, ClassVar, Optional, Dict, Any
+from typing import TYPE_CHECKING, ClassVar, Optional, Dict, Any, Tuple
 
 import httpx
 
@@ -82,6 +83,7 @@ class CrawlerBase(ABC):
 
     _CB_THRESHOLD: ClassVar[int] = 5                 # Błędy wyzwalające Circuit Breaker
     _CB_PAUSE_SECONDS: ClassVar[int] = 300           # Czas otwarcia obwodu (Pauza 5 min)
+    _KNOWN_BOT_BLOCKED_SOURCES: ClassVar[set[str]] = {"ssrn", "oecd", "epo", "esma"}
 
     # Domyślne nagłówki Anti-Ban
     _USER_AGENTS = [
@@ -168,6 +170,16 @@ class CrawlerBase(ABC):
 
         async def _do() -> httpx.Response:
             resp = await self._http.request(method, url, headers=headers, **kwargs)
+            if resp.status_code in (429, 503):
+                retry_after = self._parse_retry_after(resp.headers.get("retry-after", ""))
+                if retry_after > 0:
+                    logger.info(
+                        "[%s] PROVIDER_RATE_LIMITED — retry-after=%ss, adaptive pause before retry.",
+                        self.source_id, retry_after,
+                        extra={"crawler": self.source_id, "error_code": "PROVIDER_RATE_LIMITED", "retry_after_seconds": retry_after},
+                    )
+                    await asyncio.sleep(min(retry_after, 10))
+                resp.raise_for_status()
             if 400 <= resp.status_code < 500:
                 logger.debug(f"[{self.source_id}] Klient HTTP zablokowany ({resp.status_code}) — zaniechanie powtórzeń.")
                 return resp
@@ -222,9 +234,9 @@ class CrawlerBase(ABC):
             try:
                 if int(remaining) < 5:
                     logger.warning(
-                        "[%s] ⚠️ BARDZO NISKI POZIOM RATE LIMITU: Pozostało %s zapytań!",
+                        "[%s] PROVIDER_RATE_LIMITED (low remaining): Pozostało %s zapytań.",
                         self.source_id, remaining,
-                        extra={"crawler": self.source_id, "rl_remaining": remaining},
+                        extra={"crawler": self.source_id, "rl_remaining": remaining, "error_code": "PROVIDER_RATE_LIMITED"},
                     )
             except ValueError:
                 pass
@@ -266,12 +278,26 @@ class CrawlerBase(ABC):
         _record_fetch(self.source_id, elapsed, success=True)
 
     def _on_error(self, exc: Exception, elapsed: float) -> None:
+        error_code, severity, details = self._classify_error(exc)
         self._consecutive_errors += 1
-        logger.warning(
-            "[%s] Błąd skanowania (%d/%d): %s",
-            self.source_id, self._consecutive_errors, self._CB_THRESHOLD, exc,
-            extra={"crawler": self.source_id, "error": str(exc)},
-        )
+        payload = {
+            "crawler": self.source_id,
+            "error": str(exc),
+            "error_code": error_code,
+            "error_kind": details,
+        }
+        if severity == "info":
+            logger.info(
+                "[%s] %s (%d/%d): %s",
+                self.source_id, error_code, self._consecutive_errors, self._CB_THRESHOLD, details,
+                extra=payload,
+            )
+        else:
+            logger.warning(
+                "[%s] %s (%d/%d): %s",
+                self.source_id, error_code, self._consecutive_errors, self._CB_THRESHOLD, details,
+                extra=payload,
+            )
         if self._consecutive_errors >= self._CB_THRESHOLD:
             self._paused_until = datetime.now(timezone.utc) + timedelta(seconds=self._CB_PAUSE_SECONDS)
             self._consecutive_errors = 0
@@ -285,6 +311,31 @@ class CrawlerBase(ABC):
                 },
             )
         _record_fetch(self.source_id, elapsed, success=False)
+
+    @staticmethod
+    def _parse_retry_after(raw: str) -> int:
+        try:
+            return max(0, int(raw.strip()))
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+    def _classify_error(self, exc: Exception) -> Tuple[str, str, str]:
+        if isinstance(exc, httpx.TimeoutException):
+            return "PROVIDER_TIMEOUT", "warning", "request timeout"
+        if isinstance(exc, httpx.ConnectError):
+            return "PROVIDER_DNS_FAILURE", "warning", "network/dns connectivity failure"
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if status == 403 and self.source_id == "ieee":
+                return "PROVIDER_AUTH_FORBIDDEN", "info", "IEEE 403 — sprawdź scope IEEE API key"
+            if status in (403, 404) and self.source_id in self._KNOWN_BOT_BLOCKED_SOURCES:
+                return "PROVIDER_BOT_BLOCKED", "info", f"known-hostile source status={status}"
+            if status == 429:
+                return "PROVIDER_RATE_LIMITED", "warning", "HTTP 429 Too Many Requests"
+            if status == 503:
+                return "PROVIDER_RATE_LIMITED", "warning", "HTTP 503 Service Unavailable"
+            return "PROVIDER_HTTP_ERROR", "warning", f"HTTP status={status}"
+        return "PROVIDER_UNKNOWN_ERROR", "warning", type(exc).__name__
 
     # ------------------------------------------------------------------
     # Interfejsy Cyklu Życia (Async Context Managers)
