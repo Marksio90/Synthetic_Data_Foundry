@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -442,6 +443,7 @@ def _compute_recency(sources: list[ScoutSource]) -> float:
 # ---------------------------------------------------------------------------
 
 _CANDIDATE_DOMAINS = [
+    # ESG reporting & disclosure
     "CSRD corporate sustainability reporting directive",
     "EU AI Act compliance obligations",
     "SFDR sustainable finance disclosure regulation",
@@ -458,11 +460,50 @@ _CANDIDATE_DOMAINS = [
     "supply chain ESG due diligence regulation",
     "EU hydrogen strategy renewable energy directive",
     "greenwashing enforcement ESG claims regulation",
+    # Emerging / less-covered topics for variety
+    "just transition social taxonomy EU",
+    "nature positive targets post-2020 biodiversity framework",
+    "carbon credits voluntary market integrity",
+    "scope 3 category 15 financed emissions methodology",
+    "double materiality assessment VSME SME reporting",
+    "transition finance credibility criteria",
+    "plastic tax extended producer responsibility EU",
+    "water stewardship corporate disclosure",
+    "deforestation-free supply chain regulation EUDR",
+    "soil health monitoring EU law",
+    "circular economy product passport regulation",
+    "AI energy consumption data centre regulation",
+    "sustainable aviation fuel SAF mandate EU",
+    "methane regulation oil gas EU enforcement",
+    "stranded assets climate scenario analysis banks",
+    "gender pay gap reporting directive EU",
 ]
+
+# Module-level memory: avoid repeating the same domains across consecutive runs
+_recently_selected_domains: list[str] = []
+_RECENT_DOMAIN_MEMORY = 18  # remember at least one full rotation
 
 
 async def _select_domains(n: int = 6) -> list[str]:
-    """Use the LLM to pick the domains with the most likely knowledge gaps."""
+    """Use the LLM to pick domains with the most likely knowledge gaps.
+
+    Randomises the candidate pool and excludes recently-used domains so each
+    Scout run surfaces different topics.
+    """
+    global _recently_selected_domains
+
+    # Exclude domains selected in previous runs to force variety
+    available = [d for d in _CANDIDATE_DOMAINS if d not in _recently_selected_domains]
+    if len(available) < n:
+        # Full rotation complete — reset memory and start fresh
+        _recently_selected_domains = []
+        available = list(_CANDIDATE_DOMAINS)
+
+    # Present a random subset so the LLM's ordering bias doesn't fix the result
+    subset_size = min(len(available), n + 8)
+    candidates = random.sample(available, subset_size)
+
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     try:
         resp = await _OPENAI.chat.completions.create(
             model=settings.openai_primary_model,
@@ -470,26 +511,41 @@ async def _select_domains(n: int = 6) -> list[str]:
                 {
                     "role": "system",
                     "content": (
-                        "You are an ESG and regulatory compliance expert. "
-                        f"Select the {n} domains most likely to have significant "
-                        "recent developments (post-2023) that AI models would not know about. "
-                        "Return ONLY a JSON array of strings, no other text. "
+                        f"Today is {today}. You are an ESG and regulatory compliance expert. "
+                        f"Select {n} domains from the list below that are most likely to have "
+                        "significant recent developments that AI language models would not yet "
+                        "know about. Prioritise variety — choose topics that are less mainstream "
+                        "and less likely to have been analysed recently. "
+                        "Return ONLY a JSON array of strings copied exactly from the list, no other text.\n"
                         "Domains to choose from:\n"
-                        + "\n".join(f"- {d}" for d in _CANDIDATE_DOMAINS)
+                        + "\n".join(f"- {d}" for d in candidates)
                     ),
                 },
-                {"role": "user", "content": f"Select {n} domains with the highest knowledge gaps."},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Select {n} domains with the highest knowledge gaps as of {today}. "
+                        "Favour less-obvious choices."
+                    ),
+                },
             ],
-            temperature=0.3,
-            max_tokens=300,
+            temperature=0.9,
+            max_tokens=400,
         )
         raw = _strip_json_fences(resp.choices[0].message.content.strip())
         selected = json.loads(raw)
         if isinstance(selected, list) and selected:
-            return [str(d) for d in selected[:n]]
+            result = [str(d) for d in selected[:n]]
+            # Remember these so the next run picks different ones
+            _recently_selected_domains = (_recently_selected_domains + result)[-_RECENT_DOMAIN_MEMORY:]
+            return result
     except Exception as exc:
-        logger.warning("Domain auto-selection failed: %s — using defaults", exc)
-    return _CANDIDATE_DOMAINS[:n]
+        logger.warning("Domain auto-selection failed: %s — using random fallback", exc)
+
+    # Fallback: random sample from available candidates (not the same fixed head)
+    fallback = random.sample(available, min(n, len(available)))
+    _recently_selected_domains = (_recently_selected_domains + fallback)[-_RECENT_DOMAIN_MEMORY:]
+    return fallback
 
 
 # ---------------------------------------------------------------------------
