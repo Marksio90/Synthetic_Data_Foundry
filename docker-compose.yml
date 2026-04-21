@@ -280,6 +280,7 @@ services:
       dockerfile: ../docker/Dockerfile.frontend
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8080
+        NEXT_PUBLIC_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
     container_name: foundry_frontend
     restart: unless-stopped
     environment:
