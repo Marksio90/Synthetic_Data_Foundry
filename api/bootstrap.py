@@ -243,6 +243,50 @@ def register_system_routes(app: FastAPI) -> None:
     def health() -> dict:
         return {"status": "ok", "service": "foundry-api-pro", "timestamp": time.time()}
 
+    @app.get("/health/live", tags=["System"])
+    def health_live() -> dict:
+        """Kubernetes liveness probe — confirms the process is alive."""
+        return {"status": "ok", "service": "foundry-api-pro", "timestamp": time.time()}
+
+    @app.get("/health/ready", tags=["System"])
+    async def health_ready() -> JSONResponse:
+        """Kubernetes readiness probe — verifies DB and optional services are reachable."""
+        import sqlalchemy
+        from api.db import _engine
+
+        checks: dict = {}
+        healthy = True
+
+        # database
+        try:
+            with _engine.connect() as conn:
+                conn.execute(sqlalchemy.text("SELECT 1"))
+            checks["database"] = {"status": "ok"}
+        except Exception as exc:
+            checks["database"] = {"status": "error", "detail": str(exc)}
+            healthy = False
+
+        # ollama — optional, degraded state does not block readiness
+        ollama_url = getattr(settings, "ollama_url", "")
+        if ollama_url:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get(f"{ollama_url}/api/tags")
+                checks["ollama"] = {"status": "ok" if resp.status_code == 200 else "degraded"}
+            except Exception:
+                checks["ollama"] = {"status": "degraded"}
+
+        return JSONResponse(
+            status_code=200 if healthy else 503,
+            content={
+                "status": "ok" if healthy else "error",
+                "service": "foundry-api-pro",
+                "timestamp": time.time(),
+                "checks": checks,
+            },
+        )
+
     @app.get("/metrics", include_in_schema=False)
     def metrics():
         from fastapi import HTTPException
