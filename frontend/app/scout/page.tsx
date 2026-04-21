@@ -144,11 +144,13 @@ function FeedbackPanel({ topicId }: { topicId: string }) {
 function TopicCard({
   topic,
   isNew,
+  wasIngested,
   onIngest,
 }: {
   topic: ScoutTopic;
   isNew: boolean;
-  onIngest: () => void;
+  wasIngested: boolean;
+  onIngest: (topicId: string) => void;
 }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -171,7 +173,7 @@ function TopicCard({
     try {
       await ingestTopic(topic.topic_id);
       setIngestDone(true);
-      onIngest();
+      onIngest(topic.topic_id);
       setTimeout(() => router.push(`/autopilot?scout_prefix=scout_${topic.topic_id.slice(0, 8)}_`), 1600);
     } catch (e: unknown) {
       setIngestErr(e instanceof Error ? e.message : 'Błąd ingestion');
@@ -183,7 +185,11 @@ function TopicCard({
   const sourceTypes = Array.from(new Set(topic.sources.map((s) => s.source_type)));
 
   return (
-    <div className={`rounded-lg border border-border bg-bg-surface p-4 flex flex-col gap-2.5 ${isNew ? 'topic-appear' : ''}`}>
+    <div
+      className={`rounded-lg border p-4 flex flex-col gap-2.5 ${
+        wasIngested ? 'border-accent/40 bg-accent/5' : 'border-border bg-bg-surface'
+      } ${isNew ? 'topic-appear' : ''}`}
+    >
       <div className="flex items-start gap-3">
         <span className={`shrink-0 w-9 h-9 rounded-md border flex items-center justify-center text-xs font-bold tabular-nums ${scoreCls}`}>
           {displayScore}
@@ -191,6 +197,12 @@ function TopicCard({
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-text leading-snug line-clamp-2">{topic.title}</p>
           <p className="text-[11px] text-text-muted mt-0.5 line-clamp-1">{topic.summary}</p>
+          {wasIngested && (
+            <p className="mt-1 inline-flex items-center gap-1 rounded bg-accent/10 border border-accent/30 px-1.5 py-0.5 text-[10px] text-accent">
+              <CheckCircle2 className="w-3 h-3" />
+              Temat był już wcześniej ingestowany
+            </p>
+          )}
         </div>
       </div>
 
@@ -246,7 +258,7 @@ function TopicCard({
               hover:bg-accent/20 disabled:opacity-50 transition-colors"
           >
             {ingesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-            Ingestuj
+            {wasIngested ? 'Ingestuj ponownie' : 'Ingestuj'}
           </button>
         )}
       </div>
@@ -352,7 +364,9 @@ export default function ScoutPage() {
   const [scoutId, setScoutId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [filter, setFilter] = useState<string>('all');
+  const [ingestedTopicIds, setIngestedTopicIds] = useState<Set<string>>(new Set());
   const knownIdsRef = useRef<Set<string>>(new Set());
+  const INGESTED_TOPICS_KEY = 'scout_ingested_topic_ids_v1';
 
   const loadTopics = useCallback(async (markNew = false) => {
     try {
@@ -379,6 +393,17 @@ export default function ScoutPage() {
   }, []);
 
   useEffect(() => { loadTopics(false); }, [loadTopics]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(INGESTED_TOPICS_KEY);
+      if (!raw) return;
+      const ids = JSON.parse(raw) as string[];
+      if (Array.isArray(ids)) setIngestedTopicIds(new Set(ids));
+    } catch {
+      /* ignore localStorage parsing errors */
+    }
+  }, []);
 
   // Odpytuj tematy co 2.5s podczas aktywnego skanu
   useEffect(() => {
@@ -414,7 +439,19 @@ export default function ScoutPage() {
     [topics, filter],
   );
 
-  const handleIngest = useCallback(() => { loadTopics(false); }, [loadTopics]);
+  const handleIngest = useCallback((topicId: string) => {
+    setIngestedTopicIds((prev) => {
+      const next = new Set(prev);
+      next.add(topicId);
+      try {
+        window.localStorage.setItem(INGESTED_TOPICS_KEY, JSON.stringify(Array.from(next)));
+      } catch {
+        /* ignore localStorage write errors */
+      }
+      return next;
+    });
+    loadTopics(false);
+  }, [loadTopics]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -526,6 +563,7 @@ export default function ScoutPage() {
                         key={topic.topic_id}
                         topic={topic}
                         isNew={newTopicIds.has(topic.topic_id)}
+                        wasIngested={ingestedTopicIds.has(topic.topic_id)}
                         onIngest={handleIngest}
                       />
                     ))}
