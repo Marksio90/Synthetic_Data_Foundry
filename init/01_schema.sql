@@ -208,6 +208,32 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================================================
+-- scout_domain_history: rolling log of domains selected per scout run.
+-- Gap Scout reads this table on startup to avoid re-scanning the same domains
+-- in consecutive runs (persistent across container restarts).
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS scout_domain_history (
+    id          BIGSERIAL   PRIMARY KEY,
+    domain_text TEXT        NOT NULL,
+    run_id      TEXT        NOT NULL DEFAULT '',
+    selected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sdh_selected_at ON scout_domain_history (selected_at DESC);
+
+-- =============================================================================
+-- scout_domain_exclusions: domains permanently removed from future scans.
+-- Populated when a user clicks "Ingestuj" — the domain is being worked on and
+-- MUST NOT appear in future Gap Scout runs.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS scout_domain_exclusions (
+    topic_id    TEXT        PRIMARY KEY,
+    domain_text TEXT        NOT NULL,
+    topic_title TEXT        NOT NULL DEFAULT '',
+    excluded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sde_domain ON scout_domain_exclusions (domain_text);
+
+-- =============================================================================
 -- Stored procedure: mark chunk ready + bump retry on failure (ACID)
 -- =============================================================================
 CREATE OR REPLACE FUNCTION finalize_chunk(

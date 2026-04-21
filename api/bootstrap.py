@@ -115,13 +115,11 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
                 max_instances=1,
             )
             scheduler.start()
-            logger.info("APScheduler aktywny — zadanie 'hourly_scout' zaplanowane.")
-
-            async def _delayed_scout() -> None:
-                await asyncio.sleep(10.0)
-                await run_scheduled_scout(logger)
-
-            task_manager.add_task(_delayed_scout(), name="delayed_initial_scout")
+            logger.info(
+                "APScheduler aktywny — zadanie 'hourly_scout' zaplanowane. "
+                "Pierwszy automatyczny skan za 1 godzinę; "
+                "manualny start przez przycisk na frontendzie."
+            )
 
         callback_url = getattr(settings, "scout_webhook_callback_url", "")
         webhook_secret = getattr(settings, "scout_webhook_secret", "")

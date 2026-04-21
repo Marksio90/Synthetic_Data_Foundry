@@ -239,6 +239,20 @@ async def ingest_topic(topic_id: str) -> dict:
             saved_paths.append(filename)
             logger.info("Ingest: saved %s (%d B)", filename, len(resp.content))
 
+    # Permanently exclude this domain from future Gap Scout runs —
+    # the user has selected this topic for work, so it must not be re-discovered.
+    domain_text = topic.domains[0] if topic.domains else topic.title
+    try:
+        from agents.scout_history import exclude_domain_permanently
+        await exclude_domain_permanently(
+            topic_id=topic_id,
+            domain_text=domain_text,
+            topic_title=topic.title,
+        )
+        logger.info("Scout: domain '%s' permanently excluded from future scans.", domain_text[:60])
+    except Exception as exc:
+        logger.warning("Scout: could not persist domain exclusion: %s", exc)
+
     return {
         "topic_id": topic_id,
         "title": topic.title,
@@ -246,9 +260,10 @@ async def ingest_topic(topic_id: str) -> dict:
         "errors": len(errors),
         "output_dir": str(_DATA_DIR),
         "paths": saved_paths[:5],
+        "domain_excluded": domain_text,
         "message": (
             f"Pobrano {len(saved_paths)}/{len(verified)} źródeł do {_DATA_DIR}. "
-            f"Pliki gotowe — przejdź do AutoPilota."
+            f"Temat wykluczony z przyszłych skanów. Pliki gotowe — przejdź do AutoPilota."
         ),
     }
 

@@ -27,6 +27,7 @@ import json
 import logging
 import random
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
@@ -442,68 +443,231 @@ def _compute_recency(sources: list[ScoutSource]) -> float:
 # Domain auto-selection
 # ---------------------------------------------------------------------------
 
-_CANDIDATE_DOMAINS = [
-    # ESG reporting & disclosure
-    "CSRD corporate sustainability reporting directive",
-    "EU AI Act compliance obligations",
-    "SFDR sustainable finance disclosure regulation",
-    "carbon border adjustment mechanism CBAM",
-    "DORA digital operational resilience act financial sector",
-    "EU taxonomy green finance technical screening criteria",
-    "corporate sustainability due diligence CSDDD",
-    "climate risk financial reporting TCFD ISSB",
-    "ESG rating providers regulation EU",
-    "net zero transition planning financial institutions",
-    "TNFD biodiversity nature-related financial disclosure",
-    "ISSB IFRS S1 S2 sustainability accounting standards",
-    "SEC climate disclosure rules scope 3 emissions",
-    "supply chain ESG due diligence regulation",
-    "EU hydrogen strategy renewable energy directive",
-    "greenwashing enforcement ESG claims regulation",
-    # Emerging / less-covered topics for variety
-    "just transition social taxonomy EU",
-    "nature positive targets post-2020 biodiversity framework",
-    "carbon credits voluntary market integrity",
-    "scope 3 category 15 financed emissions methodology",
-    "double materiality assessment VSME SME reporting",
-    "transition finance credibility criteria",
-    "plastic tax extended producer responsibility EU",
-    "water stewardship corporate disclosure",
-    "deforestation-free supply chain regulation EUDR",
-    "soil health monitoring EU law",
-    "circular economy product passport regulation",
-    "AI energy consumption data centre regulation",
-    "sustainable aviation fuel SAF mandate EU",
-    "methane regulation oil gas EU enforcement",
-    "stranded assets climate scenario analysis banks",
-    "gender pay gap reporting directive EU",
+# ---------------------------------------------------------------------------
+# Candidate domain pool — 120+ topics spanning LLM knowledge-gap blind spots.
+# Domains are drawn randomly each run; DB history prevents repetition.
+# ---------------------------------------------------------------------------
+
+_CANDIDATE_DOMAINS: list[str] = [
+    # ── EU Digital & AI Regulation ───────────────────────────────────────────
+    "EU AI Act high-risk systems conformity assessment requirements",
+    "AI liability directive EU strict liability algorithmic harm",
+    "Digital Markets Act DMA gatekeeper enforcement Big Tech 2025",
+    "Digital Services Act DSA very-large-platform content moderation audit",
+    "Cyber Resilience Act CRA product security CE marking",
+    "NIS2 directive cybersecurity critical infrastructure national implementation",
+    "European Health Data Space EHDS secondary use personal health data",
+    "Data Governance Act DGA data intermediary altruism certification",
+    "EU Data Act cloud switching portability obligations",
+    "eIDAS 2.0 European digital identity wallet implementation",
+    "AI Act general purpose AI GPAI systemic risk model evaluation",
+    "Ecodesign regulation software digital products energy efficiency",
+    "EU Chips Act semiconductor first-in-class fabrication subsidies",
+    "biometric surveillance prohibition real-time remote AI enforcement",
+    "open source AI model regulation liability exemptions EU",
+    "foundation model transparency GPAI code of practice obligations",
+    "quantum computing export controls dual-use regulation",
+    "AI Act prohibited practices social scoring emotion recognition ban",
+    "digital product passport regulation circular economy implementation",
+    "platform-to-business regulation P2B ranking transparency enforcement",
+    # ── EU ESG & Sustainability Reporting ────────────────────────────────────
+    "CSRD corporate sustainability reporting ESRS sector-specific standards",
+    "SFDR sustainable finance disclosure RTS level 2 PAI indicators",
+    "EU taxonomy green finance technical screening nuclear gas controversy",
+    "corporate sustainability due diligence CSDDD civil liability chain",
+    "ISSB IFRS S1 S2 sustainability accounting national adoption schedule",
+    "TNFD biodiversity nature-related financial disclosure taskforce",
+    "double materiality assessment VSME SME proportionality reporting",
+    "ESG rating providers regulation EU methodology transparency conflicts",
+    "greenwashing enforcement ESG claims substantiation EU case law",
+    "transition finance credibility criteria financial institutions alignment",
+    "gender pay gap reporting directive EU equal pay audit enforcement",
+    "supply chain ESG due diligence forced labor import ban",
+    "scope 3 category 15 financed emissions PCAF methodology banks",
+    "carbon credits voluntary market integrity VCMI ICVCM standards",
+    "nature positive targets Kunming-Montreal post-2020 framework corporate",
+    "corporate biodiversity footprint methodology TNFD disclosure",
+    # ── EU Climate & Energy ──────────────────────────────────────────────────
+    "carbon border adjustment mechanism CBAM implementation verification 2026",
+    "EU Emissions Trading System ETS aviation maritime reform 2024",
+    "net zero transition planning financial institutions scenario analysis",
+    "carbon removal certification framework EU methodology standards",
+    "nature restoration law EU implementation biodiversity 2030 targets",
+    "EU hydrogen strategy renewable energy directive RED III delegated acts",
+    "building renovation wave EPBD nearly zero energy performance",
+    "energy efficiency directive recast EED 2024 national implementation",
+    "methane regulation oil gas EU monitoring enforcement 2025",
+    "sustainable aviation fuel SAF mandate RefuelEU aviation blending",
+    "FuelEU Maritime green shipping GHG intensity regulation",
+    "critical raw materials act strategic stockpiling EU autonomy",
+    "land use LULUCF regulation forest carbon sink accounting",
+    "soil health monitoring law EU restoration degraded land",
+    "plastic tax extended producer responsibility EU packaging waste",
+    "water stewardship corporate disclosure EU Water Framework Directive",
+    "deforestation-free supply chain regulation EUDR palm soy beef timber",
+    "net metering prosumer self-consumption regulation EU member states",
+    "just transition fund implementation coal regions reskilling workers",
+    "stranded assets climate scenario analysis bank stress test ECB",
+    # ── EU Financial & Capital Markets ──────────────────────────────────────
+    "Basel IV capital requirements output floor implementation 2025",
+    "DORA ICT third-party risk concentration cloud financial services",
+    "MiCA crypto asset markets regulation stablecoin e-money token",
+    "DeFi decentralized finance regulatory framework ESMA approach",
+    "CBDC central bank digital currency design privacy offline use",
+    "anti-money laundering AMLA new EU authority 2025 Frankfurt",
+    "FIDA financial data access framework open finance EU",
+    "ELTIF 2.0 long-term investment funds retail access liquidity",
+    "PRIIPS KID revision retail investor protection disclosure reform",
+    "MiFID III retail investment strategy inducements ban reform",
+    "CCP central counterparty EMIR 3.0 active accounts EU clearing",
+    "tokenization securities digital bond DLT pilot regime EU",
+    "insurance recovery resolution regulation IRRD solvency",
+    "crowdfunding regulation EU ECSPR cross-border scaling limits",
+    # ── US Regulatory ────────────────────────────────────────────────────────
+    "SEC climate disclosure rules Scope 3 litigation injunction 2025",
+    "US AI executive order NIST AI RMF federal agency implementation",
+    "FTC AI algorithmic fairness deceptive design enforcement action",
+    "US critical infrastructure cybersecurity CISA binding directive",
+    "EPA methane waste emissions rule oil gas 2024 enforcement",
+    "US IRA Inflation Reduction Act clean energy tax credit transferability",
+    "CFTC digital asset derivatives prediction market DeFi regulation",
+    "SEC cybersecurity material incident 4-day disclosure rule enforcement",
+    "FDA AI medical device continuous learning SaMD regulation",
+    "US antitrust AI competition enforcement DOJ FTC consent decree",
+    "US forced labor Uyghur Prevention Act UFLPA supply chain enforcement",
+    "CFPB open banking rule 1033 implementation fintech",
+    # ── International & Cross-Border ─────────────────────────────────────────
+    "OECD Pillar Two global minimum tax 15 percent GloBE implementation",
+    "UK sustainability disclosure requirements SDR labelling 2025",
+    "Australia mandatory climate disclosure ASRS AASB implementation",
+    "Singapore TCFD mandatory climate reporting MAS transition plan",
+    "Japan climate disclosure SSBJ sustainability standards adoption",
+    "India ESG BRSR core sustainability reporting SEBI listed companies",
+    "South Korea ESG disclosure KOSPI mandatory timeline phased",
+    "China ESG disclosure CSRC Shanghai Shenzhen standards GRI alignment",
+    "Brazil sustainable taxonomy green finance BCB implementation",
+    "OECD responsible business conduct guidelines 2024 update MNE",
+    "FATF crypto virtual asset travel rule VASP cross-border",
+    "anti-coercion instrument EU trade retaliation implementation",
+    "WTO fisheries subsidies agreement implementation enforcement",
+    "Basel III emerging market bank implementation challenges",
+    # ── Health, Pharma & Biotech ─────────────────────────────────────────────
+    "EU pharmaceutical legislation reform 2024 critical medicines shortage",
+    "medical device regulation MDR conformity assessment backlog notified body",
+    "in vitro diagnostic regulation IVDR performance evaluation transition",
+    "clinical trials regulation CTR EU portal CTIS implementation",
+    "advanced therapy medicinal products ATMP regulatory pathway EMA",
+    "health technology assessment HTA EU joint clinical assessment",
+    "orphan drug designation reform EU incentives critical revision",
+    "antimicrobial resistance AMR action plan EU one health approach",
+    "AI medical diagnosis regulatory pathway FDA EMA SaMD approval",
+    "pandemic preparedness health emergency HERA strategic reserve EU",
+    "synthetic biology biotech dual-use regulation containment EU",
+    # ── Labor, Social & Governance ───────────────────────────────────────────
+    "platform workers directive EU algorithmic management employment status",
+    "pay transparency directive EU gender pay gap reporting audit",
+    "whistleblower protection directive EU national transposition enforcement",
+    "AI workplace surveillance monitoring workers rights regulation EU",
+    "skills agenda digital reskilling EU funding programmes upskilling",
+    "European works council directive reform information consultation rights",
+    "remote work telework right regulation EU cross-border bilateral",
+    "corporate governance diversity board composition mandatory quota EU",
+    # ── Food, Agriculture & Environment ──────────────────────────────────────
+    "sustainable use of pesticides regulation SUR reduction target EU",
+    "new genomic techniques NGT precision breeding regulation EU approval",
+    "novel foods cultured meat cell-based regulation approval EU",
+    "CAP strategic plans 2023-2027 eco-scheme agri-environment implementation",
+    "animal welfare transport slaughter regulation EU reform initiative",
+    "food labelling nutriscore front-of-pack EU harmonisation",
+    "fisheries EU CFP landing obligation discard ban enforcement",
+    # ── Transport & Infrastructure ────────────────────────────────────────────
+    "alternative fuels infrastructure AFIR EV charging deployment mandate",
+    "road transport CO2 standards trucks vans zero emission 2030",
+    "autonomous vehicles type approval EU uncrewed certification framework",
+    "TEN-T trans-European transport network revised regulation corridors",
+    "urban access regulation low emission zone harmonisation EU cities",
+    "drone regulation EASA urban air mobility corridor U-space",
+    # ── Tax & Trade ──────────────────────────────────────────────────────────
+    "Pillar Two GloBE income inclusion qualified domestic minimum top-up",
+    "digital services tax OECD Pillar One Amount A reallocation",
+    "transfer pricing OECD BEPS 2.0 Amount B simplified approach",
+    "carbon leakage trade adjustment mechanism WTO compatibility",
+    "export controls semiconductor equipment restrictions enforcement 2024",
+    "EU customs union reform single window electronic declaration",
+    # ── AI, Data & Privacy ───────────────────────────────────────────────────
+    "AI training data copyright web scraping regulation EU US",
+    "GDPR AI profiling automated decision-making enforcement fines 2025",
+    "federated learning differential privacy compliance GDPR",
+    "cross-border data transfer adequacy decision EU US DPF",
+    "children online protection age verification regulation EU",
+    "cloud computing concentration risk regulatory guidance FSB",
+    "Internet of Things IoT security labelling regulation EU RED",
 ]
 
-# Module-level memory: avoid repeating the same domains across consecutive runs
-_recently_selected_domains: list[str] = []
-_RECENT_DOMAIN_MEMORY = 18  # remember at least one full rotation
+# ---------------------------------------------------------------------------
+# Query angle modifiers — appended to crawler queries to vary search angle
+# each run, ensuring crawlers surface different aspects of the same domain.
+# ---------------------------------------------------------------------------
+
+_QUERY_ANGLES: list[str] = [
+    "",                                          # baseline — no modifier
+    "2025 enforcement case law ruling",
+    "implementation guidance technical standard",
+    "compliance deadline SME impact proportionality",
+    "recent amendment update revision delegated act",
+    "third-country equivalence extraterritorial scope",
+    "litigation appeal court judgment annulment",
+    "industry sector-specific guidance FAQ",
+    "academic empirical study evidence research",
+    "NGO civil society position paper critique",
+    "consultation stakeholder response feedback",
+    "cross-border harmonisation conflict challenge",
+    "penalty sanction enforcement action fine",
+    "transition period exemption derogation scope",
+    "reporting template disclosure format standard",
+    "cost-benefit impact assessment analysis",
+    "SME simplification proportionality threshold",
+    "supply chain upstream downstream obligation",
+    "financial materiality double materiality assessment",
+    "benchmark index methodology update",
+]
 
 
 async def _select_domains(n: int = 6) -> list[str]:
-    """Use the LLM to pick domains with the most likely knowledge gaps.
+    """Pick domains with the highest LLM knowledge gaps using DB-backed history.
 
-    Randomises the candidate pool and excludes recently-used domains so each
-    Scout run surfaces different topics.
+    Draws from a 120+ candidate pool, excludes domains the user has already
+    ingested (permanent) and domains scanned in recent runs (rolling window),
+    then asks the LLM to rank the remainder for gap potential.
     """
-    global _recently_selected_domains
+    from agents.scout_history import (
+        get_excluded_domains,
+        get_recent_domains,
+        record_selected_domains,
+    )
 
-    # Exclude domains selected in previous runs to force variety
-    available = [d for d in _CANDIDATE_DOMAINS if d not in _recently_selected_domains]
+    excluded = await get_excluded_domains()
+    recent = set(await get_recent_domains(window=40))  # ~6-7 runs of 6 domains
+
+    # Filter: not permanently excluded AND not scanned recently
+    available = [
+        d for d in _CANDIDATE_DOMAINS
+        if d not in excluded and d not in recent
+    ]
     if len(available) < n:
-        # Full rotation complete — reset memory and start fresh
-        _recently_selected_domains = []
+        # Rotation complete — keep permanent exclusions but reset recency memory
+        available = [d for d in _CANDIDATE_DOMAINS if d not in excluded]
+    if len(available) < n:
+        # All permanently excluded (extreme edge case) — use full pool
         available = list(_CANDIDATE_DOMAINS)
 
-    # Present a random subset so the LLM's ordering bias doesn't fix the result
-    subset_size = min(len(available), n + 8)
+    # Present a random subset so LLM ordering bias never fixes the result
+    subset_size = min(len(available), n + 10)
     candidates = random.sample(available, subset_size)
 
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    run_id = uuid.uuid4().hex[:8]
+
     try:
         resp = await _OPENAI.chat.completions.create(
             model=settings.openai_primary_model,
@@ -511,40 +675,45 @@ async def _select_domains(n: int = 6) -> list[str]:
                 {
                     "role": "system",
                     "content": (
-                        f"Today is {today}. You are an ESG and regulatory compliance expert. "
-                        f"Select {n} domains from the list below that are most likely to have "
-                        "significant recent developments that AI language models would not yet "
-                        "know about. Prioritise variety — choose topics that are less mainstream "
-                        "and less likely to have been analysed recently. "
-                        "Return ONLY a JSON array of strings copied exactly from the list, no other text.\n"
-                        "Domains to choose from:\n"
-                        + "\n".join(f"- {d}" for d in candidates)
+                        f"Today is {today}. You are a research analyst identifying where large "
+                        "language models have the deepest knowledge gaps — topics with significant "
+                        "recent developments that post-date LLM training cutoffs. "
+                        f"Select exactly {n} domains from the list below that maximise "
+                        "knowledge-gap potential. Prioritise:\n"
+                        "  • Rapid 2024-2025 regulatory or technical changes not yet in training data\n"
+                        "  • Niche, less-mainstream topics LLMs are unlikely to know deeply\n"
+                        "  • Topics with real enforcement actions, case law, or delegated acts\n"
+                        "  • Topics from diverse regulatory areas (not all ESG, not all EU)\n"
+                        "Avoid picking the same obvious top-tier topics — choose for variety, depth, "
+                        "and genuine novelty.\n"
+                        "Return ONLY a JSON array of strings copied exactly from the list, "
+                        "no other text.\n"
+                        "Domains:\n" + "\n".join(f"- {d}" for d in candidates)
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Select {n} domains with the highest knowledge gaps as of {today}. "
-                        "Favour less-obvious choices."
+                        f"Select {n} domains with the highest LLM knowledge gaps as of {today}. "
+                        "Favour niche, less-obvious choices with recent enforcement or technical updates."
                     ),
                 },
             ],
-            temperature=0.9,
-            max_tokens=400,
+            temperature=0.95,
+            max_tokens=500,
         )
         raw = _strip_json_fences(resp.choices[0].message.content.strip())
         selected = json.loads(raw)
         if isinstance(selected, list) and selected:
             result = [str(d) for d in selected[:n]]
-            # Remember these so the next run picks different ones
-            _recently_selected_domains = (_recently_selected_domains + result)[-_RECENT_DOMAIN_MEMORY:]
+            await record_selected_domains(result, run_id=run_id)
             return result
     except Exception as exc:
         logger.warning("Domain auto-selection failed: %s — using random fallback", exc)
 
-    # Fallback: random sample from available candidates (not the same fixed head)
+    # Fallback: pure random from available candidates — never the same fixed head
     fallback = random.sample(available, min(n, len(available)))
-    _recently_selected_domains = (_recently_selected_domains + fallback)[-_RECENT_DOMAIN_MEMORY:]
+    await record_selected_domains(fallback, run_id=run_id)
     return fallback
 
 
@@ -598,8 +767,16 @@ async def _process_domain(
     domain: str,
     progress_callback: Optional[ProgressCallback] = None,
     topic_callback: Optional[TopicCallback] = None,
+    query_suffix: str = "",
 ) -> Optional[ScoutTopicData]:
-    """Crawl all sources for one domain, verify URLs, score, and return a topic."""
+    """Crawl all sources for one domain, verify URLs, score, and return a topic.
+
+    `domain` is the canonical identifier used for topic title/ID and history.
+    `query_suffix` is an angle modifier appended to crawler queries only, so
+    consecutive runs of the same domain surface different aspects of the topic.
+    """
+    crawler_query = f"{domain} {query_suffix}".strip() if query_suffix else domain
+
     async def _log(msg: str) -> None:
         logger.info("[Scout] %s", msg)
         if progress_callback:
@@ -608,7 +785,8 @@ async def _process_domain(
             except Exception:
                 pass
 
-    await _log(f"Scanning: {domain[:60]}")
+    angle_note = f" [{query_suffix}]" if query_suffix else ""
+    await _log(f"Scanning: {domain[:55]}{angle_note}")
 
     # Lazy imports avoid circular dependency (layers import ScoutSource from this module)
     from agents.crawlers.layer_a import run_layer_a
@@ -618,13 +796,13 @@ async def _process_domain(
     from agents.crawlers.layer_e import run_layer_e
 
     gathered = await asyncio.gather(
-        run_layer_a(domain),           # Layer A: 14 science/research crawlers
-        run_layer_b(domain),           # Layer B: 10 legislation/regulatory crawlers
-        run_layer_c(domain),           # Layer C: 10 finance/economic data crawlers
-        run_layer_d(domain),           # Layer D:  6 tech/social signal crawlers
-        run_layer_e(domain),           # Layer E:  6 multimedia/archive crawlers
-        _fetch_openalex(domain),       # cross-layer aggregator (kept for coverage)
-        _probe_llm_uncertainty(domain),
+        run_layer_a(crawler_query),    # Layer A: 14 science/research crawlers
+        run_layer_b(crawler_query),    # Layer B: 10 legislation/regulatory crawlers
+        run_layer_c(crawler_query),    # Layer C: 10 finance/economic data crawlers
+        run_layer_d(crawler_query),    # Layer D:  6 tech/social signal crawlers
+        run_layer_e(crawler_query),    # Layer E:  6 multimedia/archive crawlers
+        _fetch_openalex(crawler_query),  # cross-layer aggregator (kept for coverage)
+        _probe_llm_uncertainty(domain),  # uncertainty probe on canonical domain name
         return_exceptions=True,
     )
 
@@ -770,9 +948,18 @@ async def run_scout(
         domains = await _select_domains(n=6)
         await _log(f"Domains selected: {', '.join(d.split()[0] for d in domains[:4])}...")
 
+    # Assign a unique angle modifier per domain so each run crawls a different
+    # facet of the same topic (enforcement, SME impact, technical standards, …)
+    angles = random.choices(_QUERY_ANGLES, k=len(domains))
+    angle_preview = [a if a else "(baseline)" for a in angles[:4]]
+    await _log(f"Query angles: {angle_preview}...")
+
     # Process all domains concurrently (each internally already fans out crawlers in parallel)
     domain_results = await asyncio.gather(
-        *[_process_domain(domain, progress_callback, topic_callback) for domain in domains],
+        *[
+            _process_domain(domain, progress_callback, topic_callback, query_suffix=angle)
+            for domain, angle in zip(domains, angles)
+        ],
         return_exceptions=True,
     )
 
