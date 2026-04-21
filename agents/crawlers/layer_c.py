@@ -804,27 +804,38 @@ async def run_layer_c(
     concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
     semaphore = asyncio.Semaphore(concurrency_limit)
 
-    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+    task_map = {
+        asyncio.create_task(_run_single_crawler_safe(c, query, semaphore)): c
+        for c in crawlers
+    }
 
     # Globalny limit czasu dla całej warstwy
     layer_timeout = getattr(settings, "layer_c_timeout_seconds", 60.0)
 
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=layer_timeout
+    done, pending = await asyncio.wait(task_map.keys(), timeout=layer_timeout)
+    if pending:
+        for task in pending:
+            task.cancel()
+        logger.warning(
+            "[Layer C] Przekroczono globalny limit czasu (%.1fs). partial_success=%d/%d, pending=%d.",
+            layer_timeout, len(done), len(task_map), len(pending),
         )
-    except asyncio.TimeoutError:
-        logger.error(f"[Layer C] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
-        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
     
     # Dekompozycja wyników i logowanie błędów
-    for idx, batch in enumerate(results):
+    for task in done:
+        crawler = task_map[task]
+        if task.cancelled():
+            batch = []
+        else:
+            try:
+                batch = task.result()
+            except Exception as exc:
+                batch = exc
         if isinstance(batch, Exception):
-            logger.error(f"[Layer C] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            logger.error(f"[Layer C] Zgromadzono wyjątek z crawlera {crawler.source_id}: {batch}")
             continue
         if not isinstance(batch, list):
             continue
@@ -833,6 +844,10 @@ async def run_layer_c(
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+    logger.info(
+        "[Layer C] health summary: ok=%d/%d timed_out=%d discovered=%d",
+        len(done), len(task_map), len(pending), len(sources),
+    )
                 
     return sources
 

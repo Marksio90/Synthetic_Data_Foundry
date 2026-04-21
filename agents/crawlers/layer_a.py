@@ -161,6 +161,15 @@ class _BioMedRxivBase(CrawlerBase):
         resp = await self._fetch(url)
         if resp.status_code != 200:
             return []
+        content_type = resp.headers.get("content-type", "").lower()
+        if "json" not in content_type:
+            logger.info(
+                "[%s] PROVIDER_RATE_LIMITED — expected JSON, got Content-Type=%s (possible throttle/proxy page).",
+                self._SERVER,
+                content_type or "unknown",
+                extra={"crawler": self._SERVER, "error_code": "PROVIDER_RATE_LIMITED", "content_type": content_type},
+            )
+            return []
             
         try:
             data = resp.json()
@@ -856,28 +865,38 @@ async def run_layer_a(
     concurrency_limit = getattr(settings, "crawler_concurrency_limit", 10)
     semaphore = asyncio.Semaphore(concurrency_limit)
 
-    tasks = [_run_single_crawler_safe(c, query, semaphore) for c in crawlers]
+    task_map = {
+        asyncio.create_task(_run_single_crawler_safe(c, query, semaphore)): c
+        for c in crawlers
+    }
 
     # Globalny limit czasu dla całej warstwy (zapobiega zwieszeniu się Scouta w nieskończoność)
     layer_timeout = getattr(settings, "layer_a_timeout_seconds", 60.0)
     
-    try:
-        # wait_for dba, by niezależnie od zachowania API zewn. proces się nie zablokował
-        results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=layer_timeout
+    done, pending = await asyncio.wait(task_map.keys(), timeout=layer_timeout)
+    if pending:
+        for task in pending:
+            task.cancel()
+        logger.warning(
+            "[Layer A] Przekroczono globalny limit czasu (%.1fs). partial_success=%d/%d, pending=%d.",
+            layer_timeout, len(done), len(task_map), len(pending),
         )
-    except asyncio.TimeoutError:
-        logger.error(f"[Layer A] Przekroczono globalny limit czasu ({layer_timeout}s). Niektóre wyniki mogły zostać utracone.")
-        return []
 
     seen_urls: set[str] = set()
     sources: list[ScoutSource] = []
     
     # Dekompozycja wyników i szczegółowa identyfikacja błędów
-    for idx, batch in enumerate(results):
+    for task in done:
+        crawler = task_map[task]
+        if task.cancelled():
+            batch = []
+        else:
+            try:
+                batch = task.result()
+            except Exception as exc:
+                batch = exc
         if isinstance(batch, Exception):
-            logger.error(f"[Layer A] Zgromadzono wyjątek z crawlera {crawlers[idx].source_id}: {batch}")
+            logger.error(f"[Layer A] Zgromadzono wyjątek z crawlera {crawler.source_id}: {batch}")
             continue
         if not isinstance(batch, list):
             continue
@@ -886,6 +905,10 @@ async def run_layer_a(
             if src.url not in seen_urls:
                 seen_urls.add(src.url)
                 sources.append(src)
+    logger.info(
+        "[Layer A] health summary: ok=%d/%d timed_out=%d discovered=%d",
+        len(done), len(task_map), len(pending), len(sources),
+    )
                 
     return sources
 
