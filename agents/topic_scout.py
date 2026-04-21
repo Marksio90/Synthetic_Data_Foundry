@@ -633,6 +633,34 @@ _QUERY_ANGLES: list[str] = [
 ]
 
 
+def _select_query_angles(count: int) -> list[str]:
+    """Select mostly unique query angles to improve topical diversity per run."""
+    if count <= 0:
+        return []
+
+    # Prefer non-baseline angles so searches explore specific implementation facets.
+    non_empty = [a for a in _QUERY_ANGLES if a]
+    baseline = [a for a in _QUERY_ANGLES if not a]
+
+    # Up to 1 baseline per run; rest sampled without replacement for uniqueness.
+    baseline_slots = 1 if baseline and count >= 4 else 0
+    non_empty_needed = max(0, count - baseline_slots)
+
+    if non_empty_needed <= len(non_empty):
+        chosen = random.sample(non_empty, non_empty_needed)
+    else:
+        # If we ever request more than available unique angles, recycle with shuffle.
+        chosen = list(non_empty)
+        while len(chosen) < non_empty_needed:
+            chosen.extend(random.sample(non_empty, min(len(non_empty), non_empty_needed - len(chosen))))
+
+    if baseline_slots:
+        chosen.extend(random.sample(baseline, baseline_slots))
+
+    random.shuffle(chosen)
+    return chosen[:count]
+
+
 async def _select_domains(n: int = 6) -> list[str]:
     """Pick domains with the highest LLM knowledge gaps using DB-backed history.
 
@@ -871,6 +899,9 @@ async def _process_domain(
     scoring = await score_topic(ctx)
 
     # Legacy 4-component score kept for backwards compat (used in sort + old API consumers)
+    source_type_diversity = min(1.0, len({s.source_type for s in verified}) / 6.0)
+    high_tier_ratio = sum(1 for s in verified if s.source_tier in {"S", "A"}) / max(1, len(verified))
+
     score = round(
         0.40 * recency
         + 0.30 * float(uncertainty)
@@ -878,6 +909,8 @@ async def _process_domain(
         + 0.10 * social,
         3,
     )
+    # Backward-compatible uplift: slightly reward stronger evidence quality and source spread.
+    score = round(min(1.0, score + 0.04 * source_type_diversity + 0.04 * high_tier_ratio), 3)
 
     await _log(
         f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
@@ -948,9 +981,8 @@ async def run_scout(
         domains = await _select_domains(n=6)
         await _log(f"Domains selected: {', '.join(d.split()[0] for d in domains[:4])}...")
 
-    # Assign a unique angle modifier per domain so each run crawls a different
-    # facet of the same topic (enforcement, SME impact, technical standards, …)
-    angles = random.choices(_QUERY_ANGLES, k=len(domains))
+    # Assign mostly unique angle modifiers so each domain explores a distinct facet.
+    angles = _select_query_angles(len(domains))
     angle_preview = [a if a else "(baseline)" for a in angles[:4]]
     await _log(f"Query angles: {angle_preview}...")
 
@@ -964,6 +996,7 @@ async def run_scout(
     )
 
     results = [r for r in domain_results if isinstance(r, ScoutTopicData)]
-    results.sort(key=lambda t: t.score, reverse=True)
+    # Rank by modern gap score first, keeping legacy score as a secondary stabilizer.
+    results.sort(key=lambda t: (0.70 * t.knowledge_gap_score + 0.30 * t.score), reverse=True)
     await _log(f"Scout complete — {len(results)} topics discovered.")
     return results[:max_topics]
