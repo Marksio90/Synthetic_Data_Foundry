@@ -141,6 +141,18 @@ export async function apiFetch<T = unknown>(
   return res.json() as Promise<T>;
 }
 
+export function getAdminApiKey(): string {
+  return ADMIN_API_KEY;
+}
+
+export function withApiKeyHeaders(headers?: HeadersInit): Headers {
+  const merged = new Headers(headers);
+  if (ADMIN_API_KEY) {
+    merged.set('X-API-Key', ADMIN_API_KEY);
+  }
+  return merged;
+}
+
 // ─── Gap Scout Types ─────────────────────────────────────────────────────────
 
 export interface ScoutSource {
