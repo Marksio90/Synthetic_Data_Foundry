@@ -31,6 +31,7 @@ export default function AutopilotPage() {
   const [docs, setDocs] = useState<Document[]>([]);
   const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
   const [loadingDocs, setLoadingDocs] = useState(true);
+  const [docsError, setDocsError] = useState('');
 
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
@@ -50,13 +51,23 @@ export default function AutopilotPage() {
 
   const loadDocs = useCallback(async () => {
     setLoadingDocs(true);
+    setDocsError('');
     try {
       const res = await fetch(`${API}/api/documents`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail ?? `HTTP ${res.status}`);
+      }
       const data = await res.json();
-      const list: Document[] = data.documents ?? data ?? [];
+      const list: Document[] = Array.isArray(data?.documents)
+        ? data.documents
+        : Array.isArray(data)
+        ? data
+        : [];
       setDocs(list);
-    } catch {
-      // ignore
+    } catch (e: unknown) {
+      setDocs([]);
+      setDocsError(e instanceof Error ? e.message : 'Nie udało się pobrać dokumentów');
     } finally {
       setLoadingDocs(false);
     }
@@ -84,7 +95,7 @@ export default function AutopilotPage() {
     try {
       for (const file of arr) {
         const fd = new FormData();
-        fd.append('file', file);
+        fd.append('files', file);
         const res = await fetch(`${API}/api/documents/upload`, { method: 'POST', body: fd });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
@@ -201,6 +212,7 @@ export default function AutopilotPage() {
         <h1 className="text-2xl font-bold text-text">AutoPilot</h1>
       </div>
 
+      {docsError   && <ErrorBanner message={docsError}   onClose={() => setDocsError('')} />}
       {uploadError && <ErrorBanner message={uploadError} onClose={() => setUploadError('')} />}
       {runError    && <ErrorBanner message={runError}    onClose={() => setRunError('')} />}
 
