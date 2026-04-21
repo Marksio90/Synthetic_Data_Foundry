@@ -27,7 +27,7 @@ CTL   := ./scripts/foundry-ctl.sh
 .DEFAULT_GOAL := help
 
 .PHONY: help setup up down full-run generate gate train export chatbot \
-        logs logs-api logs-ui logs-trainer status clean rebuild
+        logs logs-api logs-ui logs-frontend logs-trainer status clean rebuild
 
 # ---------------------------------------------------------------------------
 # Pomoc
@@ -56,7 +56,8 @@ help:
 	@echo "  LOGI"
 	@echo "    make logs         Logi wszystkich serwisów"
 	@echo "    make logs-api     Logi API"
-	@echo "    make logs-ui      Logi UI"
+	@echo "    make logs-ui      Logi frontendu (alias)"
+	@echo "    make logs-frontend Logi frontendu"
 	@echo "    make logs-trainer Logi kontenera treningowego"
 	@echo ""
 	@echo "  Zmienne (opcjonalne):"
@@ -88,7 +89,7 @@ status:
 clean:
 	@echo "UWAGA: To usunie wszystkie kontenery i wolumeny (dane zostaną skasowane)!"
 	@read -p "Kontynuować? [y/N] " ans && [ "$$ans" = "y" ] || exit 1
-	@docker compose --profile train --profile chatbot --profile gpu down -v
+	@docker compose --profile train --profile chatbot down -v
 	@echo "Wyczyszczono."
 
 # ---------------------------------------------------------------------------
@@ -124,7 +125,10 @@ logs-api:
 	@docker compose logs -f foundry-api
 
 logs-ui:
-	@docker compose logs -f foundry-ui
+	@docker compose logs -f frontend
+
+logs-frontend:
+	@docker compose logs -f frontend
 
 logs-trainer:
 	@docker compose --profile train logs -f foundry-trainer
