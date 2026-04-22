@@ -381,17 +381,6 @@ class Settings(BaseSettings):
         le=10000,
         description="Maximum number of queued pipeline jobs waiting for execution.",
     )
-    pipeline_max_attempts: int = Field(
-        3,
-        ge=1,
-        le=10,
-        description="Maximum execution attempts per pipeline run before dead-lettering.",
-    )
-    pipeline_replay_token_budget_max: int = Field(
-        50000,
-        ge=1000,
-        description="Hard token budget cap for replaying dead-lettered jobs.",
-    )
     pipeline_queue_backend: str = Field(
         "memory",
         description="Queue backend for pipeline executor: 'memory' or 'redis'.",

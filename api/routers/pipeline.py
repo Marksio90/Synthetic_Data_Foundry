@@ -70,7 +70,7 @@ _REDIS_CLIENT = None
 _REDIS_QUEUE_KEY = "foundry:pipeline:jobs"
 _REDIS_CANCELLED_KEY = "foundry:pipeline:cancelled"
 _REDIS_DLQ_KEY = "foundry:pipeline:deadletter"
-_DEAD_LETTER_JOBS: list[dict[str, object]] = []
+_DEAD_LETTER_JOBS: list[dict[str, str]] = []
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
 
 
@@ -197,12 +197,9 @@ async def _clear_cancelled_queued(run_id: str) -> None:
 async def _push_dead_letter(job: PipelineJob, reason: str) -> None:
     payload = {
         "run_id": job.run_id,
-        "attempt": job.attempt,
+        "attempt": str(job.attempt),
         "reason": reason,
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "cmd": job.cmd,
-        "env": job.env,
-        "cwd": job.cwd,
     }
     client = await _ensure_redis_client()
     if client is not None and _queue_backend() == "redis":
@@ -211,61 +208,6 @@ async def _push_dead_letter(job: PipelineJob, reason: str) -> None:
     _DEAD_LETTER_JOBS.append(payload)
     if len(_DEAD_LETTER_JOBS) > 1000:
         del _DEAD_LETTER_JOBS[: len(_DEAD_LETTER_JOBS) - 1000]
-
-
-def _estimate_job_tokens(job: PipelineJob) -> int:
-    max_turns = int(job.env.get("MAX_TURNS", settings.max_turns))
-    generation_max = int(settings.generation_max_tokens)
-    return max_turns * generation_max
-
-
-async def _peek_dead_letter(limit: int = 50) -> list[dict]:
-    client = await _ensure_redis_client()
-    if client is not None and _queue_backend() == "redis":
-        rows = await client.lrange(_REDIS_DLQ_KEY, -limit, -1)
-        out: list[dict] = []
-        for raw in rows:
-            try:
-                out.append(json.loads(raw))
-            except Exception:
-                continue
-        return out
-    return list(_DEAD_LETTER_JOBS[-limit:])
-
-
-async def _pop_dead_letter_for_run(run_id: str) -> PipelineJob | None:
-    client = await _ensure_redis_client()
-    if client is not None and _queue_backend() == "redis":
-        rows = await client.lrange(_REDIS_DLQ_KEY, 0, -1)
-        for raw in rows:
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                continue
-            if payload.get("run_id") != run_id:
-                continue
-            await client.lrem(_REDIS_DLQ_KEY, 1, raw)
-            return PipelineJob(
-                run_id=payload["run_id"],
-                cmd=list(payload.get("cmd", [])),
-                env=dict(payload.get("env", {})),
-                cwd=payload.get("cwd", str(Path(__file__).parent.parent.parent)),
-                attempt=1,
-            )
-        return None
-
-    for idx, payload in enumerate(_DEAD_LETTER_JOBS):
-        if str(payload.get("run_id")) != run_id:
-            continue
-        entry = _DEAD_LETTER_JOBS.pop(idx)
-        return PipelineJob(
-            run_id=str(entry["run_id"]),
-            cmd=list(entry.get("cmd", [])),
-            env=dict(entry.get("env", {})),
-            cwd=str(entry.get("cwd", str(Path(__file__).parent.parent.parent))),
-            attempt=1,
-        )
-    return None
 
 
 async def _ensure_executor_started() -> None:
@@ -613,55 +555,6 @@ async def queue_stats() -> dict[str, int | str]:
         "cancelled_queued_runs": len(_CANCELLED_QUEUED_RUN_IDS),
         "active_workers": len(_EXECUTOR_WORKERS),
         "running_processes": len(_RUN_PROCS),
-    }
-
-
-@router.get("/deadletter", dependencies=[Depends(require_admin_api_key)])
-async def deadletter_list(limit: int = 50) -> dict[str, object]:
-    limit = max(1, min(limit, 200))
-    entries = await _peek_dead_letter(limit=limit)
-    return {"count": len(entries), "items": entries}
-
-
-@router.post("/deadletter/replay/{run_id}", dependencies=[Depends(require_admin_api_key)])
-async def replay_deadletter(run_id: str) -> dict[str, object]:
-    rec = runs.get(run_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-
-    job = await _pop_dead_letter_for_run(run_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Dead-letter entry not found for run: {run_id}")
-
-    token_estimate = _estimate_job_tokens(job)
-    max_budget = int(settings.pipeline_replay_token_budget_max)
-    if token_estimate > max_budget:
-        await _push_dead_letter(job, f"replay_budget_exceeded:{token_estimate}>{max_budget}")
-        raise HTTPException(
-            status_code=422,
-            detail=f"Replay rejected: estimated token budget {token_estimate} exceeds limit {max_budget}.",
-        )
-
-    rec.error = None
-    runs.update(run_id, status="queued")
-    runs.append_log(run_id, f"[Queue] 🔁 Replay from DLQ queued (estimated_tokens={token_estimate}).")
-
-    try:
-        await _enqueue_job(job)
-        _QUEUED_RUN_IDS.add(run_id)
-    except asyncio.QueueFull as exc:
-        await _push_dead_letter(job, "replay_queue_full")
-        raise ServiceUnavailableError(
-            error_code="pipeline_queue_full",
-            message="Pipeline queue is full.",
-            details={"hint": "Retry replay later or increase queue limits."},
-        ) from exc
-
-    return {
-        "run_id": run_id,
-        "status": "queued",
-        "estimated_tokens": token_estimate,
-        "max_budget": max_budget,
     }
 
 
