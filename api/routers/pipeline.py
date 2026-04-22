@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
+import logging
 import os
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -33,7 +36,12 @@ from agents.calibrator import calibrate
 from agents.doc_analyzer import analyze_documents
 from api.db import get_session
 from api.errors import FailedDependencyError, ServiceUnavailableError
-from api.security import require_admin_api_key, require_admin_api_key_ws
+from api.security import (
+    create_ws_ticket,
+    require_admin_api_key,
+    require_admin_api_key_ws,
+    verify_ws_ticket,
+)
 from api.schemas import (
     AnalysisResponse,
     CalibrationInfo,
@@ -47,12 +55,297 @@ from config.settings import settings
 from db.models import DirectiveChunk, SourceDocument
 
 router = APIRouter()
+logger = logging.getLogger("foundry.api.pipeline")
 
 DATA_DIR = Path(settings.data_dir)
 _PYTHON = sys.executable  # same interpreter as the API
-_RUN_TASKS: dict[str, asyncio.Task] = {}
 _RUN_PROCS: dict[str, asyncio.subprocess.Process] = {}
+_EXECUTOR_LOCK = asyncio.Lock()
+_EXECUTOR_WORKERS: list[asyncio.Task] = []
+_QUEUE: asyncio.Queue["PipelineJob"] = asyncio.Queue(maxsize=settings.pipeline_queue_maxsize)
+_QUEUED_RUN_IDS: set[str] = set()
+_CANCELLED_QUEUED_RUN_IDS: set[str] = set()
+_EXECUTOR_STARTED = False
+_REDIS_CLIENT = None
+_REDIS_QUEUE_KEY = "foundry:pipeline:jobs"
+_REDIS_CANCELLED_KEY = "foundry:pipeline:cancelled"
+_REDIS_DLQ_KEY = "foundry:pipeline:deadletter"
+_DEAD_LETTER_JOBS: list[dict[str, object]] = []
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
+
+
+# ---------------------------------------------------------------------------
+# Queue-native executor
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PipelineJob:
+    run_id: str
+    cmd: list[str]
+    env: dict[str, str]
+    cwd: str
+    attempt: int = 1
+
+
+def _queue_backend() -> str:
+    return (settings.pipeline_queue_backend or "memory").strip().lower()
+
+
+async def _ensure_redis_client():
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    if _queue_backend() != "redis":
+        return None
+    try:
+        from redis.asyncio import Redis  # type: ignore
+    except Exception:
+        logger.warning("Redis backend requested but 'redis' package is unavailable. Falling back to memory queue.")
+        return None
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        await client.ping()
+        _REDIS_CLIENT = client
+        logger.info("Pipeline queue backend: redis (%s).", settings.redis_url)
+    except Exception as exc:
+        logger.warning("Redis queue unavailable (%s). Falling back to memory queue.", exc)
+        _REDIS_CLIENT = None
+    return _REDIS_CLIENT
+
+
+def _job_to_json(job: PipelineJob) -> str:
+    return json.dumps(
+        {"run_id": job.run_id, "cmd": job.cmd, "env": job.env, "cwd": job.cwd, "attempt": job.attempt},
+        ensure_ascii=False,
+    )
+
+
+def _job_from_json(raw: str) -> PipelineJob:
+    data = json.loads(raw)
+    return PipelineJob(
+        run_id=data["run_id"],
+        cmd=list(data["cmd"]),
+        env=dict(data["env"]),
+        cwd=data["cwd"],
+        attempt=int(data.get("attempt", 1)),
+    )
+
+
+async def _queue_size() -> int:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        return int(await client.llen(_REDIS_QUEUE_KEY))
+    return _QUEUE.qsize()
+
+
+async def _dead_letter_count() -> int:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        return int(await client.llen(_REDIS_DLQ_KEY))
+    return len(_DEAD_LETTER_JOBS)
+
+
+async def _enqueue_job(job: PipelineJob) -> None:
+    client = await _ensure_redis_client()
+    maxsize = int(settings.pipeline_queue_maxsize)
+    if client is not None and _queue_backend() == "redis":
+        size = int(await client.llen(_REDIS_QUEUE_KEY))
+        if size >= maxsize:
+            raise asyncio.QueueFull
+        await client.rpush(_REDIS_QUEUE_KEY, _job_to_json(job))
+        return
+    _QUEUE.put_nowait(job)
+
+
+async def _dequeue_job() -> PipelineJob:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        while True:
+            res = await client.blpop(_REDIS_QUEUE_KEY, timeout=2)
+            if res is None:
+                await asyncio.sleep(0.1)
+                continue
+            _, raw = res
+            return _job_from_json(raw)
+    return await _QUEUE.get()
+
+
+async def _mark_cancelled_queued(run_id: str) -> None:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        await client.sadd(_REDIS_CANCELLED_KEY, run_id)
+    _CANCELLED_QUEUED_RUN_IDS.add(run_id)
+    _QUEUED_RUN_IDS.discard(run_id)
+
+
+async def _is_cancelled_queued(run_id: str) -> bool:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        if await client.sismember(_REDIS_CANCELLED_KEY, run_id):
+            return True
+    return run_id in _CANCELLED_QUEUED_RUN_IDS
+
+
+async def _clear_cancelled_queued(run_id: str) -> None:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        await client.srem(_REDIS_CANCELLED_KEY, run_id)
+    _CANCELLED_QUEUED_RUN_IDS.discard(run_id)
+
+
+async def _push_dead_letter(job: PipelineJob, reason: str) -> None:
+    payload = {
+        "run_id": job.run_id,
+        "attempt": job.attempt,
+        "reason": reason,
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "cmd": job.cmd,
+        "env": job.env,
+        "cwd": job.cwd,
+    }
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        await client.rpush(_REDIS_DLQ_KEY, json.dumps(payload, ensure_ascii=False))
+        return
+    _DEAD_LETTER_JOBS.append(payload)
+    if len(_DEAD_LETTER_JOBS) > 1000:
+        del _DEAD_LETTER_JOBS[: len(_DEAD_LETTER_JOBS) - 1000]
+
+
+def _estimate_job_tokens(job: PipelineJob) -> int:
+    max_turns = int(job.env.get("MAX_TURNS", settings.max_turns))
+    generation_max = int(settings.generation_max_tokens)
+    return max_turns * generation_max
+
+
+async def _peek_dead_letter(limit: int = 50) -> list[dict]:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        rows = await client.lrange(_REDIS_DLQ_KEY, -limit, -1)
+        out: list[dict] = []
+        for raw in rows:
+            try:
+                out.append(json.loads(raw))
+            except Exception:
+                continue
+        return out
+    return list(_DEAD_LETTER_JOBS[-limit:])
+
+
+async def _pop_dead_letter_for_run(run_id: str) -> PipelineJob | None:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        rows = await client.lrange(_REDIS_DLQ_KEY, 0, -1)
+        for raw in rows:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            if payload.get("run_id") != run_id:
+                continue
+            await client.lrem(_REDIS_DLQ_KEY, 1, raw)
+            return PipelineJob(
+                run_id=payload["run_id"],
+                cmd=list(payload.get("cmd", [])),
+                env=dict(payload.get("env", {})),
+                cwd=payload.get("cwd", str(Path(__file__).parent.parent.parent)),
+                attempt=1,
+            )
+        return None
+
+    for idx, payload in enumerate(_DEAD_LETTER_JOBS):
+        if str(payload.get("run_id")) != run_id:
+            continue
+        entry = _DEAD_LETTER_JOBS.pop(idx)
+        return PipelineJob(
+            run_id=str(entry["run_id"]),
+            cmd=list(entry.get("cmd", [])),
+            env=dict(entry.get("env", {})),
+            cwd=str(entry.get("cwd", str(Path(__file__).parent.parent.parent))),
+            attempt=1,
+        )
+    return None
+
+
+async def _ensure_executor_started() -> None:
+    global _EXECUTOR_STARTED
+    if _EXECUTOR_WORKERS and _EXECUTOR_STARTED:
+        return
+    async with _EXECUTOR_LOCK:
+        if _EXECUTOR_WORKERS and _EXECUTOR_STARTED:
+            return
+        worker_count = max(1, int(settings.pipeline_worker_concurrency))
+        _EXECUTOR_STARTED = True
+        for i in range(worker_count):
+            task = asyncio.create_task(_queue_worker(i), name=f"pipeline_queue_worker_{i}")
+            _EXECUTOR_WORKERS.append(task)
+
+
+async def _queue_worker(worker_idx: int) -> None:
+    try:
+        while True:
+            job = await _dequeue_job()
+            try:
+                _QUEUED_RUN_IDS.discard(job.run_id)
+                if await _is_cancelled_queued(job.run_id):
+                    await _clear_cancelled_queued(job.run_id)
+                    runs.append_log(job.run_id, "[Queue] Zadanie usunięte z kolejki (anulowane przed startem).")
+                    continue
+
+                runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie (attempt={job.attempt})...")
+                success = await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
+                if not success:
+                    if job.attempt < int(settings.pipeline_max_attempts):
+                        next_job = PipelineJob(
+                            run_id=job.run_id,
+                            cmd=job.cmd,
+                            env=job.env,
+                            cwd=job.cwd,
+                            attempt=job.attempt + 1,
+                        )
+                        runs.update(job.run_id, status="queued")
+                        runs.append_log(
+                            job.run_id,
+                            f"[Queue] Retry queued (attempt {next_job.attempt}/{settings.pipeline_max_attempts}).",
+                        )
+                        await _enqueue_job(next_job)
+                        _QUEUED_RUN_IDS.add(job.run_id)
+                    else:
+                        await _push_dead_letter(job, "max_attempts_exceeded")
+                        runs.append_log(job.run_id, "[Queue] ❌ Dead-lettered after max attempts.")
+            finally:
+                if _queue_backend() == "memory":
+                    _QUEUE.task_done()
+    except asyncio.CancelledError:
+        return
+
+
+async def startup_executor() -> None:
+    """Start pipeline queue workers at app startup."""
+    await _ensure_executor_started()
+
+
+async def shutdown_executor(timeout_seconds: float = 10.0) -> None:
+    """Stop queue workers gracefully during app shutdown."""
+    global _EXECUTOR_STARTED
+    _EXECUTOR_STARTED = False
+    if not _EXECUTOR_WORKERS:
+        return
+    if _queue_backend() == "memory":
+        try:
+            await asyncio.wait_for(_QUEUE.join(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            # Continue with cancellation even if queue isn't drained.
+            pass
+    for task in _EXECUTOR_WORKERS:
+        task.cancel()
+    await asyncio.gather(*_EXECUTOR_WORKERS, return_exceptions=True)
+    _EXECUTOR_WORKERS.clear()
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        await _REDIS_CLIENT.aclose()
+        _REDIS_CLIENT = None
 
 
 # ---------------------------------------------------------------------------
@@ -273,21 +566,106 @@ async def run_pipeline(
     runs.append_log(run_id, f"[AutoPilot] Perspektywy: {', '.join(analysis.perspectives)}")
     runs.append_log(run_id, f"[AutoPilot] quality_threshold={quality_threshold} "
                    f"max_turns={max_turns} adversarial={adversarial_ratio}")
-    runs.append_log(run_id, "[AutoPilot] Uruchamiam pipeline...")
+    runs.append_log(run_id, "[AutoPilot] Dodaję zadanie do kolejki wykonawczej...")
+    runs.update(run_id, status="queued")
 
-    # Launch background task
-    _RUN_TASKS[run_id] = asyncio.create_task(_run_subprocess(run_id, cmd, env))
+    await _ensure_executor_started()
+    try:
+        await _enqueue_job(
+            PipelineJob(
+                run_id=run_id,
+                cmd=cmd,
+                env=env,
+                cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
+                attempt=1,
+            )
+        )
+        _QUEUED_RUN_IDS.add(run_id)
+        runs.append_log(run_id, f"[Queue] Pozycja w kolejce: {await _queue_size()}.")
+    except asyncio.QueueFull as exc:
+        runs.update(run_id, status="error", error="Pipeline queue is full.")
+        runs.append_log(run_id, "[Queue] ❌ Kolejka pipeline jest pełna.")
+        raise ServiceUnavailableError(
+            error_code="pipeline_queue_full",
+            message="Pipeline queue is full.",
+            details={"hint": "Retry later or increase PIPELINE_QUEUE_MAXSIZE / worker concurrency."},
+        ) from exc
 
     return PipelineRunResponse(
         run_id=run_id,
         batch_id=batch_id,
-        status="starting",
-        message=f"Pipeline started. Domain: {analysis.domain_label}. "
+        status="queued",
+        message=f"Pipeline queued. Domain: {analysis.domain_label}. "
                 f"Threshold (auto): {quality_threshold}",
     )
 
 
-async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
+@router.get("/queue", dependencies=[Depends(require_admin_api_key)])
+async def queue_stats() -> dict[str, int | str]:
+    """Queue visibility endpoint for operators."""
+    queued = await _queue_size()
+    dead = await _dead_letter_count()
+    return {
+        "backend": _queue_backend(),
+        "queued_jobs": queued,
+        "dead_letter_jobs": dead,
+        "queued_run_ids": len(_QUEUED_RUN_IDS),
+        "cancelled_queued_runs": len(_CANCELLED_QUEUED_RUN_IDS),
+        "active_workers": len(_EXECUTOR_WORKERS),
+        "running_processes": len(_RUN_PROCS),
+    }
+
+
+@router.get("/deadletter", dependencies=[Depends(require_admin_api_key)])
+async def deadletter_list(limit: int = 50) -> dict[str, object]:
+    limit = max(1, min(limit, 200))
+    entries = await _peek_dead_letter(limit=limit)
+    return {"count": len(entries), "items": entries}
+
+
+@router.post("/deadletter/replay/{run_id}", dependencies=[Depends(require_admin_api_key)])
+async def replay_deadletter(run_id: str) -> dict[str, object]:
+    rec = runs.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    job = await _pop_dead_letter_for_run(run_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Dead-letter entry not found for run: {run_id}")
+
+    token_estimate = _estimate_job_tokens(job)
+    max_budget = int(settings.pipeline_replay_token_budget_max)
+    if token_estimate > max_budget:
+        await _push_dead_letter(job, f"replay_budget_exceeded:{token_estimate}>{max_budget}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Replay rejected: estimated token budget {token_estimate} exceeds limit {max_budget}.",
+        )
+
+    rec.error = None
+    runs.update(run_id, status="queued")
+    runs.append_log(run_id, f"[Queue] 🔁 Replay from DLQ queued (estimated_tokens={token_estimate}).")
+
+    try:
+        await _enqueue_job(job)
+        _QUEUED_RUN_IDS.add(run_id)
+    except asyncio.QueueFull as exc:
+        await _push_dead_letter(job, "replay_queue_full")
+        raise ServiceUnavailableError(
+            error_code="pipeline_queue_full",
+            message="Pipeline queue is full.",
+            details={"hint": "Retry replay later or increase queue limits."},
+        ) from exc
+
+    return {
+        "run_id": run_id,
+        "status": "queued",
+        "estimated_tokens": token_estimate,
+        "max_budget": max_budget,
+    }
+
+
+async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd: str) -> bool:
     """Background task: run main.py, stream its output into the run log."""
     runs.update(run_id, status="running")
     try:
@@ -296,7 +674,7 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
-            cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
+            cwd=cwd,
         )
         _RUN_PROCS[run_id] = proc
         assert proc.stdout is not None
@@ -308,6 +686,7 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
         if proc.returncode == 0:
             runs.update(run_id, status="done", progress_pct=100)
             runs.append_log(run_id, "[AutoPilot] ✅ Pipeline zakończony pomyślnie.")
+            return True
         else:
             runs.update(
                 run_id,
@@ -315,12 +694,13 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
                 error=f"Subprocess exited with code {proc.returncode}",
             )
             runs.append_log(run_id, f"[AutoPilot] ❌ Błąd (exit code {proc.returncode})")
+            return False
     except Exception as exc:
         runs.update(run_id, status="error", error=str(exc))
         runs.append_log(run_id, f"[AutoPilot] ❌ Wyjątek: {exc}")
+        return False
     finally:
         _RUN_PROCS.pop(run_id, None)
-        _RUN_TASKS.pop(run_id, None)
 
 
 @router.post("/cancel/{run_id}", dependencies=[Depends(require_admin_api_key)])
@@ -329,6 +709,18 @@ async def cancel_run(run_id: str) -> dict[str, str]:
     rec = runs.get(run_id)
     if rec is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    if run_id in _QUEUED_RUN_IDS or rec.status == "queued":
+        await _mark_cancelled_queued(run_id)
+        runs.update(
+            run_id,
+            status="cancelled",
+            error="Cancelled by user before execution",
+            ended_at=datetime.datetime.now().timestamp(),
+        )
+        runs.append_log(run_id, "[AutoPilot] ⏹️ Zadanie anulowane w kolejce przed uruchomieniem.")
+        return {"run_id": run_id, "status": "cancelled"}
+
     proc = _RUN_PROCS.get(run_id)
     if proc is None or rec.status not in ("starting", "running"):
         raise HTTPException(status_code=409, detail=f"Run is not cancellable: {run_id}")
@@ -408,6 +800,21 @@ def list_runs() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/pipeline/ws-ticket/{run_id} — short-lived WS auth ticket
+# ---------------------------------------------------------------------------
+
+@router.get("/ws-ticket/{run_id}", dependencies=[Depends(require_admin_api_key)])
+def create_ws_auth_ticket(run_id: str) -> dict[str, str]:
+    rec = runs.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    ticket = create_ws_ticket(run_id)
+    if not ticket:
+        raise HTTPException(status_code=503, detail="ADMIN_API_KEY is not configured on the server.")
+    return {"run_id": run_id, "ws_ticket": ticket}
+
+
+# ---------------------------------------------------------------------------
 # WebSocket /api/pipeline/ws/{run_id} — live log stream
 # ---------------------------------------------------------------------------
 
@@ -418,7 +825,8 @@ async def websocket_log(websocket: WebSocket, run_id: str) -> None:
     Sends one JSON message per line: {"line": "...", "status": "running"}
     Closes when the run is done or errors.
     """
-    if not require_admin_api_key_ws(websocket):
+    ws_ticket = websocket.query_params.get("ws_ticket")
+    if not (require_admin_api_key_ws(websocket) or verify_ws_ticket(ws_ticket, run_id)):
         await websocket.close(code=1008)
         return
 
