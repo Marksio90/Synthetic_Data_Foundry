@@ -50,6 +50,8 @@ from sqlalchemy.orm import Session
 from agents.constitutional import constitutional_revision
 from agents.expert import generate_answer, retrieve_context
 from agents.judge import judge_answer
+from agents.knowledge_graph import get_knowledge_graph
+from agents.self_improving_loop import get_self_improving_loop
 from agents.simulator import simulate_followup, simulate_question
 from config.settings import settings
 from db import repository as repo
@@ -288,6 +290,84 @@ def make_write_node(
     return _write
 
 
+@with_telemetry("knowledge_graph")
+def knowledge_graph_node(state: FoundryState) -> dict:
+    """Extract entities from processed chunk + answer and add to KG."""
+    chunk = state.get("chunk", {})
+    text = (chunk.get("content") or "") + "\n" + (state.get("answer") or "")
+    doc_id = chunk.get("source_document", "unknown")
+    chunk_id = chunk.get("id", "unknown")
+    try:
+        kg = get_knowledge_graph()
+        entities = kg.extract_entities(text, doc_id=doc_id, chunk_id=chunk_id)
+        relationships = kg.build_relationships(entities, text)
+        kg.add_to_graph(entities, relationships)
+        logger.debug(
+            "[KG] chunk=%s entities=%d relationships=%d",
+            chunk_id[:8], len(entities), len(relationships),
+        )
+    except Exception as exc:
+        logger.warning("[KG] Failed for chunk=%s: %s", chunk_id[:8], exc)
+    return {}
+
+
+def _extract_weakness_categories(judge_details: dict) -> list[str]:
+    """Map low-scoring judge dimensions to weakness category names."""
+    categories = []
+    dim_map = {
+        "hallucination": "factual_accuracy",
+        "grounding": "citations",
+        "completeness": "depth",
+        "language": "conciseness",
+        "citation": "citations",
+    }
+    for dim, category in dim_map.items():
+        score = judge_details.get(dim, 1.0)
+        if isinstance(score, (int, float)) and score < 0.7:
+            categories.append(category)
+    return categories
+
+
+def _run_async(coro) -> None:
+    """Run an async coroutine from a sync context without blocking."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+    except RuntimeError:
+        asyncio.run(coro)
+
+
+@with_telemetry("self_improving_loop")
+def self_improving_loop_node(state: FoundryState) -> dict:
+    """After each written sample, nudge calibration parameters from quality signals."""
+    if state.get("status") != "ready" or state.get("record_index", -1) < 0:
+        return {}
+    judge_details = state.get("judge_details") or {}
+    weakness_report = {
+        "hallucination_rate": 1.0 - float(judge_details.get("hallucination", 1.0)),
+        "avg_quality_score": float(state.get("quality_score", 0.0)),
+        "n_critiqued": 1,
+        "top_weakness_categories": _extract_weakness_categories(judge_details),
+    }
+    workflow_id = state.get("batch_id") or state.get("chunk", {}).get("id", "unknown")
+    try:
+        loop = get_self_improving_loop(db_url=getattr(settings, "async_database_url", None))
+        import asyncio
+        _run_async(
+            loop.run_cycle(
+                workflow_id=workflow_id,
+                weakness_report=weakness_report,
+                current_quality_threshold=float(settings.quality_threshold),
+                current_adversarial_ratio=float(getattr(settings, "adversarial_ratio", 0.10)),
+                current_max_turns=int(settings.max_turns),
+            )
+        )
+    except Exception as exc:
+        logger.warning("[SelfImprovingLoop] Skipped for workflow=%s: %s", workflow_id, exc)
+    return {}
+
+
 def make_unresolvable_node(session: Session) -> Callable:
     @with_telemetry("mark_unresolvable")
     def _unresolvable(state: FoundryState) -> dict:
@@ -377,6 +457,8 @@ def build_graph(
     graph.add_node("judge_answer",            with_telemetry("judge_answer")(judge_answer))
     graph.add_node("append_turn",             append_turn)
     graph.add_node("write_output",            make_write_node(session, writer, dpo_writer, orpo_writer, kto_writer, deduplicator))
+    graph.add_node("knowledge_graph_node",    knowledge_graph_node)
+    graph.add_node("self_improving_loop_node", self_improving_loop_node)
     graph.add_node("mark_unresolvable",       make_unresolvable_node(session))
     graph.add_node("increment_retry",         increment_retry)
 
@@ -409,8 +491,10 @@ def build_graph(
         },
     )
     
-    graph.add_edge("simulate_followup",   "retrieve_context")
-    graph.add_edge("write_output",        END)
-    graph.add_edge("mark_unresolvable",   END)
+    graph.add_edge("simulate_followup",        "retrieve_context")
+    graph.add_edge("write_output",             "knowledge_graph_node")
+    graph.add_edge("knowledge_graph_node",     "self_improving_loop_node")
+    graph.add_edge("self_improving_loop_node", END)
+    graph.add_edge("mark_unresolvable",        END)
 
     return graph.compile()

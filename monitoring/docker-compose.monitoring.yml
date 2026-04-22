@@ -108,6 +108,32 @@ services:
       - foundry-net
     restart: unless-stopped
 
+  # Neo4j — knowledge graph backend for KnowledgeGraph agent
+  neo4j:
+    image: neo4j:5.21-community
+    container_name: foundry-neo4j
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-foundry-neo4j}"
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_heap_initial__size: "512m"
+      NEO4J_dbms_memory_heap_max__size: "1g"
+      NEO4J_dbms_memory_pagecache_size: "512m"
+    ports:
+      - "7474:7474"   # Neo4j Browser
+      - "7687:7687"   # Bolt protocol
+    networks:
+      - foundry-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   # LiteLLM Proxy
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
@@ -137,6 +163,8 @@ volumes:
   tempo_data:
   nats_data:
   qdrant_data:
+  neo4j_data:
+  neo4j_logs:
 
 networks:
   foundry-net:
