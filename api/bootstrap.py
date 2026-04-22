@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.monitoring import get_metrics_payload, is_available as metrics_available
+from api.errors import ApiError
 from api.routers import chatbot, documents, pipeline, samples, scout, training
 from api.routers import websub as websub_router
 from config.settings import settings
@@ -168,7 +169,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         self._logger = logger
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        request_id = str(uuid.uuid4())
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
         start_time = time.perf_counter()
 
         self._logger.debug("--> [%s] %s %s", request_id, request.method, request.url.path)
@@ -206,9 +208,21 @@ def configure_middlewares(app: FastAPI, logger: logging.Logger) -> None:
 
 
 def register_exception_handlers(app: FastAPI, logger: logging.Logger) -> None:
+    @app.exception_handler(ApiError)
+    async def api_error_handler(request: Request, exc: ApiError):
+        req_id = getattr(request.state, "request_id", request.headers.get("X-Request-ID", "unknown"))
+        logger.warning(
+            "[%s] API error (%s) on %s: %s",
+            req_id,
+            exc.error_code,
+            request.url.path,
+            exc.message,
+        )
+        return JSONResponse(status_code=exc.status_code, content=exc.to_payload(req_id))
+
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
-        req_id = request.headers.get("X-Request-ID", "unknown")
+        req_id = getattr(request.state, "request_id", request.headers.get("X-Request-ID", "unknown"))
         logger.error(
             "[%s] Nieobsłużony błąd serwera (HTTP 500) pod adresem %s: %s",
             req_id,
@@ -284,6 +298,64 @@ def register_system_routes(app: FastAPI) -> None:
                 "checks": checks,
             },
         )
+
+    @app.get("/health/dependencies", tags=["System"])
+    async def health_dependencies() -> JSONResponse:
+        """
+        Diagnostic endpoint for external/service dependencies.
+        Returns 200 when core dependencies are ready, otherwise 503/424.
+        """
+        import sqlalchemy
+        from api.db import _engine
+
+        checks: dict[str, dict] = {}
+        missing: list[str] = []
+        status_code = 200
+
+        try:
+            with _engine.connect() as conn:
+                conn.execute(sqlalchemy.text("SELECT 1"))
+                ext_rows = conn.execute(
+                    sqlalchemy.text("SELECT extname FROM pg_extension WHERE extname IN ('vector')")
+                ).fetchall()
+            checks["database"] = {"status": "ok"}
+            checks["pgvector"] = {"status": "ok" if any(r[0] == "vector" for r in ext_rows) else "missing"}
+            if checks["pgvector"]["status"] != "ok":
+                missing.append("pgvector")
+                status_code = 424
+        except Exception as exc:
+            checks["database"] = {"status": "error", "detail": str(exc)}
+            checks["pgvector"] = {"status": "unknown"}
+            missing.extend(["database", "pgvector"])
+            status_code = 503
+
+        ollama_url = getattr(settings, "ollama_url", "")
+        if ollama_url:
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get(f"{ollama_url}/api/tags")
+                checks["ollama"] = {"status": "ok" if resp.status_code == 200 else "degraded"}
+            except Exception:
+                checks["ollama"] = {"status": "degraded"}
+        else:
+            checks["ollama"] = {"status": "not_configured"}
+
+        checks["api_keys"] = {
+            "openai_api_key_configured": bool(getattr(settings, "openai_api_key", "").strip()),
+            "admin_api_key_configured": bool(getattr(settings, "admin_api_key", "").strip()),
+        }
+
+        payload = {
+            "status": "ok" if status_code == 200 else "degraded",
+            "service": "foundry-api-pro",
+            "timestamp": time.time(),
+            "checks": checks,
+            "missing_dependencies": missing,
+            "error_code": "dependencies_missing" if status_code in (424, 503) else None,
+        }
+        return JSONResponse(status_code=status_code, content=payload)
 
     @app.get("/metrics", include_in_schema=False)
     def metrics():

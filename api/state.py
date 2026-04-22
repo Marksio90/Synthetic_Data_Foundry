@@ -10,17 +10,20 @@ Thread-safe for use from asyncio background tasks.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 import time
 from dataclasses import dataclass, field  # noqa: F401 — field used by ScoutTopic
+from pathlib import Path
 from typing import Any, Optional
 
 from config.settings import settings
-from agents.scout_contract import topic_priority_score
 
 _MAX_LOG_LINES = settings.state_max_log_lines
 _MAX_RUNS = settings.state_max_runs
 _MAX_SCOUT_RUNS = settings.state_max_scout_runs
+_RUN_STATE_SNAPSHOT = Path(os.getenv("RUN_STATE_SNAPSHOT_FILE", "/tmp/foundry_run_state.json"))
 
 
 @dataclass
@@ -52,8 +55,72 @@ class RunManager:
     Designed for single-process use (one Uvicorn worker).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, snapshot_path: Optional[Path] = None) -> None:
         self._runs: dict[str, RunRecord] = {}
+        self._snapshot_path = snapshot_path or _RUN_STATE_SNAPSHOT
+        self._load_snapshot()
+
+    def _serialize(self) -> dict[str, Any]:
+        return {
+            "runs": [
+                {
+                    "run_id": r.run_id,
+                    "batch_id": r.batch_id,
+                    "status": r.status,
+                    "progress_pct": r.progress_pct,
+                    "chunks_total": r.chunks_total,
+                    "chunks_done": r.chunks_done,
+                    "records_written": r.records_written,
+                    "dpo_pairs": r.dpo_pairs,
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
+                    "error": r.error,
+                    "log_lines": r.log_lines[-_MAX_LOG_LINES:],
+                    "analysis": r.analysis,
+                    "calibration": r.calibration,
+                }
+                for r in self._runs.values()
+            ][-_MAX_RUNS:],
+        }
+
+    def _persist_snapshot(self) -> None:
+        try:
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            self._snapshot_path.write_text(
+                json.dumps(self._serialize(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            # Snapshot persistence is best-effort; runtime state must not fail because of disk issues.
+            pass
+
+    def _load_snapshot(self) -> None:
+        if not self._snapshot_path.exists():
+            return
+        try:
+            raw = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
+            items = raw.get("runs", [])
+            for item in items[-_MAX_RUNS:]:
+                rec = RunRecord(
+                    run_id=item["run_id"],
+                    batch_id=item["batch_id"],
+                    status=item.get("status", "starting"),
+                    progress_pct=int(item.get("progress_pct", 0)),
+                    chunks_total=int(item.get("chunks_total", 0)),
+                    chunks_done=int(item.get("chunks_done", 0)),
+                    records_written=int(item.get("records_written", 0)),
+                    dpo_pairs=int(item.get("dpo_pairs", 0)),
+                    started_at=float(item.get("started_at", time.time())),
+                    ended_at=item.get("ended_at"),
+                    error=item.get("error"),
+                    log_lines=list(item.get("log_lines", []))[-_MAX_LOG_LINES:],
+                    analysis=item.get("analysis"),
+                    calibration=item.get("calibration"),
+                )
+                self._runs[rec.run_id] = rec
+        except Exception:
+            # Corrupt snapshot should not break app startup; continue with empty in-memory state.
+            self._runs = {}
 
     def create(self, run_id: str, batch_id: str) -> RunRecord:
         if len(self._runs) >= _MAX_RUNS:
@@ -61,6 +128,7 @@ class RunManager:
             self._runs.pop(oldest_run_id, None)
         rec = RunRecord(run_id=run_id, batch_id=batch_id)
         self._runs[run_id] = rec
+        self._persist_snapshot()
         return rec
 
     def get(self, run_id: str) -> Optional[RunRecord]:
@@ -73,6 +141,9 @@ class RunManager:
         for k, v in kwargs.items():
             if hasattr(rec, k):
                 setattr(rec, k, v)
+        if kwargs.get("status") in ("done", "error", "cancelled") and rec.ended_at is None:
+            rec.ended_at = time.time()
+        self._persist_snapshot()
 
     def append_log(self, run_id: str, line: str) -> None:
         rec = self._runs.get(run_id)
@@ -82,6 +153,7 @@ class RunManager:
                 del rec.log_lines[: len(rec.log_lines) - _MAX_LOG_LINES]
             # Parse progress hints from log lines
             _parse_progress(rec, line)
+            self._persist_snapshot()
 
     def list_runs(self) -> list[RunRecord]:
         return list(self._runs.values())
