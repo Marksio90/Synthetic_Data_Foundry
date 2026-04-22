@@ -69,6 +69,8 @@ _EXECUTOR_STARTED = False
 _REDIS_CLIENT = None
 _REDIS_QUEUE_KEY = "foundry:pipeline:jobs"
 _REDIS_CANCELLED_KEY = "foundry:pipeline:cancelled"
+_REDIS_DLQ_KEY = "foundry:pipeline:deadletter"
+_DEAD_LETTER_JOBS: list[dict[str, str]] = []
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
 
 
@@ -83,6 +85,7 @@ class PipelineJob:
     cmd: list[str]
     env: dict[str, str]
     cwd: str
+    attempt: int = 1
 
 
 def _queue_backend() -> str:
@@ -112,12 +115,21 @@ async def _ensure_redis_client():
 
 
 def _job_to_json(job: PipelineJob) -> str:
-    return json.dumps({"run_id": job.run_id, "cmd": job.cmd, "env": job.env, "cwd": job.cwd}, ensure_ascii=False)
+    return json.dumps(
+        {"run_id": job.run_id, "cmd": job.cmd, "env": job.env, "cwd": job.cwd, "attempt": job.attempt},
+        ensure_ascii=False,
+    )
 
 
 def _job_from_json(raw: str) -> PipelineJob:
     data = json.loads(raw)
-    return PipelineJob(run_id=data["run_id"], cmd=list(data["cmd"]), env=dict(data["env"]), cwd=data["cwd"])
+    return PipelineJob(
+        run_id=data["run_id"],
+        cmd=list(data["cmd"]),
+        env=dict(data["env"]),
+        cwd=data["cwd"],
+        attempt=int(data.get("attempt", 1)),
+    )
 
 
 async def _queue_size() -> int:
@@ -125,6 +137,13 @@ async def _queue_size() -> int:
     if client is not None and _queue_backend() == "redis":
         return int(await client.llen(_REDIS_QUEUE_KEY))
     return _QUEUE.qsize()
+
+
+async def _dead_letter_count() -> int:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        return int(await client.llen(_REDIS_DLQ_KEY))
+    return len(_DEAD_LETTER_JOBS)
 
 
 async def _enqueue_job(job: PipelineJob) -> None:
@@ -175,6 +194,22 @@ async def _clear_cancelled_queued(run_id: str) -> None:
     _CANCELLED_QUEUED_RUN_IDS.discard(run_id)
 
 
+async def _push_dead_letter(job: PipelineJob, reason: str) -> None:
+    payload = {
+        "run_id": job.run_id,
+        "attempt": str(job.attempt),
+        "reason": reason,
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        await client.rpush(_REDIS_DLQ_KEY, json.dumps(payload, ensure_ascii=False))
+        return
+    _DEAD_LETTER_JOBS.append(payload)
+    if len(_DEAD_LETTER_JOBS) > 1000:
+        del _DEAD_LETTER_JOBS[: len(_DEAD_LETTER_JOBS) - 1000]
+
+
 async def _ensure_executor_started() -> None:
     global _EXECUTOR_STARTED
     if _EXECUTOR_WORKERS and _EXECUTOR_STARTED:
@@ -200,8 +235,27 @@ async def _queue_worker(worker_idx: int) -> None:
                     runs.append_log(job.run_id, "[Queue] Zadanie usunięte z kolejki (anulowane przed startem).")
                     continue
 
-                runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie...")
-                await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
+                runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie (attempt={job.attempt})...")
+                success = await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
+                if not success:
+                    if job.attempt < int(settings.pipeline_max_attempts):
+                        next_job = PipelineJob(
+                            run_id=job.run_id,
+                            cmd=job.cmd,
+                            env=job.env,
+                            cwd=job.cwd,
+                            attempt=job.attempt + 1,
+                        )
+                        runs.update(job.run_id, status="queued")
+                        runs.append_log(
+                            job.run_id,
+                            f"[Queue] Retry queued (attempt {next_job.attempt}/{settings.pipeline_max_attempts}).",
+                        )
+                        await _enqueue_job(next_job)
+                        _QUEUED_RUN_IDS.add(job.run_id)
+                    else:
+                        await _push_dead_letter(job, "max_attempts_exceeded")
+                        runs.append_log(job.run_id, "[Queue] ❌ Dead-lettered after max attempts.")
             finally:
                 if _queue_backend() == "memory":
                     _QUEUE.task_done()
@@ -465,6 +519,7 @@ async def run_pipeline(
                 cmd=cmd,
                 env=env,
                 cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
+                attempt=1,
             )
         )
         _QUEUED_RUN_IDS.add(run_id)
@@ -491,9 +546,11 @@ async def run_pipeline(
 async def queue_stats() -> dict[str, int | str]:
     """Queue visibility endpoint for operators."""
     queued = await _queue_size()
+    dead = await _dead_letter_count()
     return {
         "backend": _queue_backend(),
         "queued_jobs": queued,
+        "dead_letter_jobs": dead,
         "queued_run_ids": len(_QUEUED_RUN_IDS),
         "cancelled_queued_runs": len(_CANCELLED_QUEUED_RUN_IDS),
         "active_workers": len(_EXECUTOR_WORKERS),
@@ -501,7 +558,7 @@ async def queue_stats() -> dict[str, int | str]:
     }
 
 
-async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd: str) -> None:
+async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd: str) -> bool:
     """Background task: run main.py, stream its output into the run log."""
     runs.update(run_id, status="running")
     try:
@@ -522,6 +579,7 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd:
         if proc.returncode == 0:
             runs.update(run_id, status="done", progress_pct=100)
             runs.append_log(run_id, "[AutoPilot] ✅ Pipeline zakończony pomyślnie.")
+            return True
         else:
             runs.update(
                 run_id,
@@ -529,9 +587,11 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd:
                 error=f"Subprocess exited with code {proc.returncode}",
             )
             runs.append_log(run_id, f"[AutoPilot] ❌ Błąd (exit code {proc.returncode})")
+            return False
     except Exception as exc:
         runs.update(run_id, status="error", error=str(exc))
         runs.append_log(run_id, f"[AutoPilot] ❌ Wyjątek: {exc}")
+        return False
     finally:
         _RUN_PROCS.pop(run_id, None)
 
