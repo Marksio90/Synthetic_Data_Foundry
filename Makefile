@@ -27,7 +27,8 @@ CTL   := ./scripts/foundry-ctl.sh
 .DEFAULT_GOAL := help
 
 .PHONY: help setup up down full-run generate gate train export chatbot \
-        logs logs-api logs-ui logs-frontend logs-trainer status clean rebuild
+        logs logs-api logs-ui logs-frontend logs-trainer status clean rebuild \
+        check-merge-conflicts
 
 # ---------------------------------------------------------------------------
 # Pomoc
@@ -59,6 +60,9 @@ help:
 	@echo "    make logs-ui      Logi frontendu (alias)"
 	@echo "    make logs-frontend Logi frontendu"
 	@echo "    make logs-trainer Logi kontenera treningowego"
+	@echo ""
+	@echo "  WERYFIKACJA"
+	@echo "    make check-merge-conflicts  Sprawdź czy repo nie zawiera markerów konfliktów Git"
 	@echo ""
 	@echo "  Zmienne (opcjonalne):"
 	@echo "    MODEL_NAME=my-model make export"
@@ -132,3 +136,16 @@ logs-frontend:
 
 logs-trainer:
 	@docker compose --profile train logs -f foundry-trainer
+
+# ---------------------------------------------------------------------------
+# Weryfikacja
+# ---------------------------------------------------------------------------
+
+check-merge-conflicts:
+	@echo "Sprawdzam markery konfliktów Git..."
+	@if rg -n --hidden --glob '!.git' '^(<<<<<<<|=======|>>>>>>>)' .; then \
+		echo "❌ Wykryto markery konfliktów."; \
+		exit 1; \
+	else \
+		echo "✅ Brak markerów konfliktów."; \
+	fi

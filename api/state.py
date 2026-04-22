@@ -161,6 +161,16 @@ class ScoutTopic:
     source_tier: str = "C"
     estimated_tokens: int = 0
     ingest_ready: bool = False
+    dataset_category: str = "general"
+    dataset_purpose: str = "qa_reasoning"
+    demand_score: float = 0.0
+    uniqueness_score: float = 0.0
+    quality_score: float = 0.0
+    quality_gate_passed: bool = False
+    quality_gate_reasons: list[str] = field(default_factory=list)
+    expected_capabilities: list[str] = field(default_factory=list)
+    coverage_scope: str = "narrow"
+    quality_notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -184,6 +194,16 @@ class ScoutTopic:
             "source_tier": self.source_tier,
             "estimated_tokens": self.estimated_tokens,
             "ingest_ready": self.ingest_ready,
+            "dataset_category": self.dataset_category,
+            "dataset_purpose": self.dataset_purpose,
+            "demand_score": self.demand_score,
+            "uniqueness_score": self.uniqueness_score,
+            "quality_score": self.quality_score,
+            "quality_gate_passed": self.quality_gate_passed,
+            "quality_gate_reasons": self.quality_gate_reasons,
+            "expected_capabilities": self.expected_capabilities,
+            "coverage_scope": self.coverage_scope,
+            "quality_notes": self.quality_notes,
         }
 
 
@@ -284,6 +304,16 @@ class ScoutManager:
             source_tier=getattr(t, "source_tier", "C"),
             estimated_tokens=getattr(t, "estimated_tokens", 0),
             ingest_ready=getattr(t, "ingest_ready", False),
+            dataset_category=getattr(t, "dataset_category", "general"),
+            dataset_purpose=getattr(t, "dataset_purpose", "qa_reasoning"),
+            demand_score=getattr(t, "demand_score", 0.0),
+            uniqueness_score=getattr(t, "uniqueness_score", 0.0),
+            quality_score=getattr(t, "quality_score", 0.0),
+            quality_gate_passed=getattr(t, "quality_gate_passed", False),
+            quality_gate_reasons=getattr(t, "quality_gate_reasons", []),
+            expected_capabilities=getattr(t, "expected_capabilities", []),
+            coverage_scope=getattr(t, "coverage_scope", "narrow"),
+            quality_notes=getattr(t, "quality_notes", []),
         )
 
     def add_single_topic(self, scout_id: str, topic_data: Any) -> None:
@@ -341,7 +371,17 @@ class ScoutManager:
         return self._topics.get(topic_id)
 
     def latest_topics(self, limit: int = 50) -> list[ScoutTopic]:
-        topics = sorted(self._topics.values(), key=lambda t: t.score, reverse=True)
+        topics = sorted(
+            self._topics.values(),
+            key=lambda t: (
+                0.20 * (1.0 if t.quality_gate_passed else 0.0)
+                + 0.45 * t.quality_score
+                + 0.25 * t.uniqueness_score
+                + 0.20 * t.knowledge_gap_score
+                + 0.10 * t.demand_score
+            ),
+            reverse=True,
+        )
         return topics[:limit]
 
     def list_runs(self) -> list[ScoutRecord]:
