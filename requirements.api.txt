@@ -10,3 +10,4 @@ websockets>=12.0,<14.0         # WebSocket server support (used by uvicorn)
 httpx>=0.27.0,<1.0             # async HTTP client for Ollama proxy + Scout ingest
 apscheduler>=3.10.0,<4.0       # hourly Gap Scout background scheduler (api/main.py)
 prometheus-client>=0.20.0,<1.0 # optional /metrics endpoint (api/monitoring.py)
+redis>=5.0.0,<6.0              # optional external queue backend for pipeline executor

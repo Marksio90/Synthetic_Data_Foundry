@@ -7,7 +7,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from fastapi import HTTPException
 
-from api.security import require_admin_api_key
+from api.security import create_ws_ticket, require_admin_api_key, verify_ws_ticket
 from config.settings import settings
 
 
@@ -42,6 +42,22 @@ class RequireAdminApiKeyTests(unittest.TestCase):
 
         # should not raise
         require_admin_api_key("super-secret")
+
+    def test_ws_ticket_roundtrip_and_scope(self) -> None:
+        settings.admin_api_key = "super-secret"
+
+        ticket = create_ws_ticket("run-123", ttl_seconds=60)
+        self.assertTrue(ticket)
+        self.assertTrue(verify_ws_ticket(ticket, "run-123"))
+        self.assertFalse(verify_ws_ticket(ticket, "run-xyz"))
+
+    def test_ws_ticket_rejects_expired_or_malformed(self) -> None:
+        settings.admin_api_key = "super-secret"
+
+        ticket = create_ws_ticket("run-123", ttl_seconds=60)
+        expired = f"1:{ticket.split(':', 1)[1]}"
+        self.assertFalse(verify_ws_ticket(expired, "run-123"))
+        self.assertFalse(verify_ws_ticket("not-a-ticket", "run-123"))
 
 
 if __name__ == "__main__":

@@ -12,12 +12,14 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Set
+from typing import Any, Callable, Optional, Set
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.monitoring import get_metrics_payload, is_available as metrics_available
@@ -61,6 +63,65 @@ class BackgroundTaskManager:
         self._logger.info("Zadania tła zostały bezpiecznie zamknięte.")
 
 
+class LeaderLock:
+    """
+    Cross-replica singleton guard backed by PostgreSQL advisory lock.
+    Keeps a dedicated DB connection open for the process lifetime to retain the lock.
+    """
+
+    def __init__(self, logger: logging.Logger):
+        self._logger = logger
+        self._engine = None
+        self._conn: Optional[Connection] = None
+        self._lock_id = int(settings.scheduler_leader_lock_id)
+        self.is_leader = False
+
+    def acquire(self) -> bool:
+        try:
+            self._engine = create_engine(
+                settings.database_url,
+                pool_pre_ping=True,
+                pool_size=1,
+                max_overflow=0,
+            )
+            self._conn = self._engine.connect()
+            acquired = bool(
+                self._conn.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": self._lock_id},
+                ).scalar()
+            )
+            self.is_leader = acquired
+            if acquired:
+                self._logger.info("Leader lock acquired (id=%s): singleton jobs enabled.", self._lock_id)
+            else:
+                self._logger.info("Leader lock busy (id=%s): singleton jobs disabled in this replica.", self._lock_id)
+            return acquired
+        except Exception as exc:
+            self._logger.warning(
+                "Could not acquire leader lock id=%s (%s). Running without singleton jobs.",
+                self._lock_id,
+                exc,
+            )
+            self.close()
+            return False
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        if self._engine is not None:
+            try:
+                self._engine.dispose()
+            except Exception:
+                pass
+            self._engine = None
+        self.is_leader = False
+
+
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
 except ImportError:
@@ -102,8 +163,22 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         logger.info("🚀 Inicjalizacja środowiska Synthetic Data Foundry...")
+        leader_lock = LeaderLock(logger)
+        leader_ready = leader_lock.acquire()
+        role = (getattr(settings, "service_role", "all") or "all").strip().lower()
+        run_executor = role in ("all", "worker")
 
-        if scheduler is not None:
+        if run_executor:
+            try:
+                from api.routers.pipeline import startup_executor
+                await startup_executor()
+                logger.info("Pipeline queue executor uruchomiony.")
+            except Exception as exc:
+                logger.warning("Nie udało się uruchomić pipeline queue executor: %s", exc)
+        else:
+            logger.info("Pipeline queue executor pominięty (SERVICE_ROLE=%s).", role)
+
+        if scheduler is not None and leader_ready:
             async def _scheduled_job() -> None:
                 await run_scheduled_scout(logger)
 
@@ -121,11 +196,13 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
                 "Pierwszy automatyczny skan za 1 godzinę; "
                 "manualny start przez przycisk na frontendzie."
             )
+        elif scheduler is not None:
+            logger.info("APScheduler pominięty — ta replika nie jest leaderem singleton zadań.")
 
         callback_url = getattr(settings, "scout_webhook_callback_url", "")
         webhook_secret = getattr(settings, "scout_webhook_secret", "")
 
-        if callback_url:
+        if callback_url and leader_ready:
             from agents.crawlers.websub import WebSubSubscriber
 
             websub = WebSubSubscriber.instance()
@@ -138,6 +215,8 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
                 name="websub_subscription_manager",
             )
             logger.info("WebSub: Nasłuchiwanie uruchomione pod adresem %s", callback_url)
+        elif callback_url:
+            logger.info("WebSub pominięty — ta replika nie jest leaderem singleton zadań.")
         else:
             logger.info("WebSub Tier 1 wyłączony — ustaw SCOUT_WEBHOOK_CALLBACK_URL, aby aktywować.")
 
@@ -156,6 +235,15 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
         from agents.topic_scout import _HTTP as _scout_http
         await _scout_http.aclose()
 
+        if run_executor:
+            try:
+                from api.routers.pipeline import shutdown_executor
+                await shutdown_executor()
+                logger.info("Pipeline queue executor zatrzymany.")
+            except Exception as exc:
+                logger.warning("Nie udało się bezpiecznie zatrzymać pipeline queue executor: %s", exc)
+
+        leader_lock.close()
         logger.info("Środowisko bezpiecznie wyłączone.")
 
     return lifespan
