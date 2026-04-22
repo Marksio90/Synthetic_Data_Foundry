@@ -23,6 +23,8 @@ import logging
 import sys
 from pathlib import Path
 
+from training.mlflow_tracker import FoundryMLflowTracker
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,9 +60,10 @@ def train_dpo(
     learning_rate: float = 5e-5,
     batch_size: int = 2,
     grad_accum: int = 4,
-    beta: float = 0.1,         # DPO temperature — higher = more conservative
+    beta: float = 0.1,
     max_length: int = 2048,
     run_name: str = "foundry-dpo",
+    batch_id: str = "manual",
 ) -> str:
     """
     DPO alignment from SFT model using TRL DPOTrainer.
@@ -148,12 +151,41 @@ def train_dpo(
         train_dataset=dataset,
     )
 
-    logger.info("Starting DPO training (beta=%.2f, epochs=%s)...", beta, epochs)
-    trainer.train()
+    tracker = FoundryMLflowTracker(experiment_name="foundry-dpo")
+    with tracker.start_run(run_name=run_name, batch_id=batch_id, tags={"sft_model": sft_model_path}):
+        tracker.log_hyperparams(
+            base_model=base_model,
+            sft_model=sft_model_path,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            grad_accum=grad_accum,
+            beta=beta,
+            max_length=max_length,
+            dpo_pairs=len(records),
+        )
 
-    model.save_pretrained(str(out_path))
-    tokenizer.save_pretrained(str(out_path))
-    logger.info("DPO complete. Model saved to: %s", out_path)
+        logger.info("Starting DPO training (beta=%.2f, epochs=%s)...", beta, epochs)
+        trainer.train()
+
+        for entry in (trainer.state.log_history or []):
+            step = int(entry.get("step", 0))
+            for key, val in entry.items():
+                if isinstance(val, (int, float)) and key not in ("step", "epoch", "total_flos"):
+                    tracker.log_metric(key, float(val), step=step)
+
+        model.save_pretrained(str(out_path))
+        tokenizer.save_pretrained(str(out_path))
+        logger.info("DPO complete. Model saved to: %s", out_path)
+
+        tracker.log_model_artifact(str(out_path))
+        tracker.register_model(
+            model_name="foundry-dpo",
+            model_version_tags={"batch_id": batch_id, "base_model": base_model},
+        )
+
     return str(out_path)
 
 

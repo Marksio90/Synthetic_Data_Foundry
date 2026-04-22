@@ -1,0 +1,157 @@
+{
+  "title": "Synthetic Data Foundry — Overview",
+  "uid": "foundry-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Pipeline Throughput (samples/min)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "rate(foundry_samples_written_total[5m]) * 60",
+          "legendFormat": "samples/min"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "LLM Cost (USD/hour)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "increase(foundry_llm_cost_usd_total[1h])",
+          "legendFormat": "cost USD/h"
+        },
+        {
+          "expr": "increase(foundry_llm_cost_usd_total{model_tier='local'}[1h])",
+          "legendFormat": "local tier"
+        },
+        {
+          "expr": "increase(foundry_llm_cost_usd_total{model_tier='quality'}[1h])",
+          "legendFormat": "quality tier"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Judge Quality Score Distribution",
+      "type": "histogram",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, foundry_judge_quality_score_bucket)",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.90, foundry_judge_quality_score_bucket)",
+          "legendFormat": "p90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, foundry_judge_quality_score_bucket)",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Active Pipeline Runs",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "foundry_pipeline_runs_active",
+          "legendFormat": "active runs"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Hallucination Detection Rate",
+      "type": "gauge",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(foundry_hallucinations_detected_total[1h]) / rate(foundry_samples_judged_total[1h])",
+          "legendFormat": "hallucination rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "yellow", "value": 0.05},
+              {"color": "red", "value": 0.10}
+            ]
+          },
+          "unit": "percentunit"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "LLM API Latency (p95)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(foundry_llm_request_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95 latency"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Scout Topics Discovered (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+      "targets": [
+        {
+          "expr": "increase(foundry_scout_topics_discovered_total[24h])",
+          "legendFormat": "topics/24h"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Budget Utilization",
+      "type": "gauge",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
+      "targets": [
+        {
+          "expr": "foundry_cost_budget_utilization",
+          "legendFormat": "budget used"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "yellow", "value": 0.7},
+              {"color": "red", "value": 0.9}
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "workflow_id",
+        "type": "query",
+        "query": "label_values(foundry_pipeline_runs_active, workflow_id)",
+        "refresh": 2
+      }
+    ]
+  }
+}

@@ -1,0 +1,245 @@
+# Synthetic Data Foundry — Helm values
+# Override with: helm upgrade foundry ./helm/foundry -f my-values.yaml
+
+replicaCount:
+  api: 2
+  worker: 4
+
+image:
+  registry: ghcr.io
+  repository: your-org/synthetic-data-foundry
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ---------------------------------------------------------------------------
+# API service
+# ---------------------------------------------------------------------------
+api:
+  enabled: true
+  port: 8080
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  env:
+    LOG_LEVEL: "INFO"
+    LOG_FORMAT: "json"
+    ENVIRONMENT: "production"
+  livenessProbe:
+    httpGet:
+      path: /health/live
+      port: 8080
+    initialDelaySeconds: 15
+    periodSeconds: 10
+  readinessProbe:
+    httpGet:
+      path: /health/ready
+      port: 8080
+    initialDelaySeconds: 20
+    periodSeconds: 10
+
+# ---------------------------------------------------------------------------
+# Worker (Temporal activities executor)
+# ---------------------------------------------------------------------------
+worker:
+  enabled: true
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "1Gi"
+    limits:
+      cpu: "4000m"
+      memory: "4Gi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 16
+    targetCPUUtilizationPercentage: 60
+  env:
+    MAX_CONCURRENT_ACTIVITIES: "8"
+    TEMPORAL_TASK_QUEUE: "foundry-tasks"
+
+# ---------------------------------------------------------------------------
+# Frontend (Next.js)
+# ---------------------------------------------------------------------------
+frontend:
+  enabled: true
+  port: 3000
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# Ollama (local LLM)
+# ---------------------------------------------------------------------------
+ollama:
+  enabled: true
+  port: 11434
+  model: "qwen2.5:14b"
+  embedModel: "nomic-embed-text"
+  resources:
+    requests:
+      memory: "8Gi"
+    limits:
+      memory: "12Gi"
+  nodeSelector:
+    accelerator: nvidia-gpu
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+# ---------------------------------------------------------------------------
+# LiteLLM Proxy
+# ---------------------------------------------------------------------------
+litellm:
+  enabled: true
+  port: 4000
+  configFile: "/app/config/litellm_config.yaml"
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# NATS JetStream
+# ---------------------------------------------------------------------------
+nats:
+  enabled: true
+  port: 4222
+  jetstream:
+    enabled: true
+    maxMemory: "1Gi"
+    maxFile: "10Gi"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+# ---------------------------------------------------------------------------
+# Qdrant vector database
+# ---------------------------------------------------------------------------
+qdrant:
+  enabled: true
+  port: 6333
+  collectionName: "foundry_knowledge"
+  persistence:
+    enabled: true
+    size: "20Gi"
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+
+# ---------------------------------------------------------------------------
+# PostgreSQL (Bitnami chart)
+# ---------------------------------------------------------------------------
+postgresql:
+  enabled: true
+  auth:
+    username: foundry
+    database: foundry
+    existingSecret: foundry-db-secret
+  primary:
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2000m"
+        memory: "2Gi"
+    persistence:
+      enabled: true
+      size: "50Gi"
+
+# ---------------------------------------------------------------------------
+# Redis (Bitnami chart)
+# ---------------------------------------------------------------------------
+redis:
+  enabled: true
+  auth:
+    enabled: false
+  master:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    persistence:
+      enabled: true
+      size: "5Gi"
+
+# ---------------------------------------------------------------------------
+# Secrets (reference to Kubernetes Secrets)
+# ---------------------------------------------------------------------------
+secrets:
+  existingSecret: "foundry-secrets"
+  keys:
+    openaiApiKey: OPENAI_API_KEY
+    anthropicApiKey: ANTHROPIC_API_KEY
+    adminApiKey: ADMIN_API_KEY
+    watermarkSecret: FOUNDRY_WATERMARK_SECRET
+    databaseUrl: DATABASE_URL
+
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: foundry.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: api
+        - path: /
+          pathType: Prefix
+          service: frontend
+  tls:
+    - secretName: foundry-tls
+      hosts:
+        - foundry.example.com
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+monitoring:
+  prometheus:
+    enabled: true
+    scrapeInterval: "30s"
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+  loki:
+    enabled: true
+  tempo:
+    enabled: true
+    otlpEndpoint: "http://tempo:4317"

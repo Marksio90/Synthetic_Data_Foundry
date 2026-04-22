@@ -213,16 +213,19 @@ def _retry_api(func):
 
 
 # ---------------------------------------------------------------------------
-# Moduł Embeddings
+# Moduł Embeddings (single + batch)
 # ---------------------------------------------------------------------------
+_EMBED_BATCH_LIMIT = 2048  # OpenAI max inputs per request
+
+
 @_retry_api
 def _embed_query(query: str) -> Tuple[List[float], float]:
     """
-    Generuje wektor dla pytania.
+    Generuje wektor dla jednego pytania.
     Zwraca: (Wektor, Koszt_USD_cents)
     """
     cost_cents = 0.0
-    
+
     if settings.use_local_embeddings and _OLLAMA_CLIENT and settings.ollama_embed_model:
         try:
             resp = _OLLAMA_CLIENT.embeddings.create(
@@ -233,20 +236,62 @@ def _embed_query(query: str) -> Tuple[List[float], float]:
         except Exception as e:
             logger.warning(f"Ollama embed niedostępny ({e}), używam chmury OpenAI.")
 
-    # Fallback / Default: OpenAI
     model = getattr(settings, "openai_embedding_model", "text-embedding-3-small")
     resp = _OPENAI_CLIENT.embeddings.create(
         model=model,
         input=[query],
         dimensions=settings.openai_embedding_dims,
     )
-    
+
     usage = resp.usage
     if usage and model in _COSTS_PER_1M:
         cost_in = _COSTS_PER_1M[model][0]
         cost_cents = (usage.prompt_tokens / 1_000_000) * cost_in * 100
-        
+
     return resp.data[0].embedding, cost_cents
+
+
+@_retry_api
+def embed_batch(texts: List[str]) -> Tuple[List[List[float]], float]:
+    """
+    Batch embedding — up to 2048 texts in a single API call.
+    Returns (list_of_vectors, total_cost_cents).
+    """
+    if not texts:
+        return [], 0.0
+
+    total_cost = 0.0
+    all_embeddings: List[List[float]] = []
+
+    # Local Ollama path — no batching limit, but no cost either
+    if settings.use_local_embeddings and _OLLAMA_CLIENT and settings.ollama_embed_model:
+        try:
+            resp = _OLLAMA_CLIENT.embeddings.create(
+                model=settings.ollama_embed_model,
+                input=texts,
+            )
+            return [item.embedding for item in resp.data], 0.0
+        except Exception as exc:
+            logger.warning("Ollama batch embed failed (%s), falling back to OpenAI.", exc)
+
+    model = getattr(settings, "openai_embedding_model", "text-embedding-3-small")
+    cost_in = _COSTS_PER_1M.get(model, (0.02, 0.0))[0]
+
+    for i in range(0, len(texts), _EMBED_BATCH_LIMIT):
+        chunk = texts[i : i + _EMBED_BATCH_LIMIT]
+        resp = _OPENAI_CLIENT.embeddings.create(
+            model=model,
+            input=chunk,
+            dimensions=settings.openai_embedding_dims,
+        )
+        # Sort by index to maintain order (OpenAI docs: order not guaranteed)
+        sorted_data = sorted(resp.data, key=lambda x: x.index)
+        all_embeddings.extend(item.embedding for item in sorted_data)
+
+        if resp.usage:
+            total_cost += (resp.usage.prompt_tokens / 1_000_000) * cost_in * 100
+
+    return all_embeddings, total_cost
 
 
 # ---------------------------------------------------------------------------

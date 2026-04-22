@@ -26,11 +26,29 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from config.settings import settings
 from db import repository as repo
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Shared retry policy for all external cloud calls (LlamaParse, Replicate, OpenAI)
+# ---------------------------------------------------------------------------
+_retry_external = retry(
+    reraise=True,
+    retry=retry_if_exception_type((Exception,)),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(3),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 
 # Obsługiwane rozszerzenia
 _AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm"}
@@ -51,6 +69,7 @@ _YEAR_RE = re.compile(r"\b(20\d{2})\b")
 # Parsery — PDF
 # ---------------------------------------------------------------------------
 
+@_retry_external
 def _parse_with_llamaparse(pdf_path: Path) -> str:
     from llama_parse import LlamaParse  # type: ignore
 
@@ -98,6 +117,7 @@ def _parse_with_pymupdf(pdf_path: Path) -> str:
     return "\n\n".join(pages_md)
 
 
+@_retry_external
 def _parse_with_openai_vision(pdf_path: Path) -> str:
     import base64
     import io
@@ -236,6 +256,7 @@ def _parse_plain_text(path: Path) -> str:
 # Parsery — Audio via Replicate Whisper large-v3
 # ---------------------------------------------------------------------------
 
+@_retry_external
 def _parse_with_whisper(audio_path: Path) -> str:
     """
     Transkrypcja audio → Markdown za pomocą Replicate Whisper large-v3.

@@ -19,7 +19,8 @@ Start locally:
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from api.bootstrap import (
     BackgroundTaskManager,
@@ -39,6 +40,21 @@ logger = setup_logging()
 task_manager = BackgroundTaskManager(logger)
 scheduler = create_scheduler(logger)
 
+# ---------------------------------------------------------------------------
+# Rate limiter (slowapi — Redis-backed in production, in-memory fallback)
+# ---------------------------------------------------------------------------
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler  # type: ignore
+    from slowapi.errors import RateLimitExceeded  # type: ignore
+    from slowapi.util import get_remote_address  # type: ignore
+
+    limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
+    _SLOWAPI_AVAILABLE = True
+except ImportError:
+    limiter = None  # type: ignore[assignment]
+    _SLOWAPI_AVAILABLE = False
+    logger.warning("slowapi not installed — rate limiting disabled. Run: pip install slowapi")
+
 
 # ---------------------------------------------------------------------------
 # Inicjalizacja Aplikacji FastAPI (Core App)
@@ -54,6 +70,10 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+if _SLOWAPI_AVAILABLE and limiter is not None:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 configure_middlewares(app, logger)
 register_exception_handlers(app, logger)

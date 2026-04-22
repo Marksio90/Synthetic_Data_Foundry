@@ -75,3 +75,30 @@ openpyxl>=3.1.0              # XLSX extraction → JSON schema for scout ingesti
 python-pptx>=0.6.23          # PPTX extraction → slide text + speaker notes
 langdetect>=1.0.9            # Language detection ensemble (Step 4 multilingual)
 simhash>=2.1.2               # SimHash fingerprinting for content deduplication
+
+# ── Phase 1: Distributed infrastructure ──────────────────────────────────────
+temporalio>=1.6.0            # Durable workflow orchestration
+nats-py>=2.6.0               # NATS JetStream message bus
+litellm>=1.40.0              # Unified LLM gateway (proxy client)
+
+# ── Phase 1: Observability ────────────────────────────────────────────────────
+structlog>=24.2.0            # Structured JSON logging
+opentelemetry-sdk>=1.25.0
+opentelemetry-exporter-otlp>=1.25.0
+opentelemetry-instrumentation-fastapi>=0.46b0
+opentelemetry-instrumentation-sqlalchemy>=0.46b0
+opentelemetry-instrumentation-httpx>=0.46b0
+
+# ── Phase 2: Vector memory + agents ──────────────────────────────────────────
+qdrant-client>=1.9.0         # Vector DB for long-term Memory Agent
+networkx>=3.3                # In-memory graph fallback for KnowledgeGraph
+
+# ── Phase 2: Rate limiting ────────────────────────────────────────────────────
+slowapi>=0.1.9               # FastAPI rate limiting
+
+# ── Phase 3: ML experiment tracking ──────────────────────────────────────────
+mlflow>=2.14.0               # Experiment tracking for SFT/DPO
+
+# ── Phase 4: Knowledge graph NER ──────────────────────────────────────────────
+spacy>=3.7.0                 # Named entity recognition
+neo4j>=5.21.0                # Neo4j graph database driver (optional)

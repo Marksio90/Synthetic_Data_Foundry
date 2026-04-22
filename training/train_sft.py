@@ -27,6 +27,8 @@ import logging
 import sys
 from pathlib import Path
 
+from training.mlflow_tracker import FoundryMLflowTracker
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ def train_sft(
     warmup_steps: int = 100,
     val_split: float = 0.10,
     run_name: str = "foundry-sft",
+    batch_id: str = "manual",
 ) -> str:
     """
     Fine-tune base_model on JSONL dataset using Unsloth LoRA.
@@ -192,13 +195,37 @@ def train_sft(
         packing=False,
     )
 
-    logger.info("Starting SFT training (epochs=%d, lr=%.2e, batch=%d)...", epochs, learning_rate, batch_size)
-    trainer.train()
+    tracker = FoundryMLflowTracker(experiment_name="foundry-sft")
+    lora_cfg = dict(rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+    train_cfg = dict(
+        epochs=epochs, learning_rate=learning_rate, batch_size=batch_size,
+        grad_accum=grad_accum, max_seq_length=max_seq_length, warmup_steps=warmup_steps,
+    )
 
-    # Save LoRA adapters
-    model.save_pretrained(str(out_path))
-    tokenizer.save_pretrained(str(out_path))
-    logger.info("SFT complete. LoRA adapters saved to: %s", out_path)
+    with tracker.start_run(run_name=run_name, batch_id=batch_id):
+        tracker.log_sft_config(base_model, lora_cfg, train_cfg)
+
+        logger.info("Starting SFT training (epochs=%d, lr=%.2e, batch=%d)...", epochs, learning_rate, batch_size)
+        trainer.train()
+
+        # Log per-step metrics from trainer history
+        for entry in (trainer.state.log_history or []):
+            step = int(entry.get("step", 0))
+            for key, val in entry.items():
+                if isinstance(val, (int, float)) and key not in ("step", "epoch", "total_flos"):
+                    tracker.log_metric(key, float(val), step=step)
+
+        # Save LoRA adapters
+        model.save_pretrained(str(out_path))
+        tokenizer.save_pretrained(str(out_path))
+        logger.info("SFT complete. LoRA adapters saved to: %s", out_path)
+
+        tracker.log_model_artifact(str(out_path))
+        tracker.register_model(
+            model_name="foundry-sft",
+            model_version_tags={"batch_id": batch_id, "base_model": base_model},
+        )
+
     return str(out_path)
 
 

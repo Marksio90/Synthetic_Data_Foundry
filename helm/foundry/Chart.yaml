@@ -1,0 +1,22 @@
+apiVersion: v2
+name: foundry
+description: Synthetic Data Foundry — production Kubernetes deployment
+type: application
+version: 2.0.0
+appVersion: "2.0.0"
+keywords:
+  - ai
+  - synthetic-data
+  - llm
+  - esg
+maintainers:
+  - name: Data Foundry Team
+dependencies:
+  - name: postgresql
+    version: "15.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: redis
+    version: "19.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
