@@ -467,6 +467,15 @@ class Settings(BaseSettings):
             return [p.strip() for p in s.split(",") if p.strip()]
         return [str(item).strip() for item in list(v)]  # type: ignore[arg-type]
 
+    @field_validator("service_role", mode="before")
+    @classmethod
+    def normalize_service_role(cls, v: object) -> str:
+        role = str(v or "all").strip().lower()
+        allowed = {"all", "api", "worker"}
+        if role not in allowed:
+            raise ValueError("service_role must be one of: all, api, worker")
+        return role
+
 
 # Singleton — import this everywhere
 settings = Settings()  # type: ignore[call-arg]
