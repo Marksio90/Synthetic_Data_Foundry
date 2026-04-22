@@ -165,18 +165,13 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
         logger.info("🚀 Inicjalizacja środowiska Synthetic Data Foundry...")
         leader_lock = LeaderLock(logger)
         leader_ready = leader_lock.acquire()
-        role = (getattr(settings, "service_role", "all") or "all").strip().lower()
-        run_executor = role in ("all", "worker")
 
-        if run_executor:
-            try:
-                from api.routers.pipeline import startup_executor
-                await startup_executor()
-                logger.info("Pipeline queue executor uruchomiony.")
-            except Exception as exc:
-                logger.warning("Nie udało się uruchomić pipeline queue executor: %s", exc)
-        else:
-            logger.info("Pipeline queue executor pominięty (SERVICE_ROLE=%s).", role)
+        try:
+            from api.routers.pipeline import startup_executor
+            await startup_executor()
+            logger.info("Pipeline queue executor uruchomiony.")
+        except Exception as exc:
+            logger.warning("Nie udało się uruchomić pipeline queue executor: %s", exc)
 
         if scheduler is not None and leader_ready:
             async def _scheduled_job() -> None:
@@ -235,13 +230,12 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
         from agents.topic_scout import _HTTP as _scout_http
         await _scout_http.aclose()
 
-        if run_executor:
-            try:
-                from api.routers.pipeline import shutdown_executor
-                await shutdown_executor()
-                logger.info("Pipeline queue executor zatrzymany.")
-            except Exception as exc:
-                logger.warning("Nie udało się bezpiecznie zatrzymać pipeline queue executor: %s", exc)
+        try:
+            from api.routers.pipeline import shutdown_executor
+            await shutdown_executor()
+            logger.info("Pipeline queue executor zatrzymany.")
+        except Exception as exc:
+            logger.warning("Nie udało się bezpiecznie zatrzymać pipeline queue executor: %s", exc)
 
         leader_lock.close()
         logger.info("Środowisko bezpiecznie wyłączone.")
