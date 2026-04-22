@@ -381,6 +381,14 @@ class Settings(BaseSettings):
         le=10000,
         description="Maximum number of queued pipeline jobs waiting for execution.",
     )
+    pipeline_queue_backend: str = Field(
+        "memory",
+        description="Queue backend for pipeline executor: 'memory' or 'redis'.",
+    )
+    redis_url: str = Field(
+        "redis://localhost:6379/0",
+        description="Redis connection URL used when PIPELINE_QUEUE_BACKEND=redis.",
+    )
     scheduler_leader_lock_id: int = Field(
         61029001,
         description=(

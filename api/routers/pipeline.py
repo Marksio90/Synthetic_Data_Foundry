@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
+import logging
 import os
 import sys
 import uuid
@@ -53,6 +55,7 @@ from config.settings import settings
 from db.models import DirectiveChunk, SourceDocument
 
 router = APIRouter()
+logger = logging.getLogger("foundry.api.pipeline")
 
 DATA_DIR = Path(settings.data_dir)
 _PYTHON = sys.executable  # same interpreter as the API
@@ -63,6 +66,9 @@ _QUEUE: asyncio.Queue["PipelineJob"] = asyncio.Queue(maxsize=settings.pipeline_q
 _QUEUED_RUN_IDS: set[str] = set()
 _CANCELLED_QUEUED_RUN_IDS: set[str] = set()
 _EXECUTOR_STARTED = False
+_REDIS_CLIENT = None
+_REDIS_QUEUE_KEY = "foundry:pipeline:jobs"
+_REDIS_CANCELLED_KEY = "foundry:pipeline:cancelled"
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
 
 
@@ -77,6 +83,96 @@ class PipelineJob:
     cmd: list[str]
     env: dict[str, str]
     cwd: str
+
+
+def _queue_backend() -> str:
+    return (settings.pipeline_queue_backend or "memory").strip().lower()
+
+
+async def _ensure_redis_client():
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    if _queue_backend() != "redis":
+        return None
+    try:
+        from redis.asyncio import Redis  # type: ignore
+    except Exception:
+        logger.warning("Redis backend requested but 'redis' package is unavailable. Falling back to memory queue.")
+        return None
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        await client.ping()
+        _REDIS_CLIENT = client
+        logger.info("Pipeline queue backend: redis (%s).", settings.redis_url)
+    except Exception as exc:
+        logger.warning("Redis queue unavailable (%s). Falling back to memory queue.", exc)
+        _REDIS_CLIENT = None
+    return _REDIS_CLIENT
+
+
+def _job_to_json(job: PipelineJob) -> str:
+    return json.dumps({"run_id": job.run_id, "cmd": job.cmd, "env": job.env, "cwd": job.cwd}, ensure_ascii=False)
+
+
+def _job_from_json(raw: str) -> PipelineJob:
+    data = json.loads(raw)
+    return PipelineJob(run_id=data["run_id"], cmd=list(data["cmd"]), env=dict(data["env"]), cwd=data["cwd"])
+
+
+async def _queue_size() -> int:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        return int(await client.llen(_REDIS_QUEUE_KEY))
+    return _QUEUE.qsize()
+
+
+async def _enqueue_job(job: PipelineJob) -> None:
+    client = await _ensure_redis_client()
+    maxsize = int(settings.pipeline_queue_maxsize)
+    if client is not None and _queue_backend() == "redis":
+        size = int(await client.llen(_REDIS_QUEUE_KEY))
+        if size >= maxsize:
+            raise asyncio.QueueFull
+        await client.rpush(_REDIS_QUEUE_KEY, _job_to_json(job))
+        return
+    _QUEUE.put_nowait(job)
+
+
+async def _dequeue_job() -> PipelineJob:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        while True:
+            res = await client.blpop(_REDIS_QUEUE_KEY, timeout=2)
+            if res is None:
+                await asyncio.sleep(0.1)
+                continue
+            _, raw = res
+            return _job_from_json(raw)
+    return await _QUEUE.get()
+
+
+async def _mark_cancelled_queued(run_id: str) -> None:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        await client.sadd(_REDIS_CANCELLED_KEY, run_id)
+    _CANCELLED_QUEUED_RUN_IDS.add(run_id)
+    _QUEUED_RUN_IDS.discard(run_id)
+
+
+async def _is_cancelled_queued(run_id: str) -> bool:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        if await client.sismember(_REDIS_CANCELLED_KEY, run_id):
+            return True
+    return run_id in _CANCELLED_QUEUED_RUN_IDS
+
+
+async def _clear_cancelled_queued(run_id: str) -> None:
+    client = await _ensure_redis_client()
+    if client is not None and _queue_backend() == "redis":
+        await client.srem(_REDIS_CANCELLED_KEY, run_id)
+    _CANCELLED_QUEUED_RUN_IDS.discard(run_id)
 
 
 async def _ensure_executor_started() -> None:
@@ -96,18 +192,19 @@ async def _ensure_executor_started() -> None:
 async def _queue_worker(worker_idx: int) -> None:
     try:
         while True:
-            job = await _QUEUE.get()
+            job = await _dequeue_job()
             try:
                 _QUEUED_RUN_IDS.discard(job.run_id)
-                if job.run_id in _CANCELLED_QUEUED_RUN_IDS:
-                    _CANCELLED_QUEUED_RUN_IDS.discard(job.run_id)
+                if await _is_cancelled_queued(job.run_id):
+                    await _clear_cancelled_queued(job.run_id)
                     runs.append_log(job.run_id, "[Queue] Zadanie usunięte z kolejki (anulowane przed startem).")
                     continue
 
                 runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie...")
                 await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
             finally:
-                _QUEUE.task_done()
+                if _queue_backend() == "memory":
+                    _QUEUE.task_done()
     except asyncio.CancelledError:
         return
 
@@ -123,15 +220,20 @@ async def shutdown_executor(timeout_seconds: float = 10.0) -> None:
     _EXECUTOR_STARTED = False
     if not _EXECUTOR_WORKERS:
         return
-    try:
-        await asyncio.wait_for(_QUEUE.join(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        # Continue with cancellation even if queue isn't drained.
-        pass
+    if _queue_backend() == "memory":
+        try:
+            await asyncio.wait_for(_QUEUE.join(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            # Continue with cancellation even if queue isn't drained.
+            pass
     for task in _EXECUTOR_WORKERS:
         task.cancel()
     await asyncio.gather(*_EXECUTOR_WORKERS, return_exceptions=True)
     _EXECUTOR_WORKERS.clear()
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        await _REDIS_CLIENT.aclose()
+        _REDIS_CLIENT = None
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +459,7 @@ async def run_pipeline(
 
     await _ensure_executor_started()
     try:
-        _QUEUE.put_nowait(
+        await _enqueue_job(
             PipelineJob(
                 run_id=run_id,
                 cmd=cmd,
@@ -366,7 +468,7 @@ async def run_pipeline(
             )
         )
         _QUEUED_RUN_IDS.add(run_id)
-        runs.append_log(run_id, f"[Queue] Pozycja w kolejce: {_QUEUE.qsize()}.")
+        runs.append_log(run_id, f"[Queue] Pozycja w kolejce: {await _queue_size()}.")
     except asyncio.QueueFull as exc:
         runs.update(run_id, status="error", error="Pipeline queue is full.")
         runs.append_log(run_id, "[Queue] ❌ Kolejka pipeline jest pełna.")
@@ -386,10 +488,12 @@ async def run_pipeline(
 
 
 @router.get("/queue", dependencies=[Depends(require_admin_api_key)])
-def queue_stats() -> dict[str, int]:
+async def queue_stats() -> dict[str, int | str]:
     """Queue visibility endpoint for operators."""
+    queued = await _queue_size()
     return {
-        "queued_jobs": _QUEUE.qsize(),
+        "backend": _queue_backend(),
+        "queued_jobs": queued,
         "queued_run_ids": len(_QUEUED_RUN_IDS),
         "cancelled_queued_runs": len(_CANCELLED_QUEUED_RUN_IDS),
         "active_workers": len(_EXECUTOR_WORKERS),
@@ -440,8 +544,7 @@ async def cancel_run(run_id: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
     if run_id in _QUEUED_RUN_IDS or rec.status == "queued":
-        _CANCELLED_QUEUED_RUN_IDS.add(run_id)
-        _QUEUED_RUN_IDS.discard(run_id)
+        await _mark_cancelled_queued(run_id)
         runs.update(
             run_id,
             status="cancelled",
