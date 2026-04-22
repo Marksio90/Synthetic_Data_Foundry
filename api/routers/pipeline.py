@@ -62,6 +62,7 @@ _EXECUTOR_WORKERS: list[asyncio.Task] = []
 _QUEUE: asyncio.Queue["PipelineJob"] = asyncio.Queue(maxsize=settings.pipeline_queue_maxsize)
 _QUEUED_RUN_IDS: set[str] = set()
 _CANCELLED_QUEUED_RUN_IDS: set[str] = set()
+_EXECUTOR_STARTED = False
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
 
 
@@ -79,31 +80,58 @@ class PipelineJob:
 
 
 async def _ensure_executor_started() -> None:
-    if _EXECUTOR_WORKERS:
+    global _EXECUTOR_STARTED
+    if _EXECUTOR_WORKERS and _EXECUTOR_STARTED:
         return
     async with _EXECUTOR_LOCK:
-        if _EXECUTOR_WORKERS:
+        if _EXECUTOR_WORKERS and _EXECUTOR_STARTED:
             return
         worker_count = max(1, int(settings.pipeline_worker_concurrency))
+        _EXECUTOR_STARTED = True
         for i in range(worker_count):
             task = asyncio.create_task(_queue_worker(i), name=f"pipeline_queue_worker_{i}")
             _EXECUTOR_WORKERS.append(task)
 
 
 async def _queue_worker(worker_idx: int) -> None:
-    while True:
-        job = await _QUEUE.get()
-        try:
-            _QUEUED_RUN_IDS.discard(job.run_id)
-            if job.run_id in _CANCELLED_QUEUED_RUN_IDS:
-                _CANCELLED_QUEUED_RUN_IDS.discard(job.run_id)
-                runs.append_log(job.run_id, "[Queue] Zadanie usunięte z kolejki (anulowane przed startem).")
-                continue
+    try:
+        while True:
+            job = await _QUEUE.get()
+            try:
+                _QUEUED_RUN_IDS.discard(job.run_id)
+                if job.run_id in _CANCELLED_QUEUED_RUN_IDS:
+                    _CANCELLED_QUEUED_RUN_IDS.discard(job.run_id)
+                    runs.append_log(job.run_id, "[Queue] Zadanie usunięte z kolejki (anulowane przed startem).")
+                    continue
 
-            runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie...")
-            await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
-        finally:
-            _QUEUE.task_done()
+                runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie...")
+                await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
+            finally:
+                _QUEUE.task_done()
+    except asyncio.CancelledError:
+        return
+
+
+async def startup_executor() -> None:
+    """Start pipeline queue workers at app startup."""
+    await _ensure_executor_started()
+
+
+async def shutdown_executor(timeout_seconds: float = 10.0) -> None:
+    """Stop queue workers gracefully during app shutdown."""
+    global _EXECUTOR_STARTED
+    _EXECUTOR_STARTED = False
+    if not _EXECUTOR_WORKERS:
+        return
+    try:
+        await asyncio.wait_for(_QUEUE.join(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        # Continue with cancellation even if queue isn't drained.
+        pass
+    for task in _EXECUTOR_WORKERS:
+        task.cancel()
+    await asyncio.gather(*_EXECUTOR_WORKERS, return_exceptions=True)
+    _EXECUTOR_WORKERS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +383,18 @@ async def run_pipeline(
         message=f"Pipeline queued. Domain: {analysis.domain_label}. "
                 f"Threshold (auto): {quality_threshold}",
     )
+
+
+@router.get("/queue", dependencies=[Depends(require_admin_api_key)])
+def queue_stats() -> dict[str, int]:
+    """Queue visibility endpoint for operators."""
+    return {
+        "queued_jobs": _QUEUE.qsize(),
+        "queued_run_ids": len(_QUEUED_RUN_IDS),
+        "cancelled_queued_runs": len(_CANCELLED_QUEUED_RUN_IDS),
+        "active_workers": len(_EXECUTOR_WORKERS),
+        "running_processes": len(_RUN_PROCS),
+    }
 
 
 async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd: str) -> None:

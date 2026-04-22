@@ -166,6 +166,13 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
         leader_lock = LeaderLock(logger)
         leader_ready = leader_lock.acquire()
 
+        try:
+            from api.routers.pipeline import startup_executor
+            await startup_executor()
+            logger.info("Pipeline queue executor uruchomiony.")
+        except Exception as exc:
+            logger.warning("Nie udało się uruchomić pipeline queue executor: %s", exc)
+
         if scheduler is not None and leader_ready:
             async def _scheduled_job() -> None:
                 await run_scheduled_scout(logger)
@@ -222,6 +229,13 @@ def create_lifespan(logger: logging.Logger, task_manager: BackgroundTaskManager,
 
         from agents.topic_scout import _HTTP as _scout_http
         await _scout_http.aclose()
+
+        try:
+            from api.routers.pipeline import shutdown_executor
+            await shutdown_executor()
+            logger.info("Pipeline queue executor zatrzymany.")
+        except Exception as exc:
+            logger.warning("Nie udało się bezpiecznie zatrzymać pipeline queue executor: %s", exc)
 
         leader_lock.close()
         logger.info("Środowisko bezpiecznie wyłączone.")
