@@ -92,15 +92,12 @@ def _get_calibration_chunks(session: Session, filenames: list[str]) -> list:
             .limit(settings.calibration_samples)
         ).all()
     except SQLAlchemyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error_code": "pipeline_db_query_failed",
-                "message": (
-                    "Pipeline database query failed. "
-                    "Verify DATABASE_URL connectivity and PostgreSQL schema initialization."
-                ),
-                "hint": "Run DB bootstrap/migrations (e.g. init/01_schema.sql) and retry.",
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_query_failed",
+            message="Pipeline database query failed.",
+            details={
+                "hint": "Verify DATABASE_URL connectivity and PostgreSQL schema initialization. "
+                        "Run DB bootstrap/migrations (e.g. init/01_schema.sql) and retry.",
             },
         ) from exc
     return list(chunks)
@@ -109,52 +106,42 @@ def _get_calibration_chunks(session: Session, filenames: list[str]) -> list:
 def _ensure_pipeline_db_ready(session: Session) -> None:
     """
     Preflight: verify DB connectivity + required pipeline tables exist.
-    Raises HTTP 503 with actionable details instead of surfacing raw SQL errors.
+    Raises typed API errors (503/424) with actionable details.
     """
     try:
         session.execute(text("SELECT 1"))
     except SQLAlchemyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error_code": "pipeline_db_unavailable",
-                "message": "Pipeline database is unavailable.",
-                "hint": "Check DATABASE_URL, network reachability, and DB credentials.",
-            },
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_unavailable",
+            message="Pipeline database is unavailable.",
+            details={"hint": "Check DATABASE_URL, network reachability, and DB credentials."},
         ) from exc
 
     bind = session.get_bind()
     if bind is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error_code": "pipeline_db_unavailable",
-                "message": "Pipeline database bind is unavailable.",
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_unavailable",
+            message="Pipeline database bind is unavailable.",
+            details={
                 "hint": "Verify SQLAlchemy session/engine initialization.",
             },
         )
 
     try:
         db_inspector = inspect(bind)
-    try:
-        db_inspector = inspect(session.bind)
         missing_tables = [t for t in _REQUIRED_TABLES if not db_inspector.has_table(t)]
     except SQLAlchemyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error_code": "pipeline_db_inspection_failed",
-                "message": "Unable to inspect pipeline database schema.",
-                "hint": "Verify DB permissions and schema availability.",
-            },
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_inspection_failed",
+            message="Unable to inspect pipeline database schema.",
+            details={"hint": "Verify DB permissions and schema availability."},
         ) from exc
 
     if missing_tables:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error_code": "pipeline_schema_missing",
-                "message": "Pipeline schema is not initialized.",
+        raise FailedDependencyError(
+            error_code="pipeline_schema_missing",
+            message="Pipeline schema is not initialized.",
+            details={
                 "missing_tables": missing_tables,
                 "hint": "Apply SQL bootstrap/migrations (init/01_schema.sql) and retry.",
             },
