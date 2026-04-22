@@ -34,6 +34,8 @@ router = APIRouter(dependencies=[Depends(require_admin_api_key)])
 
 OUTPUT_DIR = Path(settings.output_file).parent
 _PYTHON = sys.executable
+_TRAIN_TASKS: dict[str, asyncio.Task] = {}
+_TRAIN_PROCS: dict[str, asyncio.subprocess.Process] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +193,14 @@ async def start_training(req: TrainingRunRequest) -> dict:
         runs.append_log(run_id, f"[AutoTuner] {r}")
     runs.append_log(run_id, "[Training] Uruchamiam SFT training...")
 
-    asyncio.create_task(
+    _TRAIN_TASKS[run_id] = asyncio.create_task(
         _run_training_pipeline(
             run_id=run_id,
             sft_cmd=sft_cmd,
             dpo_cmd=dpo_cmd if not req.skip_dpo else None,
             env=env,
-        )
+        ),
+        name=f"training-{run_id}",
     )
 
     return {
@@ -229,10 +232,12 @@ async def _run_training_pipeline(
             env=env,
             cwd=str(Path(__file__).parent.parent.parent),
         )
+        _TRAIN_PROCS[run_id] = proc
         assert proc.stdout is not None
         async for raw in proc.stdout:
             runs.append_log(run_id, raw.decode("utf-8", errors="replace").rstrip())
         await proc.wait()
+        _TRAIN_PROCS.pop(run_id, None)
         if proc.returncode != 0:
             runs.append_log(run_id, f"[{label}] ❌ Exit code {proc.returncode}")
             return False
@@ -250,6 +255,40 @@ async def _run_training_pipeline(
     except Exception as exc:
         runs.update(run_id, status="error", error=str(exc))
         runs.append_log(run_id, f"[Training] ❌ Wyjątek: {exc}")
+    finally:
+        _TRAIN_PROCS.pop(run_id, None)
+        _TRAIN_TASKS.pop(run_id, None)
+
+
+@router.post("/cancel/{run_id}")
+async def cancel_training(run_id: str) -> dict[str, str]:
+    """Cancel an active training subprocess."""
+    rec = runs.get(run_id)
+    if rec is None or not run_id.startswith("train-"):
+        raise HTTPException(status_code=404, detail=f"Training run not found: {run_id}")
+    if rec.status not in ("starting", "running"):
+        raise HTTPException(status_code=409, detail=f"Training run is not cancellable: {run_id}")
+
+    proc = _TRAIN_PROCS.get(run_id)
+    if proc is None:
+        raise HTTPException(status_code=409, detail=f"No active training process for run: {run_id}")
+
+    runs.append_log(run_id, "[Training] ⏹️ Cancellation requested by user.")
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+    runs.update(run_id, status="cancelled", error="Cancelled by user")
+    runs.append_log(run_id, "[Training] ⏹️ Training run cancelled.")
+    _TRAIN_PROCS.pop(run_id, None)
+
+    task = _TRAIN_TASKS.get(run_id)
+    if task and not task.done():
+        task.cancel()
+    return {"run_id": run_id, "status": "cancelled"}
 
 
 # ---------------------------------------------------------------------------
