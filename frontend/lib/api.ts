@@ -195,9 +195,6 @@ export interface ScoutTopic {
   quality_score?: number;
   quality_gate_passed?: boolean;
   quality_gate_reasons?: string[];
-  expected_capabilities?: string[];
-  coverage_scope?: 'narrow' | 'medium' | 'broad' | string;
-  quality_notes?: string[];
 }
 
 export interface ScoutRun {

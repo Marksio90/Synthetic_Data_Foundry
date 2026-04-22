@@ -28,7 +28,7 @@ CTL   := ./scripts/foundry-ctl.sh
 
 .PHONY: help setup up down full-run generate gate train export chatbot \
         logs logs-api logs-ui logs-frontend logs-trainer status clean rebuild \
-        check-merge-conflicts check-scout-contract
+        check-merge-conflicts
 
 # ---------------------------------------------------------------------------
 # Pomoc
@@ -63,7 +63,6 @@ help:
 	@echo ""
 	@echo "  WERYFIKACJA"
 	@echo "    make check-merge-conflicts  Sprawdź czy repo nie zawiera markerów konfliktów Git"
-	@echo "    make check-scout-contract   Sprawdź spójność kontraktu Scout (backend/frontend)"
 	@echo ""
 	@echo "  Zmienne (opcjonalne):"
 	@echo "    MODEL_NAME=my-model make export"
@@ -150,6 +149,3 @@ check-merge-conflicts:
 	else \
 		echo "✅ Brak markerów konfliktów."; \
 	fi
-
-check-scout-contract:
-	@python scripts/check_scout_contract.py

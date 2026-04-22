@@ -186,9 +186,6 @@ class ScoutTopicData:
     quality_score: float = 0.0                # evidence quality for dataset usefulness [0..1]
     quality_gate_passed: bool = False         # hard gate per category
     quality_gate_reasons: list[str] = field(default_factory=list)
-    expected_capabilities: list[str] = field(default_factory=list)  # what model should reliably know
-    coverage_scope: str = "narrow"            # narrow | medium | broad
-    quality_notes: list[str] = field(default_factory=list)          # operator-facing quality notes
 
 
 # ---------------------------------------------------------------------------
@@ -818,38 +815,6 @@ _RESEARCH_SOURCES = frozenset({
     "europepmc", "philpapers", "acm", "base", "chemrxiv", "engrxiv",
 })
 
-_CATEGORY_CAPABILITIES: dict[str, list[str]] = {
-    "legal_regulatory": [
-        "interpretacja obowiązków regulacyjnych i wyjątków",
-        "wyjaśnianie terminów compliance i terminów wdrożeń",
-        "mapowanie wymogów na procesy operacyjne",
-    ],
-    "climate_finance": [
-        "interpretacja wskaźników ujawnień ESG/klimatycznych",
-        "łączenie wymogów raportowych z metrykami finansowymi",
-        "wyjaśnianie kryteriów taksonomii i zgodności",
-    ],
-    "health_medtech": [
-        "porównanie wymogów bezpieczeństwa i dowodów klinicznych",
-        "wyjaśnianie ścieżek regulacyjnych urządzeń/terapii",
-        "identyfikacja luk dokumentacyjnych do audytu",
-    ],
-    "ai_data_governance": [
-        "analiza ryzyk danych/modelu i obowiązków transparentności",
-        "wyjaśnianie polityk prywatności i transferu danych",
-        "mapowanie kontroli governance do wymogów prawnych",
-    ],
-    "capital_markets": [
-        "interpretacja zasad rynku i nadzoru",
-        "wyjaśnianie wymogów raportowych instytucji finansowych",
-        "powiązanie ryzyk rynkowych z obowiązkami regulacyjnymi",
-    ],
-    "general": [
-        "syntetyzowanie kluczowych wymogów domenowych",
-        "odpowiedzi Q&A na bazie zweryfikowanych źródeł",
-    ],
-}
-
 
 def _infer_dataset_profile(domain: str) -> tuple[str, str]:
     d = domain.lower()
@@ -914,14 +879,6 @@ def _evaluate_quality_gate(
             reasons.append("min_1_high_tier_source")
 
     return len(reasons) == 0, reasons
-
-
-def _coverage_scope(source_count: int, source_type_diversity: float, high_tier_ratio: float) -> str:
-    if source_count >= 6 and source_type_diversity >= 0.60 and high_tier_ratio >= 0.50:
-        return "broad"
-    if source_count >= 4 and source_type_diversity >= 0.35:
-        return "medium"
-    return "narrow"
 
 
 # ---------------------------------------------------------------------------
@@ -1060,13 +1017,6 @@ async def _process_domain(
     quality_gate_passed, quality_gate_reasons = _evaluate_quality_gate(
         dataset_category, verified, quality_score,
     )
-    expected_capabilities = _CATEGORY_CAPABILITIES.get(dataset_category, _CATEGORY_CAPABILITIES["general"])
-    coverage_scope = _coverage_scope(len(verified), source_type_diversity, high_tier_ratio)
-    quality_notes = (
-        ["gate_passed", f"high_tier_ratio={high_tier_ratio:.2f}", f"source_type_diversity={source_type_diversity:.2f}"]
-        if quality_gate_passed
-        else [f"gate_failed:{r}" for r in quality_gate_reasons[:5]]
-    )
 
     await _log(
         f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
@@ -1105,9 +1055,6 @@ async def _process_domain(
         quality_score=round(quality_score, 3),
         quality_gate_passed=quality_gate_passed,
         quality_gate_reasons=quality_gate_reasons,
-        expected_capabilities=expected_capabilities,
-        coverage_scope=coverage_scope,
-        quality_notes=quality_notes,
     )
 
     if topic_callback:
@@ -1168,14 +1115,15 @@ async def run_scout(
     passed_count = sum(1 for t in results if t.quality_gate_passed)
     if results:
         await _log(f"Quality gate passed: {passed_count}/{len(results)} topics")
-        category_counts: dict[str, int] = {}
-        for t in results:
-            category_counts[t.dataset_category] = category_counts.get(t.dataset_category, 0) + 1
-        top_cats = ", ".join(f"{k}:{v}" for k, v in sorted(category_counts.items(), key=lambda kv: kv[1], reverse=True)[:5])
-        await _log(f"Category coverage: {top_cats}")
     # Prioritize topics with high practical usefulness for dataset generation.
     results.sort(
-        key=topic_priority_score,
+        key=lambda t: (
+            0.20 * (1.0 if t.quality_gate_passed else 0.0)
+            + 0.45 * t.quality_score
+            + 0.25 * t.uniqueness_score
+            + 0.20 * t.knowledge_gap_score
+            + 0.10 * t.demand_score
+        ),
         reverse=True,
     )
     await _log(f"Scout complete — {len(results)} topics discovered.")

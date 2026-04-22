@@ -169,9 +169,6 @@ class ScoutTopic:
     quality_score: float = 0.0
     quality_gate_passed: bool = False
     quality_gate_reasons: list[str] = field(default_factory=list)
-    expected_capabilities: list[str] = field(default_factory=list)
-    coverage_scope: str = "narrow"
-    quality_notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -202,9 +199,6 @@ class ScoutTopic:
             "quality_score": self.quality_score,
             "quality_gate_passed": self.quality_gate_passed,
             "quality_gate_reasons": self.quality_gate_reasons,
-            "expected_capabilities": self.expected_capabilities,
-            "coverage_scope": self.coverage_scope,
-            "quality_notes": self.quality_notes,
         }
 
 
@@ -312,9 +306,6 @@ class ScoutManager:
             quality_score=getattr(t, "quality_score", 0.0),
             quality_gate_passed=getattr(t, "quality_gate_passed", False),
             quality_gate_reasons=getattr(t, "quality_gate_reasons", []),
-            expected_capabilities=getattr(t, "expected_capabilities", []),
-            coverage_scope=getattr(t, "coverage_scope", "narrow"),
-            quality_notes=getattr(t, "quality_notes", []),
         )
 
     def add_single_topic(self, scout_id: str, topic_data: Any) -> None:
@@ -374,7 +365,13 @@ class ScoutManager:
     def latest_topics(self, limit: int = 50) -> list[ScoutTopic]:
         topics = sorted(
             self._topics.values(),
-            key=topic_priority_score,
+            key=lambda t: (
+                0.20 * (1.0 if t.quality_gate_passed else 0.0)
+                + 0.45 * t.quality_score
+                + 0.25 * t.uniqueness_score
+                + 0.20 * t.knowledge_gap_score
+                + 0.10 * t.demand_score
+            ),
             reverse=True,
         )
         return topics[:limit]
