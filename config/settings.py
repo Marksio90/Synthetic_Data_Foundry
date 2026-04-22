@@ -369,6 +369,18 @@ class Settings(BaseSettings):
         ge=10,
         description="Max number of scout runs retained in memory.",
     )
+    pipeline_worker_concurrency: int = Field(
+        1,
+        ge=1,
+        le=16,
+        description="Number of queue workers consuming pipeline execution jobs.",
+    )
+    pipeline_queue_maxsize: int = Field(
+        100,
+        ge=1,
+        le=10000,
+        description="Maximum number of queued pipeline jobs waiting for execution.",
+    )
     scheduler_leader_lock_id: int = Field(
         61029001,
         description=(

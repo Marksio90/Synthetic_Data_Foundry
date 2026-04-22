@@ -22,6 +22,7 @@ import datetime
 import os
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -55,9 +56,54 @@ router = APIRouter()
 
 DATA_DIR = Path(settings.data_dir)
 _PYTHON = sys.executable  # same interpreter as the API
-_RUN_TASKS: dict[str, asyncio.Task] = {}
 _RUN_PROCS: dict[str, asyncio.subprocess.Process] = {}
+_EXECUTOR_LOCK = asyncio.Lock()
+_EXECUTOR_WORKERS: list[asyncio.Task] = []
+_QUEUE: asyncio.Queue["PipelineJob"] = asyncio.Queue(maxsize=settings.pipeline_queue_maxsize)
+_QUEUED_RUN_IDS: set[str] = set()
+_CANCELLED_QUEUED_RUN_IDS: set[str] = set()
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
+
+
+# ---------------------------------------------------------------------------
+# Queue-native executor
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PipelineJob:
+    run_id: str
+    cmd: list[str]
+    env: dict[str, str]
+    cwd: str
+
+
+async def _ensure_executor_started() -> None:
+    if _EXECUTOR_WORKERS:
+        return
+    async with _EXECUTOR_LOCK:
+        if _EXECUTOR_WORKERS:
+            return
+        worker_count = max(1, int(settings.pipeline_worker_concurrency))
+        for i in range(worker_count):
+            task = asyncio.create_task(_queue_worker(i), name=f"pipeline_queue_worker_{i}")
+            _EXECUTOR_WORKERS.append(task)
+
+
+async def _queue_worker(worker_idx: int) -> None:
+    while True:
+        job = await _QUEUE.get()
+        try:
+            _QUEUED_RUN_IDS.discard(job.run_id)
+            if job.run_id in _CANCELLED_QUEUED_RUN_IDS:
+                _CANCELLED_QUEUED_RUN_IDS.discard(job.run_id)
+                runs.append_log(job.run_id, "[Queue] Zadanie usunięte z kolejki (anulowane przed startem).")
+                continue
+
+            runs.append_log(job.run_id, f"[Queue] Worker {worker_idx} uruchamia zadanie...")
+            await _run_subprocess(job.run_id, job.cmd, job.env, job.cwd)
+        finally:
+            _QUEUE.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -278,21 +324,40 @@ async def run_pipeline(
     runs.append_log(run_id, f"[AutoPilot] Perspektywy: {', '.join(analysis.perspectives)}")
     runs.append_log(run_id, f"[AutoPilot] quality_threshold={quality_threshold} "
                    f"max_turns={max_turns} adversarial={adversarial_ratio}")
-    runs.append_log(run_id, "[AutoPilot] Uruchamiam pipeline...")
+    runs.append_log(run_id, "[AutoPilot] Dodaję zadanie do kolejki wykonawczej...")
+    runs.update(run_id, status="queued")
 
-    # Launch background task
-    _RUN_TASKS[run_id] = asyncio.create_task(_run_subprocess(run_id, cmd, env))
+    await _ensure_executor_started()
+    try:
+        _QUEUE.put_nowait(
+            PipelineJob(
+                run_id=run_id,
+                cmd=cmd,
+                env=env,
+                cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
+            )
+        )
+        _QUEUED_RUN_IDS.add(run_id)
+        runs.append_log(run_id, f"[Queue] Pozycja w kolejce: {_QUEUE.qsize()}.")
+    except asyncio.QueueFull as exc:
+        runs.update(run_id, status="error", error="Pipeline queue is full.")
+        runs.append_log(run_id, "[Queue] ❌ Kolejka pipeline jest pełna.")
+        raise ServiceUnavailableError(
+            error_code="pipeline_queue_full",
+            message="Pipeline queue is full.",
+            details={"hint": "Retry later or increase PIPELINE_QUEUE_MAXSIZE / worker concurrency."},
+        ) from exc
 
     return PipelineRunResponse(
         run_id=run_id,
         batch_id=batch_id,
-        status="starting",
-        message=f"Pipeline started. Domain: {analysis.domain_label}. "
+        status="queued",
+        message=f"Pipeline queued. Domain: {analysis.domain_label}. "
                 f"Threshold (auto): {quality_threshold}",
     )
 
 
-async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
+async def _run_subprocess(run_id: str, cmd: list[str], env: dict[str, str], cwd: str) -> None:
     """Background task: run main.py, stream its output into the run log."""
     runs.update(run_id, status="running")
     try:
@@ -301,7 +366,7 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
-            cwd=str(Path(__file__).parent.parent.parent),  # /app/api/routers → /app
+            cwd=cwd,
         )
         _RUN_PROCS[run_id] = proc
         assert proc.stdout is not None
@@ -325,7 +390,6 @@ async def _run_subprocess(run_id: str, cmd: list[str], env: dict) -> None:
         runs.append_log(run_id, f"[AutoPilot] ❌ Wyjątek: {exc}")
     finally:
         _RUN_PROCS.pop(run_id, None)
-        _RUN_TASKS.pop(run_id, None)
 
 
 @router.post("/cancel/{run_id}", dependencies=[Depends(require_admin_api_key)])
@@ -334,6 +398,19 @@ async def cancel_run(run_id: str) -> dict[str, str]:
     rec = runs.get(run_id)
     if rec is None:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    if run_id in _QUEUED_RUN_IDS or rec.status == "queued":
+        _CANCELLED_QUEUED_RUN_IDS.add(run_id)
+        _QUEUED_RUN_IDS.discard(run_id)
+        runs.update(
+            run_id,
+            status="cancelled",
+            error="Cancelled by user before execution",
+            ended_at=datetime.datetime.now().timestamp(),
+        )
+        runs.append_log(run_id, "[AutoPilot] ⏹️ Zadanie anulowane w kolejce przed uruchomieniem.")
+        return {"run_id": run_id, "status": "cancelled"}
+
     proc = _RUN_PROCS.get(run_id)
     if proc is None or rec.status not in ("starting", "running"):
         raise HTTPException(status_code=409, detail=f"Run is not cancellable: {run_id}")
