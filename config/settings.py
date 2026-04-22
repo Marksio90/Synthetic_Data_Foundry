@@ -369,6 +369,13 @@ class Settings(BaseSettings):
         ge=10,
         description="Max number of scout runs retained in memory.",
     )
+    scheduler_leader_lock_id: int = Field(
+        61029001,
+        description=(
+            "PostgreSQL advisory lock id used for leader-only scheduler/websub tasks. "
+            "Only the process holding the lock runs singleton background jobs."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Batch ID (overridable from CLI; also readable from env)
