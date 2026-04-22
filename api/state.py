@@ -365,7 +365,8 @@ class ScoutManager:
         topics = sorted(
             self._topics.values(),
             key=lambda t: (
-                0.45 * t.quality_score
+                0.20 * (1.0 if t.quality_gate_passed else 0.0)
+                + 0.45 * t.quality_score
                 + 0.25 * t.uniqueness_score
                 + 0.20 * t.knowledge_gap_score
                 + 0.10 * t.demand_score
