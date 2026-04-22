@@ -32,9 +32,17 @@ def main() -> int:
     frontend = _extract_frontend_keys(Path("frontend/lib/api.ts"))
 
     missing_in_front = sorted(backend - frontend)
+    extra_in_front = sorted(frontend - backend)
     if missing_in_front:
         print("❌ ScoutTopic fields missing in frontend/lib/api.ts:")
         for k in missing_in_front:
+            print(f"  - {k}")
+        return 1
+
+    # Extras are allowed only for frontend-specific helper fields? For ScoutTopic we keep strict sync.
+    if extra_in_front:
+        print("❌ Extra ScoutTopic fields in frontend/lib/api.ts not present in backend:")
+        for k in extra_in_front:
             print(f"  - {k}")
         return 1
 
