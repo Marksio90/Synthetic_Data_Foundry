@@ -1,7 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+
+os.environ.setdefault("DATABASE_URL", "postgresql+psycopg2://user:pass@localhost:5432/db")
+os.environ.setdefault("ASYNC_DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/db")
+os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from api.state import RunManager
 
