@@ -1,5 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
-const ADMIN_API_KEY = process.env.NEXT_PUBLIC_ADMIN_API_KEY ?? '';
+const API_BASE = process.env.NEXT_PUBLIC_BFF_URL ?? '/bff';
 
 // ─── Response Types ───────────────────────────────────────────────────────────
 
@@ -112,9 +111,8 @@ export async function apiFetch<T = unknown>(
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
   const headers = new Headers(options?.headers);
-  headers.set('Content-Type', 'application/json');
-  if (ADMIN_API_KEY) {
-    headers.set('X-API-Key', ADMIN_API_KEY);
+  if (!headers.has('Content-Type') && !(options?.body instanceof FormData)) {
+    headers.set('Content-Type', 'application/json');
   }
 
   const res = await fetch(url, {
@@ -142,15 +140,11 @@ export async function apiFetch<T = unknown>(
 }
 
 export function getAdminApiKey(): string {
-  return ADMIN_API_KEY;
+  return '';
 }
 
 export function withApiKeyHeaders(headers?: HeadersInit): Headers {
-  const merged = new Headers(headers);
-  if (ADMIN_API_KEY) {
-    merged.set('X-API-Key', ADMIN_API_KEY);
-  }
-  return merged;
+  return new Headers(headers);
 }
 
 // ─── Gap Scout Types ─────────────────────────────────────────────────────────
@@ -231,7 +225,8 @@ export async function ingestTopic(topicId: string): Promise<{
 }
 
 export function getWsBase(): string {
-  const base = API_BASE.replace(/^http/, 'ws').replace(/^https/, 'wss');
+  const backendBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
+  const base = backendBase.replace(/^http/, 'ws').replace(/^https/, 'wss');
   return base;
 }
 

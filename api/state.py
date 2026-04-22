@@ -1,10 +1,9 @@
 """
-api/state.py — Shared in-memory run state for the Foundry API.
+api/state.py — Shared run state for the Foundry API.
 
-One RunManager singleton tracks all pipeline runs in the current process.
-Each run stores: status, log lines, progress counters, analysis/calibration results.
-
-Thread-safe for use from asyncio background tasks.
+Primary runtime state lives in-memory, with best-effort persistence:
+- local JSON snapshot (filesystem),
+- optional PostgreSQL-backed store for cross-replica continuity.
 """
 
 from __future__ import annotations
@@ -17,6 +16,9 @@ import time
 from dataclasses import dataclass, field  # noqa: F401 — field used by ScoutTopic
 from pathlib import Path
 from typing import Any, Optional
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 from config.settings import settings
 
@@ -58,7 +60,61 @@ class RunManager:
     def __init__(self, snapshot_path: Optional[Path] = None) -> None:
         self._runs: dict[str, RunRecord] = {}
         self._snapshot_path = snapshot_path or _RUN_STATE_SNAPSHOT
-        self._load_snapshot()
+        self._db_enabled = os.getenv("RUN_STATE_DB_ENABLED", "true").lower() in ("1", "true", "yes")
+        self._db_engine: Optional[Engine] = None
+        # Explicit snapshot_path is used by tests/tools and should remain filesystem-only.
+        self._use_db = self._db_enabled and snapshot_path is None
+        if self._use_db:
+            self._init_db_store()
+            self._load_db_snapshot()
+        if not self._runs:
+            self._load_snapshot()
+
+    def _init_db_store(self) -> None:
+        try:
+            self._db_engine = create_engine(settings.database_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+            with self._db_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS foundry_run_state (
+                            run_id TEXT PRIMARY KEY,
+                            payload JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_foundry_run_state_updated_at "
+                        "ON foundry_run_state (updated_at DESC)"
+                    )
+                )
+        except Exception:
+            self._db_engine = None
+            self._use_db = False
+
+    def _load_db_snapshot(self) -> None:
+        if self._db_engine is None:
+            return
+        try:
+            with self._db_engine.begin() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT payload FROM foundry_run_state "
+                        "ORDER BY updated_at DESC "
+                        "LIMIT :limit"
+                    ),
+                    {"limit": _MAX_RUNS},
+                ).fetchall()
+            for row in reversed(rows):
+                payload = row[0] or {}
+                rec = _record_from_dict(payload)
+                self._runs[rec.run_id] = rec
+        except Exception:
+            # DB load failures should not block API startup.
+            self._runs = {}
 
     def _serialize(self) -> dict[str, Any]:
         return {
@@ -94,6 +150,40 @@ class RunManager:
             # Snapshot persistence is best-effort; runtime state must not fail because of disk issues.
             pass
 
+    def _persist_db_record(self, rec: RunRecord) -> None:
+        if self._db_engine is None:
+            return
+        payload = _record_to_dict(rec)
+        try:
+            with self._db_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO foundry_run_state(run_id, payload, updated_at)
+                        VALUES (:run_id, CAST(:payload AS JSONB), NOW())
+                        ON CONFLICT (run_id) DO UPDATE
+                        SET payload = CAST(:payload AS JSONB), updated_at = NOW()
+                        """
+                    ),
+                    {"run_id": rec.run_id, "payload": json.dumps(payload, ensure_ascii=False)},
+                )
+                conn.execute(
+                    text(
+                        """
+                        DELETE FROM foundry_run_state
+                        WHERE run_id IN (
+                            SELECT run_id FROM foundry_run_state
+                            ORDER BY updated_at DESC
+                            OFFSET :offset
+                        )
+                        """
+                    ),
+                    {"offset": _MAX_RUNS},
+                )
+        except Exception:
+            # DB persistence is best effort; in-memory state remains source of truth for current process.
+            pass
+
     def _load_snapshot(self) -> None:
         if not self._snapshot_path.exists():
             return
@@ -101,22 +191,7 @@ class RunManager:
             raw = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
             items = raw.get("runs", [])
             for item in items[-_MAX_RUNS:]:
-                rec = RunRecord(
-                    run_id=item["run_id"],
-                    batch_id=item["batch_id"],
-                    status=item.get("status", "starting"),
-                    progress_pct=int(item.get("progress_pct", 0)),
-                    chunks_total=int(item.get("chunks_total", 0)),
-                    chunks_done=int(item.get("chunks_done", 0)),
-                    records_written=int(item.get("records_written", 0)),
-                    dpo_pairs=int(item.get("dpo_pairs", 0)),
-                    started_at=float(item.get("started_at", time.time())),
-                    ended_at=item.get("ended_at"),
-                    error=item.get("error"),
-                    log_lines=list(item.get("log_lines", []))[-_MAX_LOG_LINES:],
-                    analysis=item.get("analysis"),
-                    calibration=item.get("calibration"),
-                )
+                rec = _record_from_dict(item)
                 self._runs[rec.run_id] = rec
         except Exception:
             # Corrupt snapshot should not break app startup; continue with empty in-memory state.
@@ -129,6 +204,7 @@ class RunManager:
         rec = RunRecord(run_id=run_id, batch_id=batch_id)
         self._runs[run_id] = rec
         self._persist_snapshot()
+        self._persist_db_record(rec)
         return rec
 
     def get(self, run_id: str) -> Optional[RunRecord]:
@@ -144,6 +220,7 @@ class RunManager:
         if kwargs.get("status") in ("done", "error", "cancelled") and rec.ended_at is None:
             rec.ended_at = time.time()
         self._persist_snapshot()
+        self._persist_db_record(rec)
 
     def append_log(self, run_id: str, line: str) -> None:
         rec = self._runs.get(run_id)
@@ -154,6 +231,7 @@ class RunManager:
             # Parse progress hints from log lines
             _parse_progress(rec, line)
             self._persist_snapshot()
+            self._persist_db_record(rec)
 
     def list_runs(self) -> list[RunRecord]:
         return list(self._runs.values())
@@ -201,6 +279,44 @@ def _parse_progress(rec: RunRecord, line: str) -> None:
         return
 
     # _ERROR_RE matches are non-fatal — only the subprocess exit code matters
+
+
+def _record_to_dict(rec: RunRecord) -> dict[str, Any]:
+    return {
+        "run_id": rec.run_id,
+        "batch_id": rec.batch_id,
+        "status": rec.status,
+        "progress_pct": rec.progress_pct,
+        "chunks_total": rec.chunks_total,
+        "chunks_done": rec.chunks_done,
+        "records_written": rec.records_written,
+        "dpo_pairs": rec.dpo_pairs,
+        "started_at": rec.started_at,
+        "ended_at": rec.ended_at,
+        "error": rec.error,
+        "log_lines": rec.log_lines[-_MAX_LOG_LINES:],
+        "analysis": rec.analysis,
+        "calibration": rec.calibration,
+    }
+
+
+def _record_from_dict(item: dict[str, Any]) -> RunRecord:
+    return RunRecord(
+        run_id=item["run_id"],
+        batch_id=item["batch_id"],
+        status=item.get("status", "starting"),
+        progress_pct=int(item.get("progress_pct", 0)),
+        chunks_total=int(item.get("chunks_total", 0)),
+        chunks_done=int(item.get("chunks_done", 0)),
+        records_written=int(item.get("records_written", 0)),
+        dpo_pairs=int(item.get("dpo_pairs", 0)),
+        started_at=float(item.get("started_at", time.time())),
+        ended_at=item.get("ended_at"),
+        error=item.get("error"),
+        log_lines=list(item.get("log_lines", []))[-_MAX_LOG_LINES:],
+        analysis=item.get("analysis"),
+        calibration=item.get("calibration"),
+    )
 
 
 # Singleton imported by routers

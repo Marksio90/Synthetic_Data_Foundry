@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import ProgressBar from './ProgressBar';
-import { getAdminApiKey, withApiKeyHeaders } from '@/lib/api';
+import { apiFetch, withApiKeyHeaders } from '@/lib/api';
 
 interface LiveLogProps {
   runId: string;
@@ -129,91 +129,98 @@ export default function LiveLog({ runId, apiBase, onStatusChange }: LiveLogProps
     offsetRef.current = 0;
     setConnectionStatus('connecting');
 
-    const base = apiBase ?? '';
-    let wsUrl: string;
-    const apiKey = getAdminApiKey();
-    if (base.startsWith('http://') || base.startsWith('https://')) {
-      wsUrl = base.replace(/^http/, 'ws') + `/api/pipeline/ws/${runId}`;
-    } else {
-      const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
-      wsUrl = `${protocol}//${host}/api/pipeline/ws/${runId}`;
-    }
-    if (apiKey) {
-      wsUrl += `${wsUrl.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(apiKey)}`;
-    }
-
     let wsConnected = false;
+    const connectWebSocket = async () => {
+      try {
+        const ticketRes = await apiFetch<{ ws_ticket: string }>(`/api/pipeline/ws-ticket/${runId}`);
+        const wsTicket = ticketRes.ws_ticket;
 
-    try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      const connectTimeout = setTimeout(() => {
-        if (!wsConnected) {
-          ws.close();
-          startPolling();
-        }
-      }, 5000);
-
-      ws.onopen = () => {
-        if (!mountedRef.current) return;
-        wsConnected = true;
-        clearTimeout(connectTimeout);
-        setConnectionStatus('connected');
-        addLines(['[WS] Połączono z serwerem logów...']);
-      };
-
-      ws.onmessage = (event) => {
-        if (!mountedRef.current) return;
-        try {
-          const data = JSON.parse(event.data);
-          if (data.line) {
-            addLines([data.line]);
-          } else if (data.lines) {
-            addLines(data.lines);
-          } else if (typeof event.data === 'string') {
-            addLines([event.data]);
-          }
-          if (data.status && onStatusChange) {
-            onStatusChange(data.status);
-          }
-          // Track progress from WS payload
-          if (data.progress_pct !== undefined && data.chunks_total > 0) {
-            setWsProgress({
-              pct: data.progress_pct,
-              done: data.chunks_done ?? 0,
-              total: data.chunks_total ?? 0,
-            });
-          }
-          if (data.status) setWsStatus(data.status);
-        } catch {
-          if (typeof event.data === 'string') {
-            addLines([event.data]);
-          }
-        }
-      };
-
-      ws.onerror = () => {
-        clearTimeout(connectTimeout);
-        if (!wsConnected && mountedRef.current) {
-          startPolling();
-        }
-      };
-
-      ws.onclose = () => {
-        clearTimeout(connectTimeout);
-        if (!mountedRef.current) return;
-        if (wsConnected) {
-          setConnectionStatus('disconnected');
-          addLines(['[WS] Rozłączono.']);
+        const base = apiBase ?? '';
+        let wsUrl: string;
+        if (base.startsWith('http://') || base.startsWith('https://')) {
+          wsUrl = base.replace(/^http/, 'ws') + `/api/pipeline/ws/${runId}`;
         } else {
-          startPolling();
+          const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const backendHost = typeof window !== 'undefined'
+            ? (process.env.NEXT_PUBLIC_API_URL ?? `${window.location.protocol}//${window.location.host}`)
+            : 'http://localhost:8080';
+          wsUrl = `${backendHost.replace(/^http/, 'ws').replace(/^https/, 'wss')}/api/pipeline/ws/${runId}`;
+          if (!backendHost.startsWith('http')) {
+            wsUrl = `${protocol}//${window.location.host}/api/pipeline/ws/${runId}`;
+          }
         }
-      };
-    } catch {
-      startPolling();
-    }
+        wsUrl += `${wsUrl.includes('?') ? '&' : '?'}ws_ticket=${encodeURIComponent(wsTicket)}`;
+
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        const connectTimeout = setTimeout(() => {
+          if (!wsConnected) {
+            ws.close();
+            startPolling();
+          }
+        }, 5000);
+
+        ws.onopen = () => {
+          if (!mountedRef.current) return;
+          wsConnected = true;
+          clearTimeout(connectTimeout);
+          setConnectionStatus('connected');
+          addLines(['[WS] Połączono z serwerem logów...']);
+        };
+
+        ws.onmessage = (event) => {
+          if (!mountedRef.current) return;
+          try {
+            const data = JSON.parse(event.data);
+            if (data.line) {
+              addLines([data.line]);
+            } else if (data.lines) {
+              addLines(data.lines);
+            } else if (typeof event.data === 'string') {
+              addLines([event.data]);
+            }
+            if (data.status && onStatusChange) {
+              onStatusChange(data.status);
+            }
+            if (data.progress_pct !== undefined && data.chunks_total > 0) {
+              setWsProgress({
+                pct: data.progress_pct,
+                done: data.chunks_done ?? 0,
+                total: data.chunks_total ?? 0,
+              });
+            }
+            if (data.status) setWsStatus(data.status);
+          } catch {
+            if (typeof event.data === 'string') {
+              addLines([event.data]);
+            }
+          }
+        };
+
+        ws.onerror = () => {
+          clearTimeout(connectTimeout);
+          if (!wsConnected && mountedRef.current) {
+            startPolling();
+          }
+        };
+
+        ws.onclose = () => {
+          clearTimeout(connectTimeout);
+          if (!mountedRef.current) return;
+          if (wsConnected) {
+            setConnectionStatus('disconnected');
+            addLines(['[WS] Rozłączono.']);
+          } else {
+            startPolling();
+          }
+        };
+      } catch {
+        startPolling();
+      }
+    };
+
+    void connectWebSocket();
 
     return () => {
       mountedRef.current = false;

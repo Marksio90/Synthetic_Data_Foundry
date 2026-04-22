@@ -33,7 +33,12 @@ from agents.calibrator import calibrate
 from agents.doc_analyzer import analyze_documents
 from api.db import get_session
 from api.errors import FailedDependencyError, ServiceUnavailableError
-from api.security import require_admin_api_key, require_admin_api_key_ws
+from api.security import (
+    create_ws_ticket,
+    require_admin_api_key,
+    require_admin_api_key_ws,
+    verify_ws_ticket,
+)
 from api.schemas import (
     AnalysisResponse,
     CalibrationInfo,
@@ -408,6 +413,21 @@ def list_runs() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/pipeline/ws-ticket/{run_id} — short-lived WS auth ticket
+# ---------------------------------------------------------------------------
+
+@router.get("/ws-ticket/{run_id}", dependencies=[Depends(require_admin_api_key)])
+def create_ws_auth_ticket(run_id: str) -> dict[str, str]:
+    rec = runs.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    ticket = create_ws_ticket(run_id)
+    if not ticket:
+        raise HTTPException(status_code=503, detail="ADMIN_API_KEY is not configured on the server.")
+    return {"run_id": run_id, "ws_ticket": ticket}
+
+
+# ---------------------------------------------------------------------------
 # WebSocket /api/pipeline/ws/{run_id} — live log stream
 # ---------------------------------------------------------------------------
 
@@ -418,7 +438,8 @@ async def websocket_log(websocket: WebSocket, run_id: str) -> None:
     Sends one JSON message per line: {"line": "...", "status": "running"}
     Closes when the run is done or errors.
     """
-    if not require_admin_api_key_ws(websocket):
+    ws_ticket = websocket.query_params.get("ws_ticket")
+    if not (require_admin_api_key_ws(websocket) or verify_ws_ticket(ws_ticket, run_id)):
         await websocket.close(code=1008)
         return
 
