@@ -16,6 +16,7 @@ class PipelinePreflightTests(unittest.TestCase):
     def test_preflight_passes_when_required_tables_exist(self) -> None:
         session = MagicMock()
         session.get_bind.return_value = object()
+        session.bind = object()
 
         inspector = MagicMock()
         inspector.has_table.side_effect = lambda table: table in {"source_documents", "directive_chunks"}
@@ -28,6 +29,7 @@ class PipelinePreflightTests(unittest.TestCase):
     def test_preflight_returns_503_when_tables_are_missing(self) -> None:
         session = MagicMock()
         session.get_bind.return_value = object()
+        session.bind = object()
 
         inspector = MagicMock()
         inspector.has_table.return_value = False

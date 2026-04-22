@@ -135,6 +135,8 @@ def _ensure_pipeline_db_ready(session: Session) -> None:
 
     try:
         db_inspector = inspect(bind)
+    try:
+        db_inspector = inspect(session.bind)
         missing_tables = [t for t in _REQUIRED_TABLES if not db_inspector.has_table(t)]
     except SQLAlchemyError as exc:
         raise HTTPException(
@@ -172,6 +174,7 @@ def analyze(
     parameters — without starting the pipeline.
     Used by the UI to show the AutoPilot preview before the user clicks Start.
     """
+    _ensure_pipeline_db_ready(session)
     paths = _resolve_paths(filenames)
     _ensure_pipeline_db_ready(session)
     analysis = analyze_documents([str(p) for p in paths])
@@ -213,6 +216,7 @@ async def run_pipeline(
     Start a full AutoPilot pipeline run as a background subprocess.
     Returns run_id immediately; poll /status or open /ws for progress.
     """
+    _ensure_pipeline_db_ready(session)
     paths = _resolve_paths(req.filenames)
     _ensure_pipeline_db_ready(session)
 
