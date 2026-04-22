@@ -122,6 +122,19 @@ def _ensure_pipeline_db_ready(session: Session) -> None:
             },
         ) from exc
 
+    bind = session.get_bind()
+    if bind is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "pipeline_db_unavailable",
+                "message": "Pipeline database bind is unavailable.",
+                "hint": "Verify SQLAlchemy session/engine initialization.",
+            },
+        )
+
+    try:
+        db_inspector = inspect(bind)
     try:
         db_inspector = inspect(session.bind)
         missing_tables = [t for t in _REQUIRED_TABLES if not db_inspector.has_table(t)]
@@ -163,6 +176,7 @@ def analyze(
     """
     _ensure_pipeline_db_ready(session)
     paths = _resolve_paths(filenames)
+    _ensure_pipeline_db_ready(session)
     analysis = analyze_documents([str(p) for p in paths])
     chunks = _get_calibration_chunks(session, filenames)
     calib = calibrate(chunks)
@@ -204,6 +218,7 @@ async def run_pipeline(
     """
     _ensure_pipeline_db_ready(session)
     paths = _resolve_paths(req.filenames)
+    _ensure_pipeline_db_ready(session)
 
     # Auto-generate batch_id if not provided
     batch_id = req.batch_id or (

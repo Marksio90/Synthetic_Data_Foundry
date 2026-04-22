@@ -15,6 +15,7 @@ from api.routers.pipeline import _ensure_pipeline_db_ready, _get_calibration_chu
 class PipelinePreflightTests(unittest.TestCase):
     def test_preflight_passes_when_required_tables_exist(self) -> None:
         session = MagicMock()
+        session.get_bind.return_value = object()
         session.bind = object()
 
         inspector = MagicMock()
@@ -27,6 +28,7 @@ class PipelinePreflightTests(unittest.TestCase):
 
     def test_preflight_returns_503_when_tables_are_missing(self) -> None:
         session = MagicMock()
+        session.get_bind.return_value = object()
         session.bind = object()
 
         inspector = MagicMock()
@@ -40,6 +42,27 @@ class PipelinePreflightTests(unittest.TestCase):
         self.assertEqual(ctx.exception.detail["error_code"], "pipeline_schema_missing")
         self.assertIn("source_documents", ctx.exception.detail["missing_tables"])
         self.assertIn("directive_chunks", ctx.exception.detail["missing_tables"])
+
+    def test_preflight_returns_503_when_database_ping_fails(self) -> None:
+        session = MagicMock()
+        session.execute.side_effect = SQLAlchemyError("db down")
+
+        with self.assertRaises(HTTPException) as ctx:
+            _ensure_pipeline_db_ready(session)
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["error_code"], "pipeline_db_unavailable")
+
+    def test_preflight_returns_503_when_inspection_fails(self) -> None:
+        session = MagicMock()
+        session.get_bind.return_value = object()
+
+        with patch("api.routers.pipeline.inspect", side_effect=SQLAlchemyError("no inspect")):
+            with self.assertRaises(HTTPException) as ctx:
+                _ensure_pipeline_db_ready(session)
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["error_code"], "pipeline_db_inspection_failed")
 
     def test_get_calibration_chunks_returns_503_when_query_fails(self) -> None:
         session = MagicMock()
