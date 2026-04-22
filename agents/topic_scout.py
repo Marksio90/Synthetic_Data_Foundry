@@ -37,6 +37,7 @@ import httpx
 import openai
 
 from config.settings import settings
+from agents.scout_contract import topic_priority_score
 
 logger = logging.getLogger(__name__)
 
