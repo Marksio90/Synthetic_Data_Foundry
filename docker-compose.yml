@@ -236,6 +236,7 @@ services:
     restart: unless-stopped
     environment:
       <<: *app-env
+      SERVICE_ROLE: ${API_SERVICE_ROLE:-api}
       DATA_DIR: /app/data
       POSTGRES_USER: ${POSTGRES_USER:-esg_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -288,6 +289,48 @@ services:
       postgres:
         condition: service_healthy
       ollama:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - foundry_net
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Dedicated pipeline worker — executes queued jobs outside API process
+  # ---------------------------------------------------------------------------
+  foundry-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: foundry_worker
+    restart: unless-stopped
+    command: ["python", "-m", "api.pipeline_worker"]
+    environment:
+      <<: *app-env
+      SERVICE_ROLE: ${WORKER_SERVICE_ROLE:-worker}
+      DATA_DIR: /app/data
+      POSTGRES_USER: ${POSTGRES_USER:-esg_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data
+      - ./api:/app/api:ro
+      - ./agents:/app/agents:ro
+      - ./pipeline:/app/pipeline:ro
+      - ./training:/app/training:ro
+      - ./utils:/app/utils:ro
+      - ./config:/app/config:ro
+      - ./db:/app/db:ro
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "2.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - foundry_net
