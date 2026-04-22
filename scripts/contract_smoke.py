@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi.testclient import TestClient
 
 from api.main import app
+from api.state import runs
 from config.settings import settings
 
 
@@ -43,6 +44,28 @@ def main() -> None:
             headers={"X-API-Key": "ci-admin-key"},
         )
         assert authorized_not_found.status_code == 404, "status contract mismatch for missing run"
+
+        # "Live" path contracts: log endpoint + websocket stream for an existing run
+        run_id = "contract-live-run"
+        rec = runs.create(run_id, "contract-batch")
+        rec.status = "done"
+        rec.log_lines = ["line-1", "line-2"]
+
+        log_resp = client.get(
+            f"/api/pipeline/log/{run_id}",
+            headers={"X-API-Key": "ci-admin-key"},
+        )
+        assert log_resp.status_code == 200, "log contract mismatch"
+        assert log_resp.json().get("total_lines", 0) >= 2, "log payload mismatch"
+
+        with client.websocket_connect(f"/api/pipeline/ws/{run_id}?api_key=ci-admin-key") as ws:
+            msg = ws.receive_json()
+            assert "line" in msg, "websocket payload missing log line"
+            # stream must end with EOF marker for done/error states
+            while True:
+                msg = ws.receive_json()
+                if msg.get("line") == "__EOF__":
+                    break
 
     print("contract_smoke: OK")
 
