@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 _REFUSAL_PHRASE = "Brak danych w dyrektywie"
 
 
+def _build_holdout_pool(records: list[dict], modulo: int = 5) -> list[dict]:
+    """
+    Build deterministic holdout split from dataset order.
+
+    Default policy keeps ~20% of records where index % 5 == 0.
+    Falls back to full set if holdout would be empty.
+    """
+    if not records:
+        return []
+    if modulo <= 0:
+        return records
+    holdout = [rec for idx, rec in enumerate(records) if idx % modulo == 0]
+    return holdout or records
+
+
 def _ask_model_ollama(
     model_name: str,
     system_prompt: str,
@@ -121,8 +136,10 @@ def evaluate_model(
     if not records:
         return {"error": "Empty dataset"}
 
-    # Sample
-    sample = rng.sample(records, min(n_samples, len(records)))
+    # Deterministic holdout pool (~20%) to avoid evaluating on the exact
+    # same training slice and to match module docstring.
+    holdout_records = _build_holdout_pool(records, modulo=5)
+    sample = rng.sample(holdout_records, min(n_samples, len(holdout_records)))
     logger.info("Evaluating model '%s' on %d samples...", model_name, len(sample))
 
     scores: list[float] = []
@@ -164,6 +181,8 @@ def evaluate_model(
 
     result = {
         "model_name": model_name,
+        "n_records_total": len(records),
+        "n_holdout_pool": len(holdout_records),
         "n_evaluated": len(scores),
         "avg_score": round(statistics.mean(scores), 3),
         "median_score": round(statistics.median(scores), 3),
