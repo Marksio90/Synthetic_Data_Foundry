@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from agents.calibrator import calibrate
 from agents.doc_analyzer import analyze_documents
 from api.db import get_session
+from api.errors import FailedDependencyError, ServiceUnavailableError
 from api.security import require_admin_api_key, require_admin_api_key_ws
 from api.schemas import (
     AnalysisResponse,
