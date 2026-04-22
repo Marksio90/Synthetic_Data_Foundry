@@ -183,6 +183,8 @@ class ScoutTopicData:
     demand_score: float = 0.0                 # estimated practical demand [0..1]
     uniqueness_score: float = 0.0             # novelty/rarity [0..1]
     quality_score: float = 0.0                # evidence quality for dataset usefulness [0..1]
+    quality_gate_passed: bool = False         # hard gate per category
+    quality_gate_reasons: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +801,19 @@ _CATEGORY_RULES: list[tuple[str, tuple[str, ...], str]] = [
     ("capital_markets", ("mifid", "mica", "basel", "aml", "tokenization", "derivatives"), "market_surveillance"),
 ]
 
+_LEGISLATIVE_SOURCES = frozenset({
+    "eurlex", "curia", "federalregister", "secedgar", "esma", "eba", "oecd", "wto", "wipo", "epo",
+})
+
+_ECON_DATA_SOURCES = frozenset({
+    "imf", "worldbank", "ecb", "bis", "eurostat", "owid", "irena", "undl", "hdx",
+})
+
+_RESEARCH_SOURCES = frozenset({
+    "arxiv", "openalex", "semanticscholar", "pubmed", "core", "ieee", "ssrn",
+    "europepmc", "philpapers", "acm", "base", "chemrxiv", "engrxiv",
+})
+
 
 def _infer_dataset_profile(domain: str) -> tuple[str, str]:
     d = domain.lower()
@@ -806,6 +821,63 @@ def _infer_dataset_profile(domain: str) -> tuple[str, str]:
         if any(m in d for m in markers):
             return category, purpose
     return "general", "qa_reasoning"
+
+
+def _evaluate_quality_gate(
+    category: str,
+    sources: list[ScoutSource],
+    quality_score: float,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    src_types = {s.source_type for s in sources}
+    high_tier = sum(1 for s in sources if s.source_tier in {"S", "A"})
+    n_sources = len(sources)
+
+    if quality_score < 0.45:
+        reasons.append("quality_score<0.45")
+
+    if category == "legal_regulatory":
+        if n_sources < 3:
+            reasons.append("min_3_sources")
+        if high_tier < 2:
+            reasons.append("min_2_high_tier_sources")
+        if not (src_types & _LEGISLATIVE_SOURCES):
+            reasons.append("min_1_legislative_source")
+    elif category == "climate_finance":
+        if n_sources < 4:
+            reasons.append("min_4_sources")
+        if high_tier < 2:
+            reasons.append("min_2_high_tier_sources")
+        if not (src_types & (_LEGISLATIVE_SOURCES | _ECON_DATA_SOURCES)):
+            reasons.append("min_1_policy_or_econ_source")
+    elif category == "health_medtech":
+        if n_sources < 4:
+            reasons.append("min_4_sources")
+        if high_tier < 2:
+            reasons.append("min_2_high_tier_sources")
+        if not (src_types & _RESEARCH_SOURCES):
+            reasons.append("min_1_research_source")
+    elif category == "ai_data_governance":
+        if n_sources < 3:
+            reasons.append("min_3_sources")
+        if high_tier < 2:
+            reasons.append("min_2_high_tier_sources")
+        if not (src_types & (_LEGISLATIVE_SOURCES | _RESEARCH_SOURCES)):
+            reasons.append("min_1_regulatory_or_research_source")
+    elif category == "capital_markets":
+        if n_sources < 3:
+            reasons.append("min_3_sources")
+        if high_tier < 2:
+            reasons.append("min_2_high_tier_sources")
+        if not (src_types & (_ECON_DATA_SOURCES | _LEGISLATIVE_SOURCES)):
+            reasons.append("min_1_market_regulatory_source")
+    else:
+        if n_sources < 3:
+            reasons.append("min_3_sources")
+        if high_tier < 1:
+            reasons.append("min_1_high_tier_source")
+
+    return len(reasons) == 0, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +995,7 @@ async def _process_domain(
     # Legacy 4-component score kept for backwards compat (used in sort + old API consumers)
     source_type_diversity = min(1.0, len({s.source_type for s in verified}) / 6.0)
     high_tier_ratio = sum(1 for s in verified if s.source_tier in {"S", "A"}) / max(1, len(verified))
+    cutoff_coverage = min(1.0, len(post_cutoff_models) / 8.0)
 
     score = round(
         0.40 * recency
@@ -934,12 +1007,24 @@ async def _process_domain(
     # Backward-compatible uplift: slightly reward stronger evidence quality and source spread.
     score = round(min(1.0, score + 0.04 * source_type_diversity + 0.04 * high_tier_ratio), 3)
 
+    # New quality-and-demand profile used for stronger dataset triage.
+    evidence_quality = min(1.0, 0.45 * high_tier_ratio + 0.35 * source_type_diversity + 0.20 * density)
+    uniqueness_score = min(1.0, 0.50 * scoring.knowledge_gap_score + 0.30 * scoring.llm_uncertainty + 0.20 * cutoff_coverage)
+    demand_score = min(1.0, 0.55 * recency + 0.30 * cutoff_coverage + 0.15 * evidence_quality)
+    quality_score = min(1.0, 0.60 * evidence_quality + 0.40 * uniqueness_score)
+    dataset_category, dataset_purpose = _infer_dataset_profile(domain)
+    quality_gate_passed, quality_gate_reasons = _evaluate_quality_gate(
+        dataset_category, verified, quality_score,
+    )
+
     await _log(
         f"  {domain[:40]}: gap={scoring.knowledge_gap_score:.3f} score={score:.2f} "
         f"tier={best_tier} sources={len(verified)} "
         f"uncertainty={scoring.llm_uncertainty:.2f} cutoff_models={len(post_cutoff_models)} "
-        f"quality={quality_score:.2f} uniqueness={uniqueness_score:.2f}"
+        f"quality={quality_score:.2f} uniqueness={uniqueness_score:.2f} gate={'pass' if quality_gate_passed else 'fail'}"
     )
+    if not quality_gate_passed:
+        await _log(f"  {domain[:40]}: quality gate failed ({', '.join(quality_gate_reasons[:4])})")
 
     topic = ScoutTopicData(
         topic_id=_topic_id(domain),
@@ -961,12 +1046,14 @@ async def _process_domain(
         citation_velocity=scoring.citation_velocity,
         source_tier=best_tier,
         estimated_tokens=est_tokens,
-        ingest_ready=quality_score >= 0.45,
+        ingest_ready=quality_gate_passed,
         dataset_category=dataset_category,
         dataset_purpose=dataset_purpose,
         demand_score=round(demand_score, 3),
         uniqueness_score=round(uniqueness_score, 3),
         quality_score=round(quality_score, 3),
+        quality_gate_passed=quality_gate_passed,
+        quality_gate_reasons=quality_gate_reasons,
     )
 
     if topic_callback:
@@ -1024,7 +1111,19 @@ async def run_scout(
     )
 
     results = [r for r in domain_results if isinstance(r, ScoutTopicData)]
-    # Rank by modern gap score first, keeping legacy score as a secondary stabilizer.
-    results.sort(key=lambda t: (0.70 * t.knowledge_gap_score + 0.30 * t.score), reverse=True)
+    passed_count = sum(1 for t in results if t.quality_gate_passed)
+    if results:
+        await _log(f"Quality gate passed: {passed_count}/{len(results)} topics")
+    # Prioritize topics with high practical usefulness for dataset generation.
+    results.sort(
+        key=lambda t: (
+            0.20 * (1.0 if t.quality_gate_passed else 0.0)
+            + 0.45 * t.quality_score
+            + 0.25 * t.uniqueness_score
+            + 0.20 * t.knowledge_gap_score
+            + 0.10 * t.demand_score
+        ),
+        reverse=True,
+    )
     await _log(f"Scout complete — {len(results)} topics discovered.")
     return results[:max_topics]

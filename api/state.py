@@ -166,6 +166,8 @@ class ScoutTopic:
     demand_score: float = 0.0
     uniqueness_score: float = 0.0
     quality_score: float = 0.0
+    quality_gate_passed: bool = False
+    quality_gate_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -194,6 +196,8 @@ class ScoutTopic:
             "demand_score": self.demand_score,
             "uniqueness_score": self.uniqueness_score,
             "quality_score": self.quality_score,
+            "quality_gate_passed": self.quality_gate_passed,
+            "quality_gate_reasons": self.quality_gate_reasons,
         }
 
 
@@ -299,6 +303,8 @@ class ScoutManager:
             demand_score=getattr(t, "demand_score", 0.0),
             uniqueness_score=getattr(t, "uniqueness_score", 0.0),
             quality_score=getattr(t, "quality_score", 0.0),
+            quality_gate_passed=getattr(t, "quality_gate_passed", False),
+            quality_gate_reasons=getattr(t, "quality_gate_reasons", []),
         )
 
     def add_single_topic(self, scout_id: str, topic_data: Any) -> None:
@@ -359,7 +365,8 @@ class ScoutManager:
         topics = sorted(
             self._topics.values(),
             key=lambda t: (
-                0.45 * t.quality_score
+                0.20 * (1.0 if t.quality_gate_passed else 0.0)
+                + 0.45 * t.quality_score
                 + 0.25 * t.uniqueness_score
                 + 0.20 * t.knowledge_gap_score
                 + 0.10 * t.demand_score

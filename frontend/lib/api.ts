@@ -193,6 +193,8 @@ export interface ScoutTopic {
   demand_score?: number;
   uniqueness_score?: number;
   quality_score?: number;
+  quality_gate_passed?: boolean;
+  quality_gate_reasons?: string[];
 }
 
 export interface ScoutRun {
