@@ -416,14 +416,188 @@ class ScoutRecord:
         return round(end - self.started_at, 1)
 
 
+def _scout_topic_from_dict(data: dict[str, Any]) -> ScoutTopic:
+    return ScoutTopic(
+        topic_id=data["topic_id"],
+        title=data.get("title", ""),
+        summary=data.get("summary", ""),
+        score=float(data.get("score", 0.0)),
+        recency_score=float(data.get("recency_score", 0.0)),
+        llm_uncertainty=float(data.get("llm_uncertainty", 0.0)),
+        source_count=int(data.get("source_count", 0)),
+        social_signal=float(data.get("social_signal", 0.0)),
+        sources=list(data.get("sources", [])),
+        domains=list(data.get("domains", [])),
+        discovered_at=data.get("discovered_at", ""),
+        knowledge_gap_score=float(data.get("knowledge_gap_score", 0.0)),
+        cutoff_model_targets=list(data.get("cutoff_model_targets", [])),
+        format_types=list(data.get("format_types", [])),
+        languages=list(data.get("languages", [])),
+        citation_velocity=float(data.get("citation_velocity", 0.0)),
+        source_tier=data.get("source_tier", "C"),
+        estimated_tokens=int(data.get("estimated_tokens", 0)),
+        ingest_ready=bool(data.get("ingest_ready", False)),
+        dataset_category=data.get("dataset_category", "general"),
+        dataset_purpose=data.get("dataset_purpose", "qa_reasoning"),
+        demand_score=float(data.get("demand_score", 0.0)),
+        uniqueness_score=float(data.get("uniqueness_score", 0.0)),
+        quality_score=float(data.get("quality_score", 0.0)),
+        quality_gate_passed=bool(data.get("quality_gate_passed", False)),
+        quality_gate_reasons=list(data.get("quality_gate_reasons", [])),
+    )
+
+
+def _scout_record_to_dict(rec: ScoutRecord) -> dict[str, Any]:
+    return {
+        "scout_id": rec.scout_id,
+        "status": rec.status,
+        "topics_found": rec.topics_found,
+        "started_at": rec.started_at,
+        "ended_at": rec.ended_at,
+        "error": rec.error,
+        "log_lines": rec.log_lines[-_MAX_LOG_LINES:],
+        "topics": [t.to_dict() for t in rec.topics],
+    }
+
+
+def _scout_record_from_dict(data: dict[str, Any]) -> ScoutRecord:
+    topics = [_scout_topic_from_dict(t) for t in data.get("topics", []) if isinstance(t, dict)]
+    return ScoutRecord(
+        scout_id=data["scout_id"],
+        status=data.get("status", "starting"),
+        topics_found=int(data.get("topics_found", len(topics))),
+        started_at=float(data.get("started_at", time.time())),
+        ended_at=data.get("ended_at"),
+        error=data.get("error"),
+        log_lines=list(data.get("log_lines", []))[-_MAX_LOG_LINES:],
+        topics=topics,
+    )
+
+
 class ScoutManager:
-    """In-memory store for scout runs and discovered topics."""
+    """In-memory store for scout runs/topics with optional DB-backed persistence."""
 
     def __init__(self) -> None:
         self._runs: dict[str, ScoutRecord] = {}
         self._topics: dict[str, ScoutTopic] = {}   # topic_id → latest version
         self._sse_queues: set = set()
         self._feedback: list = []
+        self._db_enabled = os.getenv("SCOUT_STATE_DB_ENABLED", "true").lower() in ("1", "true", "yes")
+        self._db_engine: Optional[Engine] = None
+        if self._db_enabled:
+            self._init_db_store()
+            self._load_db_snapshot()
+
+    def _init_db_store(self) -> None:
+        try:
+            self._db_engine = create_engine(settings.database_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+            with self._db_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS foundry_scout_state (
+                            scout_id TEXT PRIMARY KEY,
+                            payload JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS foundry_scout_topics (
+                            topic_id TEXT PRIMARY KEY,
+                            payload JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                )
+        except Exception:
+            self._db_engine = None
+
+    def _load_db_snapshot(self) -> None:
+        if self._db_engine is None:
+            return
+        try:
+            with self._db_engine.begin() as conn:
+                run_rows = conn.execute(
+                    text(
+                        "SELECT payload FROM foundry_scout_state "
+                        "ORDER BY updated_at DESC LIMIT :limit"
+                    ),
+                    {"limit": _MAX_SCOUT_RUNS},
+                ).fetchall()
+                topic_rows = conn.execute(
+                    text(
+                        "SELECT payload FROM foundry_scout_topics "
+                        "ORDER BY updated_at DESC LIMIT :limit"
+                    ),
+                    {"limit": 5000},
+                ).fetchall()
+            for row in reversed(run_rows):
+                rec = _scout_record_from_dict(row[0] or {})
+                self._runs[rec.scout_id] = rec
+            for row in topic_rows:
+                topic = _scout_topic_from_dict(row[0] or {})
+                self._topics[topic.topic_id] = topic
+        except Exception:
+            # DB hydration is best-effort.
+            pass
+
+    def _persist_scout_run(self, rec: ScoutRecord) -> None:
+        if self._db_engine is None:
+            return
+        payload = _scout_record_to_dict(rec)
+        try:
+            with self._db_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO foundry_scout_state(scout_id, payload, updated_at)
+                        VALUES (:scout_id, CAST(:payload AS JSONB), NOW())
+                        ON CONFLICT (scout_id) DO UPDATE
+                        SET payload = CAST(:payload AS JSONB), updated_at = NOW()
+                        """
+                    ),
+                    {"scout_id": rec.scout_id, "payload": json.dumps(payload, ensure_ascii=False)},
+                )
+                conn.execute(
+                    text(
+                        """
+                        DELETE FROM foundry_scout_state
+                        WHERE scout_id IN (
+                            SELECT scout_id FROM foundry_scout_state
+                            ORDER BY updated_at DESC
+                            OFFSET :offset
+                        )
+                        """
+                    ),
+                    {"offset": _MAX_SCOUT_RUNS},
+                )
+        except Exception:
+            pass
+
+    def _persist_topic(self, topic: ScoutTopic) -> None:
+        if self._db_engine is None:
+            return
+        payload = topic.to_dict()
+        try:
+            with self._db_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO foundry_scout_topics(topic_id, payload, updated_at)
+                        VALUES (:topic_id, CAST(:payload AS JSONB), NOW())
+                        ON CONFLICT (topic_id) DO UPDATE
+                        SET payload = CAST(:payload AS JSONB), updated_at = NOW()
+                        """
+                    ),
+                    {"topic_id": topic.topic_id, "payload": json.dumps(payload, ensure_ascii=False)},
+                )
+        except Exception:
+            pass
 
     def create(self, scout_id: str) -> ScoutRecord:
         if len(self._runs) >= _MAX_SCOUT_RUNS:
@@ -431,6 +605,7 @@ class ScoutManager:
             self._runs.pop(oldest_scout_id, None)
         rec = ScoutRecord(scout_id=scout_id)
         self._runs[scout_id] = rec
+        self._persist_scout_run(rec)
         return rec
 
     def get(self, scout_id: str) -> Optional[ScoutRecord]:
@@ -445,6 +620,7 @@ class ScoutManager:
                 setattr(rec, k, v)
         if kwargs.get("status") in ("done", "error") and rec.ended_at is None:
             rec.ended_at = time.time()
+        self._persist_scout_run(rec)
 
     def append_log(self, scout_id: str, line: str) -> None:
         rec = self._runs.get(scout_id)
@@ -452,6 +628,7 @@ class ScoutManager:
             rec.log_lines.append(line)
             if len(rec.log_lines) > _MAX_LOG_LINES:
                 del rec.log_lines[: len(rec.log_lines) - _MAX_LOG_LINES]
+            self._persist_scout_run(rec)
 
     def _make_scout_topic(self, t: Any) -> "ScoutTopic":
         return ScoutTopic(
@@ -507,6 +684,8 @@ class ScoutManager:
         rec.topics.append(topic)
         self._topics[topic.topic_id] = topic
         rec.topics_found = len(rec.topics)
+        self._persist_topic(topic)
+        self._persist_scout_run(rec)
         self.broadcast_event({"event": "topic", "data": topic.to_dict()})
         try:
             from api.monitoring import topics_discovered_total, scout_topics_per_source
@@ -530,7 +709,9 @@ class ScoutManager:
             topic = self._make_scout_topic(t)
             rec.topics.append(topic)
             self._topics[topic.topic_id] = topic
+            self._persist_topic(topic)
         rec.topics_found = len(rec.topics)
+        self._persist_scout_run(rec)
 
     def _evict_old_topics(self, ttl_hours: int = 72) -> None:
         """Remove topics older than ttl_hours to prevent unbounded memory growth."""
