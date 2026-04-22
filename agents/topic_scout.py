@@ -37,6 +37,7 @@ import httpx
 import openai
 
 from config.settings import settings
+from agents.scout_contract import topic_priority_score
 
 logger = logging.getLogger(__name__)
 
@@ -1174,13 +1175,7 @@ async def run_scout(
         await _log(f"Category coverage: {top_cats}")
     # Prioritize topics with high practical usefulness for dataset generation.
     results.sort(
-        key=lambda t: (
-            0.20 * (1.0 if t.quality_gate_passed else 0.0)
-            + 0.45 * t.quality_score
-            + 0.25 * t.uniqueness_score
-            + 0.20 * t.knowledge_gap_score
-            + 0.10 * t.demand_score
-        ),
+        key=topic_priority_score,
         reverse=True,
     )
     await _log(f"Scout complete — {len(results)} topics discovered.")

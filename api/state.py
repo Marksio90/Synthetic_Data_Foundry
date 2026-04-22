@@ -16,6 +16,7 @@ from dataclasses import dataclass, field  # noqa: F401 — field used by ScoutTo
 from typing import Any, Optional
 
 from config.settings import settings
+from agents.scout_contract import topic_priority_score
 
 _MAX_LOG_LINES = settings.state_max_log_lines
 _MAX_RUNS = settings.state_max_runs
@@ -373,13 +374,7 @@ class ScoutManager:
     def latest_topics(self, limit: int = 50) -> list[ScoutTopic]:
         topics = sorted(
             self._topics.values(),
-            key=lambda t: (
-                0.20 * (1.0 if t.quality_gate_passed else 0.0)
-                + 0.45 * t.quality_score
-                + 0.25 * t.uniqueness_score
-                + 0.20 * t.knowledge_gap_score
-                + 0.10 * t.demand_score
-            ),
+            key=topic_priority_score,
             reverse=True,
         )
         return topics[:limit]
