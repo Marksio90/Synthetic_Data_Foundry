@@ -228,6 +228,24 @@ FROM workflow_cost_ledger
 GROUP BY workflow_id, DATE(recorded_at);
 
 -- =============================================================================
+-- calibration_history: self-improving loop parameter adjustment audit trail
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS calibration_history (
+    record_id       TEXT        PRIMARY KEY,
+    workflow_id     TEXT        NOT NULL,
+    cycle_id        TEXT        NOT NULL,
+    recorded_at     TIMESTAMPTZ DEFAULT NOW(),
+    params_before   JSONB       NOT NULL,   -- {quality_threshold, adversarial_ratio, max_turns}
+    params_after    JSONB       NOT NULL,
+    metrics         JSONB       NOT NULL,   -- {hallucination_rate, avg_quality_score, n_critiqued, …}
+    reasoning       JSONB       NOT NULL,   -- list of human-readable adjustment reasons
+    was_reset       BOOLEAN     DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cal_history_workflow
+    ON calibration_history (workflow_id, recorded_at DESC);
+
+-- =============================================================================
 -- scout_domain_history: rolling log of domains selected per scout run.
 -- Gap Scout reads this table on startup to avoid re-scanning the same domains
 -- in consecutive runs (persistent across container restarts).
