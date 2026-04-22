@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config.settings import settings
-from agents.scout_contract import topic_priority_score
 
 _MAX_LOG_LINES = settings.state_max_log_lines
 _MAX_RUNS = settings.state_max_runs
