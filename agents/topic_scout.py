@@ -1111,13 +1111,14 @@ async def run_scout(
     )
 
     results = [r for r in domain_results if isinstance(r, ScoutTopicData)]
-    gate_passed = [t for t in results if t.quality_gate_passed]
-    if gate_passed:
-        results = gate_passed
+    passed_count = sum(1 for t in results if t.quality_gate_passed)
+    if results:
+        await _log(f"Quality gate passed: {passed_count}/{len(results)} topics")
     # Prioritize topics with high practical usefulness for dataset generation.
     results.sort(
         key=lambda t: (
-            0.45 * t.quality_score
+            0.20 * (1.0 if t.quality_gate_passed else 0.0)
+            + 0.45 * t.quality_score
             + 0.25 * t.uniqueness_score
             + 0.20 * t.knowledge_gap_score
             + 0.10 * t.demand_score
