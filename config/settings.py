@@ -369,6 +369,66 @@ class Settings(BaseSettings):
         ge=10,
         description="Max number of scout runs retained in memory.",
     )
+    pipeline_worker_concurrency: int = Field(
+        1,
+        ge=1,
+        le=16,
+        description="Number of queue workers consuming pipeline execution jobs.",
+    )
+    pipeline_queue_maxsize: int = Field(
+        100,
+        ge=1,
+        le=10000,
+        description="Maximum number of queued pipeline jobs waiting for execution.",
+    )
+    pipeline_max_attempts: int = Field(
+        3,
+        ge=1,
+        le=10,
+        description="Maximum execution attempts per pipeline run before dead-lettering.",
+    )
+    pipeline_replay_token_budget_max: int = Field(
+        50000,
+        ge=1000,
+        description="Hard token budget cap for replaying dead-lettered jobs.",
+    )
+    pipeline_queue_backend: str = Field(
+        "memory",
+        description="Queue backend for pipeline executor: 'memory', 'redis', or 'redis_streams'.",
+    )
+    redis_url: str = Field(
+        "redis://localhost:6379/0",
+        description="Redis connection URL used when PIPELINE_QUEUE_BACKEND=redis.",
+    )
+    pipeline_stream_block_ms: int = Field(
+        2000,
+        ge=100,
+        le=30000,
+        description="Redis Streams block timeout (ms) for XREADGROUP polling.",
+    )
+    pipeline_stream_claim_idle_ms: int = Field(
+        60000,
+        ge=1000,
+        le=3600000,
+        description="Idle timeout (ms) before pending stream entries are reclaimed via XAUTOCLAIM.",
+    )
+    pipeline_replay_audit_retention: int = Field(
+        1000,
+        ge=100,
+        le=100000,
+        description="Max number of replay audit events retained (memory fallback / Redis list trim).",
+    )
+    scheduler_leader_lock_id: int = Field(
+        61029001,
+        description=(
+            "PostgreSQL advisory lock id used for leader-only scheduler/websub tasks. "
+            "Only the process holding the lock runs singleton background jobs."
+        ),
+    )
+    service_role: str = Field(
+        "all",
+        description="Runtime role: 'all' (API+executor), 'api' (API-only), or 'worker' (executor-only).",
+    )
 
     # ------------------------------------------------------------------
     # Batch ID (overridable from CLI; also readable from env)
@@ -439,6 +499,15 @@ class Settings(BaseSettings):
                 return [str(item).strip() for item in _json.loads(s)]
             return [p.strip() for p in s.split(",") if p.strip()]
         return [str(item).strip() for item in list(v)]  # type: ignore[arg-type]
+
+    @field_validator("service_role", mode="before")
+    @classmethod
+    def normalize_service_role(cls, v: object) -> str:
+        role = str(v or "all").strip().lower()
+        allowed = {"all", "api", "worker"}
+        if role not in allowed:
+            raise ValueError("service_role must be one of: all, api, worker")
+        return role
 
 
 # Singleton — import this everywhere
