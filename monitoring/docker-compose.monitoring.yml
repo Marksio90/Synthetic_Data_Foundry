@@ -1,0 +1,143 @@
+# docker-compose.monitoring.yml — Observability stack (Grafana + Loki + Tempo + Prometheus)
+# Usage: docker-compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml up
+version: "3.9"
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: foundry-prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - foundry-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: foundry-grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-foundry-admin}"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/foundry-overview.json
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3001:3000"
+    networks:
+      - foundry-net
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: foundry-loki
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    networks:
+      - foundry-net
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: foundry-promtail
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - foundry-net
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    container_name: foundry-tempo
+    volumes:
+      - tempo_data:/tmp/tempo
+    command: -config.file=/etc/tempo.yaml
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+      - "3200:3200"  # Tempo query API
+    networks:
+      - foundry-net
+    restart: unless-stopped
+
+  # NATS (moved from main compose for clarity)
+  nats:
+    image: nats:2.10-alpine
+    container_name: foundry-nats
+    command: "--jetstream --store_dir=/data --max_file_store=10GB"
+    volumes:
+      - nats_data:/data
+    ports:
+      - "4222:4222"
+      - "8222:8222"   # NATS monitoring HTTP
+      - "7777:7777"   # Prometheus metrics
+    networks:
+      - foundry-net
+    restart: unless-stopped
+
+  # Qdrant vector database
+  qdrant:
+    image: qdrant/qdrant:v1.9.4
+    container_name: foundry-qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+    networks:
+      - foundry-net
+    restart: unless-stopped
+
+  # LiteLLM Proxy
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: foundry-litellm
+    volumes:
+      - ./config/litellm_config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--detailed_debug"]
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OLLAMA_URL: "${OLLAMA_URL:-http://ollama:11434}"
+      REDIS_HOST: redis
+      DATABASE_URL: "${DATABASE_URL}"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-foundry-dev-key}"
+    ports:
+      - "4000:4000"
+    networks:
+      - foundry-net
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  tempo_data:
+  nats_data:
+  qdrant_data:
+
+networks:
+  foundry-net:
+    external: true

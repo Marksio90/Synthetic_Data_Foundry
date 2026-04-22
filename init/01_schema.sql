@@ -70,26 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_chunks_valid
     ON directive_chunks (is_superseded, valid_from_date DESC)
     WHERE is_superseded = FALSE;
 
--- IVFFlat ANN index — create only when embeddings exist to avoid low-recall init warning.
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM directive_chunks
-        WHERE embedding IS NOT NULL
-        LIMIT 1
-    ) THEN
-        EXECUTE '
-            CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-            ON directive_chunks
-            USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100)
-        ';
-    ELSE
-        RAISE NOTICE 'Skipping idx_chunks_embedding creation (no embeddings yet).';
-    END IF;
-END;
-$$;
+-- HNSW ANN index — better recall for dynamic inserts, no VACUUM ANALYZE required.
+-- m=16: balanced connectivity; ef_construction=64: build quality vs speed tradeoff.
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding
+    ON directive_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 
 -- GIN trigram index for BM25-like keyword search
 CREATE INDEX IF NOT EXISTS idx_chunks_trgm
@@ -206,6 +192,40 @@ BEGIN
     RETURN rows_updated = 1;
 END;
 $$ LANGUAGE plpgsql;
+
+-- =============================================================================
+-- workflow_cost_ledger: per-workflow LLM cost tracking (FinOps)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS workflow_cost_ledger (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workflow_id     TEXT        NOT NULL,      -- Temporal workflow ID or batch_id
+    agent_name      TEXT        NOT NULL,      -- expert | judge | critic | embed | ...
+    model_name      TEXT        NOT NULL,      -- gpt-4o-mini | qwen2.5:14b | ...
+    model_tier      TEXT        NOT NULL,      -- local | mid | quality | judge
+    prompt_tokens   INTEGER     NOT NULL DEFAULT 0,
+    completion_tokens INTEGER   NOT NULL DEFAULT 0,
+    cost_usd        NUMERIC(12,8) NOT NULL DEFAULT 0,
+    chunk_id        UUID        REFERENCES directive_chunks(id) ON DELETE SET NULL,
+    perspective     TEXT,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cost_ledger_workflow ON workflow_cost_ledger (workflow_id);
+CREATE INDEX IF NOT EXISTS idx_cost_ledger_recorded  ON workflow_cost_ledger (recorded_at DESC);
+
+-- View: daily cost summary per workflow
+CREATE OR REPLACE VIEW v_workflow_daily_cost AS
+SELECT
+    workflow_id,
+    DATE(recorded_at) AS day,
+    SUM(cost_usd)     AS total_cost_usd,
+    SUM(prompt_tokens + completion_tokens) AS total_tokens,
+    COUNT(*)          AS call_count,
+    SUM(cost_usd) FILTER (WHERE model_tier = 'local')   AS local_cost_usd,
+    SUM(cost_usd) FILTER (WHERE model_tier = 'quality') AS quality_cost_usd,
+    SUM(cost_usd) FILTER (WHERE model_tier = 'judge')   AS judge_cost_usd
+FROM workflow_cost_ledger
+GROUP BY workflow_id, DATE(recorded_at);
 
 -- =============================================================================
 -- scout_domain_history: rolling log of domains selected per scout run.

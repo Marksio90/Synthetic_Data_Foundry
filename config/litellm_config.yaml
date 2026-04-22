@@ -1,0 +1,132 @@
+# config/litellm_config.yaml — LiteLLM Proxy model routing configuration
+#
+# Start proxy: litellm --config config/litellm_config.yaml --port 4000
+# Or via Docker: see docker-compose.yml (profile: litellm)
+#
+# Routing tiers:
+#   LOCAL   — Ollama (GPU/CPU, $0/call)   → ~80% of requests
+#   MID     — Claude Haiku 4.5             → ~15% of requests
+#   QUALITY — GPT-4o-mini                  → ~4% of requests (judge)
+#   JUDGE   — Claude Sonnet 4.6            → ~1% of requests (final arbiter)
+#   VISION  — GPT-4o                       → PDF scan fallback only
+
+model_list:
+  # ── LOCAL (Ollama) ────────────────────────────────────────────────────────
+  - model_name: foundry/local
+    litellm_params:
+      model: ollama/qwen2.5:14b
+      api_base: "${OLLAMA_URL}/v1"
+      timeout: 180
+      stream: false
+    model_info:
+      tier: local
+      cost_per_1M_input: 0.0
+      cost_per_1M_output: 0.0
+      max_tokens: 8192
+
+  - model_name: foundry/local-embed
+    litellm_params:
+      model: ollama/nomic-embed-text
+      api_base: "${OLLAMA_URL}/v1"
+      timeout: 30
+    model_info:
+      tier: local
+      cost_per_1M_input: 0.0
+
+  # ── MID TIER (Claude Haiku) ───────────────────────────────────────────────
+  - model_name: foundry/mid
+    litellm_params:
+      model: claude-haiku-4-5-20251001
+      api_key: "${ANTHROPIC_API_KEY}"
+      timeout: 60
+    model_info:
+      tier: mid
+      cost_per_1M_input: 0.8
+      cost_per_1M_output: 4.0
+      max_tokens: 8192
+
+  # ── QUALITY TIER (GPT-4o-mini) ────────────────────────────────────────────
+  - model_name: foundry/quality
+    litellm_params:
+      model: gpt-4o-mini
+      api_key: "${OPENAI_API_KEY}"
+      timeout: 60
+    model_info:
+      tier: quality
+      cost_per_1M_input: 0.15
+      cost_per_1M_output: 0.60
+      max_tokens: 16384
+
+  # ── JUDGE TIER (Claude Sonnet) ────────────────────────────────────────────
+  - model_name: foundry/judge
+    litellm_params:
+      model: claude-sonnet-4-6
+      api_key: "${ANTHROPIC_API_KEY}"
+      timeout: 90
+    model_info:
+      tier: judge
+      cost_per_1M_input: 3.0
+      cost_per_1M_output: 15.0
+      max_tokens: 8192
+
+  # ── VISION (GPT-4o) ───────────────────────────────────────────────────────
+  - model_name: foundry/vision
+    litellm_params:
+      model: gpt-4o
+      api_key: "${OPENAI_API_KEY}"
+      timeout: 120
+    model_info:
+      tier: vision
+      cost_per_1M_input: 5.0
+      cost_per_1M_output: 15.0
+
+  # ── EMBEDDINGS (text-embedding-3-small) ───────────────────────────────────
+  - model_name: foundry/embed
+    litellm_params:
+      model: text-embedding-3-small
+      api_key: "${OPENAI_API_KEY}"
+      dimensions: 1536
+    model_info:
+      tier: quality
+      cost_per_1M_input: 0.02
+
+router_settings:
+  # Routing strategy: cost-optimized with quality fallback
+  routing_strategy: least-busy
+  num_retries: 3
+  request_timeout: 180
+  retry_after: 5
+
+  # Cost-based routing rules
+  routing_rules:
+    - model_name: foundry/auto
+      routing_strategy: cost-based-routing
+      models:
+        - foundry/local     # Try local first ($0)
+        - foundry/mid       # Fall back to Haiku
+        - foundry/quality   # Fall back to GPT-4o-mini
+      fallback: foundry/judge
+
+# Semantic caching (reduces duplicate calls by ~30%)
+cache:
+  type: redis
+  host: "${REDIS_HOST:-redis}"
+  port: 6379
+  ttl: 3600  # 1 hour
+  namespace: "foundry:llm_cache"
+
+# Budget limits (prevent runaway costs)
+litellm_settings:
+  # Hard stop at $50/day across all models
+  max_budget: 50
+  budget_duration: "1d"
+  # Detailed logging for FinOps
+  success_callback: ["langsmith"]  # optional: plug in your observability tool
+  drop_params: true  # ignore unsupported params per model
+
+# Prometheus metrics export
+general_settings:
+  completion_model: foundry/auto
+  master_key: "${LITELLM_MASTER_KEY:-foundry-dev-key}"
+  database_url: "${DATABASE_URL}"
+  store_model_in_db: true

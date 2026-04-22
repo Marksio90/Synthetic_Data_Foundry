@@ -197,6 +197,22 @@ class RunManager:
             # Corrupt snapshot should not break app startup; continue with empty in-memory state.
             self._runs = {}
 
+    def _schedule_redis_persist(self, rec: RunRecord) -> None:
+        """Fire-and-forget Redis persistence — does not block synchronous callers."""
+        try:
+            import asyncio
+            from api.redis_state import get_redis_state
+
+            async def _do() -> None:
+                rs = await get_redis_state()
+                await rs.set_run(rec.run_id, _record_to_dict(rec))
+
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_do())
+        except Exception:
+            pass
+
     def create(self, run_id: str, batch_id: str) -> RunRecord:
         if len(self._runs) >= _MAX_RUNS:
             oldest_run_id = next(iter(self._runs))
@@ -205,6 +221,7 @@ class RunManager:
         self._runs[run_id] = rec
         self._persist_snapshot()
         self._persist_db_record(rec)
+        self._schedule_redis_persist(rec)
         return rec
 
     def get(self, run_id: str) -> Optional[RunRecord]:
@@ -221,6 +238,7 @@ class RunManager:
             rec.ended_at = time.time()
         self._persist_snapshot()
         self._persist_db_record(rec)
+        self._schedule_redis_persist(rec)
 
     def append_log(self, run_id: str, line: str) -> None:
         rec = self._runs.get(run_id)
@@ -232,6 +250,7 @@ class RunManager:
             _parse_progress(rec, line)
             self._persist_snapshot()
             self._persist_db_record(rec)
+            self._schedule_redis_persist(rec)
 
     def list_runs(self) -> list[RunRecord]:
         return list(self._runs.values())

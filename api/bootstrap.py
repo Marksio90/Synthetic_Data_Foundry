@@ -30,12 +30,21 @@ from config.settings import settings
 
 
 def setup_logging() -> logging.Logger:
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO)
+    level = (
+        settings.log_level.upper()
         if hasattr(settings, "log_level")
-        else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        else "INFO"
     )
+    from config.logging_config import configure_logging
+    configure_logging(level=level)
+
+    # Boot OpenTelemetry tracing (no-op if packages not installed)
+    try:
+        from telemetry.tracing import setup_tracing
+        setup_tracing(service_name="foundry-api")
+    except Exception:
+        pass
+
     return logging.getLogger("foundry.api")
 
 
@@ -277,15 +286,21 @@ def configure_middlewares(app: FastAPI, logger: logging.Logger) -> None:
     app.add_middleware(RequestContextMiddleware, logger=logger)
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-    allowed_origins = settings.cors_origins or ["http://localhost:3000", "http://localhost:8501"]
-    allow_credentials = "*" not in allowed_origins
+    _default_origins = ["http://localhost:3000", "http://localhost:8501"]
+    raw_origins: list[str] = settings.cors_origins or _default_origins
+    # Reject wildcard — explicit allowlist only; protects credentialed requests
+    allowed_origins = [o for o in raw_origins if o != "*"] or _default_origins
+    if len(allowed_origins) != len(raw_origins):
+        logger.warning(
+            "CORS: wildcard '*' removed from CORS_ORIGINS — use explicit origins for security."
+        )
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_credentials=allow_credentials,
+        allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
     )
 
 
