@@ -25,12 +25,14 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from agents.calibrator import calibrate
 from agents.doc_analyzer import analyze_documents
 from api.db import get_session
+from api.errors import FailedDependencyError, ServiceUnavailableError
 from api.security import require_admin_api_key, require_admin_api_key_ws
 from api.schemas import (
     AnalysisResponse,
@@ -50,6 +52,7 @@ DATA_DIR = Path(settings.data_dir)
 _PYTHON = sys.executable  # same interpreter as the API
 _RUN_TASKS: dict[str, asyncio.Task] = {}
 _RUN_PROCS: dict[str, asyncio.subprocess.Process] = {}
+_REQUIRED_TABLES = ("source_documents", "directive_chunks")
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +83,69 @@ def _get_calibration_chunks(session: Session, filenames: list[str]) -> list:
     Return up to calibration_samples chunks for auto-calibration.
     Uses existing DB chunks if the documents have already been ingested.
     """
-    chunks = session.scalars(
-        select(DirectiveChunk)
-        .join(SourceDocument, DirectiveChunk.source_doc_id == SourceDocument.id)
-        .where(SourceDocument.filename.in_(filenames))
-        .order_by(DirectiveChunk.created_at)
-        .limit(settings.calibration_samples)
-    ).all()
+    try:
+        chunks = session.scalars(
+            select(DirectiveChunk)
+            .join(SourceDocument, DirectiveChunk.source_doc_id == SourceDocument.id)
+            .where(SourceDocument.filename.in_(filenames))
+            .order_by(DirectiveChunk.created_at)
+            .limit(settings.calibration_samples)
+        ).all()
+    except SQLAlchemyError as exc:
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_query_failed",
+            message="Pipeline database query failed.",
+            details={
+                "hint": "Verify DATABASE_URL connectivity and PostgreSQL schema initialization. "
+                        "Run DB bootstrap/migrations (e.g. init/01_schema.sql) and retry.",
+            },
+        ) from exc
     return list(chunks)
+
+
+def _ensure_pipeline_db_ready(session: Session) -> None:
+    """
+    Preflight: verify DB connectivity + required pipeline tables exist.
+    Raises HTTP 503 with actionable details instead of surfacing raw SQL errors.
+    """
+    try:
+        session.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_unavailable",
+            message="Pipeline database is unavailable.",
+            details={"hint": "Check DATABASE_URL, network reachability, and DB credentials."},
+        ) from exc
+
+    bind = session.get_bind()
+    if bind is None:
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_unavailable",
+            message="Pipeline database bind is unavailable.",
+            details={
+                "hint": "Verify SQLAlchemy session/engine initialization.",
+            },
+        )
+
+    try:
+        db_inspector = inspect(bind)
+        missing_tables = [t for t in _REQUIRED_TABLES if not db_inspector.has_table(t)]
+    except SQLAlchemyError as exc:
+        raise ServiceUnavailableError(
+            error_code="pipeline_db_inspection_failed",
+            message="Unable to inspect pipeline database schema.",
+            details={"hint": "Verify DB permissions and schema availability."},
+        ) from exc
+
+    if missing_tables:
+        raise FailedDependencyError(
+            error_code="pipeline_schema_missing",
+            message="Pipeline schema is not initialized.",
+            details={
+                "missing_tables": missing_tables,
+                "hint": "Apply SQL bootstrap/migrations (init/01_schema.sql) and retry.",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +163,7 @@ def analyze(
     Used by the UI to show the AutoPilot preview before the user clicks Start.
     """
     paths = _resolve_paths(filenames)
+    _ensure_pipeline_db_ready(session)
     analysis = analyze_documents([str(p) for p in paths])
     chunks = _get_calibration_chunks(session, filenames)
     calib = calibrate(chunks)
@@ -145,6 +204,7 @@ async def run_pipeline(
     Returns run_id immediately; poll /status or open /ws for progress.
     """
     paths = _resolve_paths(req.filenames)
+    _ensure_pipeline_db_ready(session)
 
     # Auto-generate batch_id if not provided
     batch_id = req.batch_id or (
