@@ -101,8 +101,34 @@ x-app-env: &app-env
   ADMIN_API_KEY: ${ADMIN_API_KEY:-}
   MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
   CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://localhost:8501"]}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  PIPELINE_QUEUE_BACKEND: ${PIPELINE_QUEUE_BACKEND:-memory}
+  PIPELINE_WORKER_CONCURRENCY: ${PIPELINE_WORKER_CONCURRENCY:-1}
+  PIPELINE_QUEUE_MAXSIZE: ${PIPELINE_QUEUE_MAXSIZE:-100}
+  PIPELINE_MAX_ATTEMPTS: ${PIPELINE_MAX_ATTEMPTS:-3}
+  PIPELINE_REPLAY_TOKEN_BUDGET_MAX: ${PIPELINE_REPLAY_TOKEN_BUDGET_MAX:-50000}
+  PIPELINE_STREAM_BLOCK_MS: ${PIPELINE_STREAM_BLOCK_MS:-2000}
+  PIPELINE_STREAM_CLAIM_IDLE_MS: ${PIPELINE_STREAM_CLAIM_IDLE_MS:-60000}
+  PIPELINE_REPLAY_AUDIT_RETENTION: ${PIPELINE_REPLAY_AUDIT_RETENTION:-1000}
 
 services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: foundry_redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - foundry_net
+    logging: *default-logging
 
   # ---------------------------------------------------------------------------
   # PostgreSQL 16 + pgvector
@@ -192,6 +218,10 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - foundry_net
     logging: *default-logging
@@ -280,12 +310,10 @@ services:
       dockerfile: ../docker/Dockerfile.frontend
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8080
-        NEXT_PUBLIC_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
     container_name: foundry_frontend
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: http://foundry-api:8080
-      NEXT_PUBLIC_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       API_URL: http://foundry-api:8080
     ports:
       - "3000:3000"
@@ -453,6 +481,7 @@ services:
 # =============================================================================
 volumes:
   postgres_data:
+  redis_data:
     driver: local
   hf_cache:
     driver: local
