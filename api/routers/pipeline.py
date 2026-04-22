@@ -68,14 +68,9 @@ _CANCELLED_QUEUED_RUN_IDS: set[str] = set()
 _EXECUTOR_STARTED = False
 _REDIS_CLIENT = None
 _REDIS_QUEUE_KEY = "foundry:pipeline:jobs"
-_REDIS_STREAM_KEY = "foundry:pipeline:stream"
-_REDIS_STREAM_GROUP = "foundry_pipeline_group"
-_REDIS_STREAM_CONSUMER = f"consumer-{os.getpid()}"
 _REDIS_CANCELLED_KEY = "foundry:pipeline:cancelled"
 _REDIS_DLQ_KEY = "foundry:pipeline:deadletter"
-_DEAD_LETTER_JOBS: list[dict[str, object]] = []
-_STREAM_RECLAIMED_TOTAL = 0
-_STREAM_PENDING_LAST = 0
+_DEAD_LETTER_JOBS: list[dict[str, str]] = []
 _REQUIRED_TABLES = ("source_documents", "directive_chunks")
 
 
@@ -93,37 +88,15 @@ class PipelineJob:
     attempt: int = 1
 
 
-@dataclass
-class QueueMessage:
-    job: PipelineJob
-    ack_id: str | None = None
-
-
 def _queue_backend() -> str:
     return (settings.pipeline_queue_backend or "memory").strip().lower()
-
-
-async def _ensure_stream_group(client) -> None:
-    if _queue_backend() != "redis_streams":
-        return
-    try:
-        await client.xgroup_create(
-            name=_REDIS_STREAM_KEY,
-            groupname=_REDIS_STREAM_GROUP,
-            id="0-0",
-            mkstream=True,
-        )
-    except Exception as exc:
-        msg = str(exc).upper()
-        if "BUSYGROUP" not in msg:
-            raise
 
 
 async def _ensure_redis_client():
     global _REDIS_CLIENT
     if _REDIS_CLIENT is not None:
         return _REDIS_CLIENT
-    if _queue_backend() not in ("redis", "redis_streams"):
+    if _queue_backend() != "redis":
         return None
     try:
         from redis.asyncio import Redis  # type: ignore
@@ -133,10 +106,8 @@ async def _ensure_redis_client():
     try:
         client = Redis.from_url(settings.redis_url, decode_responses=True)
         await client.ping()
-        if _queue_backend() == "redis_streams":
-            await _ensure_stream_group(client)
         _REDIS_CLIENT = client
-        logger.info("Pipeline queue backend: %s (%s).", _queue_backend(), settings.redis_url)
+        logger.info("Pipeline queue backend: redis (%s).", settings.redis_url)
     except Exception as exc:
         logger.warning("Redis queue unavailable (%s). Falling back to memory queue.", exc)
         _REDIS_CLIENT = None
@@ -165,8 +136,6 @@ async def _queue_size() -> int:
     client = await _ensure_redis_client()
     if client is not None and _queue_backend() == "redis":
         return int(await client.llen(_REDIS_QUEUE_KEY))
-    if client is not None and _queue_backend() == "redis_streams":
-        return int(await client.xlen(_REDIS_STREAM_KEY))
     return _QUEUE.qsize()
 
 
@@ -175,26 +144,6 @@ async def _dead_letter_count() -> int:
     if client is not None and _queue_backend() == "redis":
         return int(await client.llen(_REDIS_DLQ_KEY))
     return len(_DEAD_LETTER_JOBS)
-
-
-async def _stream_pending_count() -> int:
-    global _STREAM_PENDING_LAST
-    if _queue_backend() != "redis_streams":
-        return 0
-    client = await _ensure_redis_client()
-    if client is None:
-        return 0
-    try:
-        pending = await client.xpending(_REDIS_STREAM_KEY, _REDIS_STREAM_GROUP)
-        if isinstance(pending, dict):
-            _STREAM_PENDING_LAST = int(pending.get("pending", 0))
-        elif isinstance(pending, (list, tuple)) and pending:
-            _STREAM_PENDING_LAST = int(pending[0])
-        else:
-            _STREAM_PENDING_LAST = 0
-    except Exception:
-        _STREAM_PENDING_LAST = 0
-    return _STREAM_PENDING_LAST
 
 
 async def _enqueue_job(job: PipelineJob) -> None:
@@ -206,16 +155,10 @@ async def _enqueue_job(job: PipelineJob) -> None:
             raise asyncio.QueueFull
         await client.rpush(_REDIS_QUEUE_KEY, _job_to_json(job))
         return
-    if client is not None and _queue_backend() == "redis_streams":
-        size = int(await client.xlen(_REDIS_STREAM_KEY))
-        if size >= maxsize:
-            raise asyncio.QueueFull
-        await client.xadd(_REDIS_STREAM_KEY, fields={"data": _job_to_json(job)})
-        return
     _QUEUE.put_nowait(job)
 
 
-async def _dequeue_job() -> QueueMessage:
+async def _dequeue_job() -> PipelineJob:
     client = await _ensure_redis_client()
     if client is not None and _queue_backend() == "redis":
         while True:
@@ -224,61 +167,8 @@ async def _dequeue_job() -> QueueMessage:
                 await asyncio.sleep(0.1)
                 continue
             _, raw = res
-            return QueueMessage(job=_job_from_json(raw), ack_id=None)
-    if client is not None and _queue_backend() == "redis_streams":
-        while True:
-            res = await client.xreadgroup(
-                groupname=_REDIS_STREAM_GROUP,
-                consumername=_REDIS_STREAM_CONSUMER,
-                streams={_REDIS_STREAM_KEY: ">"},
-                count=1,
-                block=2000,
-            )
-            if res:
-                _, messages = res[0]
-                if messages:
-                    message_id, fields = messages[0]
-                    return QueueMessage(job=_job_from_json(fields.get("data", "{}")), ack_id=message_id)
-
-            reclaimed = await _stream_reclaim_one(client)
-            if reclaimed is not None:
-                return reclaimed
-    return QueueMessage(job=await _QUEUE.get(), ack_id=None)
-
-
-async def _stream_reclaim_one(client) -> QueueMessage | None:
-    global _STREAM_RECLAIMED_TOTAL
-    min_idle_ms = 60_000
-    try:
-        res = await client.xautoclaim(
-            name=_REDIS_STREAM_KEY,
-            groupname=_REDIS_STREAM_GROUP,
-            consumername=_REDIS_STREAM_CONSUMER,
-            min_idle_time=min_idle_ms,
-            start_id="0-0",
-            count=1,
-        )
-    except Exception:
-        return None
-
-    messages = []
-    if isinstance(res, (tuple, list)):
-        if len(res) >= 2 and isinstance(res[1], list):
-            messages = res[1]
-    if not messages:
-        return None
-    message_id, fields = messages[0]
-    _STREAM_RECLAIMED_TOTAL += 1
-    return QueueMessage(job=_job_from_json(fields.get("data", "{}")), ack_id=message_id)
-
-
-async def _ack_message(ack_id: str | None) -> None:
-    if ack_id is None or _queue_backend() != "redis_streams":
-        return
-    client = await _ensure_redis_client()
-    if client is None:
-        return
-    await client.xack(_REDIS_STREAM_KEY, _REDIS_STREAM_GROUP, ack_id)
+            return _job_from_json(raw)
+    return await _QUEUE.get()
 
 
 async def _mark_cancelled_queued(run_id: str) -> None:
@@ -307,12 +197,9 @@ async def _clear_cancelled_queued(run_id: str) -> None:
 async def _push_dead_letter(job: PipelineJob, reason: str) -> None:
     payload = {
         "run_id": job.run_id,
-        "attempt": job.attempt,
+        "attempt": str(job.attempt),
         "reason": reason,
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "cmd": job.cmd,
-        "env": job.env,
-        "cwd": job.cwd,
     }
     client = await _ensure_redis_client()
     if client is not None and _queue_backend() == "redis":
@@ -321,61 +208,6 @@ async def _push_dead_letter(job: PipelineJob, reason: str) -> None:
     _DEAD_LETTER_JOBS.append(payload)
     if len(_DEAD_LETTER_JOBS) > 1000:
         del _DEAD_LETTER_JOBS[: len(_DEAD_LETTER_JOBS) - 1000]
-
-
-def _estimate_job_tokens(job: PipelineJob) -> int:
-    max_turns = int(job.env.get("MAX_TURNS", settings.max_turns))
-    generation_max = int(settings.generation_max_tokens)
-    return max_turns * generation_max
-
-
-async def _peek_dead_letter(limit: int = 50) -> list[dict]:
-    client = await _ensure_redis_client()
-    if client is not None and _queue_backend() == "redis":
-        rows = await client.lrange(_REDIS_DLQ_KEY, -limit, -1)
-        out: list[dict] = []
-        for raw in rows:
-            try:
-                out.append(json.loads(raw))
-            except Exception:
-                continue
-        return out
-    return list(_DEAD_LETTER_JOBS[-limit:])
-
-
-async def _pop_dead_letter_for_run(run_id: str) -> PipelineJob | None:
-    client = await _ensure_redis_client()
-    if client is not None and _queue_backend() == "redis":
-        rows = await client.lrange(_REDIS_DLQ_KEY, 0, -1)
-        for raw in rows:
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                continue
-            if payload.get("run_id") != run_id:
-                continue
-            await client.lrem(_REDIS_DLQ_KEY, 1, raw)
-            return PipelineJob(
-                run_id=payload["run_id"],
-                cmd=list(payload.get("cmd", [])),
-                env=dict(payload.get("env", {})),
-                cwd=payload.get("cwd", str(Path(__file__).parent.parent.parent)),
-                attempt=1,
-            )
-        return None
-
-    for idx, payload in enumerate(_DEAD_LETTER_JOBS):
-        if str(payload.get("run_id")) != run_id:
-            continue
-        entry = _DEAD_LETTER_JOBS.pop(idx)
-        return PipelineJob(
-            run_id=str(entry["run_id"]),
-            cmd=list(entry.get("cmd", [])),
-            env=dict(entry.get("env", {})),
-            cwd=str(entry.get("cwd", str(Path(__file__).parent.parent.parent))),
-            attempt=1,
-        )
-    return None
 
 
 async def _ensure_executor_started() -> None:
@@ -395,8 +227,7 @@ async def _ensure_executor_started() -> None:
 async def _queue_worker(worker_idx: int) -> None:
     try:
         while True:
-            msg = await _dequeue_job()
-            job = msg.job
+            job = await _dequeue_job()
             try:
                 _QUEUED_RUN_IDS.discard(job.run_id)
                 if await _is_cancelled_queued(job.run_id):
@@ -428,7 +259,6 @@ async def _queue_worker(worker_idx: int) -> None:
             finally:
                 if _queue_backend() == "memory":
                     _QUEUE.task_done()
-                await _ack_message(msg.ack_id)
     except asyncio.CancelledError:
         return
 
@@ -717,66 +547,14 @@ async def queue_stats() -> dict[str, int | str]:
     """Queue visibility endpoint for operators."""
     queued = await _queue_size()
     dead = await _dead_letter_count()
-    pending = await _stream_pending_count()
     return {
         "backend": _queue_backend(),
         "queued_jobs": queued,
         "dead_letter_jobs": dead,
-        "stream_pending_jobs": pending,
-        "stream_reclaimed_total": _STREAM_RECLAIMED_TOTAL,
         "queued_run_ids": len(_QUEUED_RUN_IDS),
         "cancelled_queued_runs": len(_CANCELLED_QUEUED_RUN_IDS),
         "active_workers": len(_EXECUTOR_WORKERS),
         "running_processes": len(_RUN_PROCS),
-    }
-
-
-@router.get("/deadletter", dependencies=[Depends(require_admin_api_key)])
-async def deadletter_list(limit: int = 50) -> dict[str, object]:
-    limit = max(1, min(limit, 200))
-    entries = await _peek_dead_letter(limit=limit)
-    return {"count": len(entries), "items": entries}
-
-
-@router.post("/deadletter/replay/{run_id}", dependencies=[Depends(require_admin_api_key)])
-async def replay_deadletter(run_id: str) -> dict[str, object]:
-    rec = runs.get(run_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-
-    job = await _pop_dead_letter_for_run(run_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Dead-letter entry not found for run: {run_id}")
-
-    token_estimate = _estimate_job_tokens(job)
-    max_budget = int(settings.pipeline_replay_token_budget_max)
-    if token_estimate > max_budget:
-        await _push_dead_letter(job, f"replay_budget_exceeded:{token_estimate}>{max_budget}")
-        raise HTTPException(
-            status_code=422,
-            detail=f"Replay rejected: estimated token budget {token_estimate} exceeds limit {max_budget}.",
-        )
-
-    rec.error = None
-    runs.update(run_id, status="queued")
-    runs.append_log(run_id, f"[Queue] 🔁 Replay from DLQ queued (estimated_tokens={token_estimate}).")
-
-    try:
-        await _enqueue_job(job)
-        _QUEUED_RUN_IDS.add(run_id)
-    except asyncio.QueueFull as exc:
-        await _push_dead_letter(job, "replay_queue_full")
-        raise ServiceUnavailableError(
-            error_code="pipeline_queue_full",
-            message="Pipeline queue is full.",
-            details={"hint": "Retry replay later or increase queue limits."},
-        ) from exc
-
-    return {
-        "run_id": run_id,
-        "status": "queued",
-        "estimated_tokens": token_estimate,
-        "max_budget": max_budget,
     }
 
 
