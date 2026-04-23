@@ -235,13 +235,24 @@ async def _check_4_cross_source(
         except Exception:
             pass
 
-    # Strategy 3: Wayback Machine CDX archivability check
+    # Strategy 3a: Wayback Machine availability (requires recent snapshot)
     try:
         wb = f"https://archive.org/wayback/available?url={quote_plus(url)}"
         resp = await client.get(wb, timeout=8.0)
         if resp.status_code == 200:
             snap = resp.json().get("archived_snapshots", {}).get("closest", {})
             if snap.get("available"):
+                return True, ""
+    except Exception:
+        pass
+
+    # Strategy 3b: Wayback CDX — any historical crawl suffices (lower bar, catches new regulatory docs)
+    try:
+        cdx = f"https://web.archive.org/cdx/search/cdx?url={quote_plus(url)}&limit=1&output=json&fl=timestamp"
+        resp = await client.get(cdx, timeout=8.0)
+        if resp.status_code == 200:
+            rows = resp.json()
+            if rows and len(rows) > 1:  # row[0] is the header ["timestamp"]
                 return True, ""
     except Exception:
         pass
