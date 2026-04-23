@@ -65,6 +65,8 @@
 #
 # =============================================================================
 
+include:
+  - monitoring/docker-compose.monitoring.yml
 
 x-logging: &default-logging
   driver: "json-file"

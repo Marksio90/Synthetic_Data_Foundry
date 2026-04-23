@@ -1,13 +1,13 @@
-# docker-compose.monitoring.yml — Observability stack (Grafana + Loki + Tempo + Prometheus)
-# Usage: docker-compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml up
-version: "3.9"
+# monitoring/docker-compose.monitoring.yml
+# Included automatically by docker-compose.yml via the `include` directive.
+# All paths are relative to this file's location (monitoring/).
 
 services:
   prometheus:
     image: prom/prometheus:v2.52.0
     container_name: foundry-prometheus
     volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -17,7 +17,7 @@ services:
     ports:
       - "9090:9090"
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
 
   grafana:
@@ -25,7 +25,7 @@ services:
     container_name: foundry-grafana
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-foundry-admin}"
@@ -34,7 +34,7 @@ services:
     ports:
       - "3001:3000"
     networks:
-      - foundry-net
+      - foundry_net
     depends_on:
       - prometheus
       - loki
@@ -50,7 +50,7 @@ services:
     ports:
       - "3100:3100"
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
 
   promtail:
@@ -61,7 +61,7 @@ services:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     command: -config.file=/etc/promtail/config.yml
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
 
   tempo:
@@ -75,10 +75,9 @@ services:
       - "4318:4318"  # OTLP HTTP
       - "3200:3200"  # Tempo query API
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
 
-  # NATS (moved from main compose for clarity)
   nats:
     image: nats:2.10-alpine
     container_name: foundry-nats
@@ -87,13 +86,12 @@ services:
       - nats_data:/data
     ports:
       - "4222:4222"
-      - "8222:8222"   # NATS monitoring HTTP
-      - "7777:7777"   # Prometheus metrics
+      - "8222:8222"
+      - "7777:7777"
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
 
-  # Qdrant vector database
   qdrant:
     image: qdrant/qdrant:v1.9.4
     container_name: foundry-qdrant
@@ -105,10 +103,9 @@ services:
     environment:
       QDRANT__SERVICE__HTTP_PORT: 6333
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
 
-  # Neo4j — knowledge graph backend for KnowledgeGraph agent
   neo4j:
     image: neo4j:5.21-community
     container_name: foundry-neo4j
@@ -122,10 +119,10 @@ services:
       NEO4J_dbms_memory_heap_max__size: "1g"
       NEO4J_dbms_memory_pagecache_size: "512m"
     ports:
-      - "7474:7474"   # Neo4j Browser
-      - "7687:7687"   # Bolt protocol
+      - "7474:7474"
+      - "7687:7687"
     networks:
-      - foundry-net
+      - foundry_net
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
@@ -134,12 +131,11 @@ services:
       retries: 5
       start_period: 30s
 
-  # LiteLLM Proxy
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: foundry-litellm
     volumes:
-      - ./config/litellm_config.yaml:/app/config.yaml:ro
+      - ../config/litellm_config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000", "--detailed_debug"]
     environment:
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
@@ -151,7 +147,7 @@ services:
     ports:
       - "4000:4000"
     networks:
-      - foundry-net
+      - foundry_net
     depends_on:
       - redis
     restart: unless-stopped
@@ -165,7 +161,3 @@ volumes:
   qdrant_data:
   neo4j_data:
   neo4j_logs:
-
-networks:
-  foundry-net:
-    external: true
