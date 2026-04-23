@@ -84,6 +84,19 @@ class CrawlerBase(ABC):
     _CB_THRESHOLD: ClassVar[int] = 5                 # Błędy wyzwalające Circuit Breaker
     _CB_PAUSE_SECONDS: ClassVar[int] = 300           # Czas otwarcia obwodu (Pauza 5 min)
     _KNOWN_BOT_BLOCKED_SOURCES: ClassVar[set[str]] = {"ssrn", "oecd", "epo", "esma"}
+    # Źródła z agresywnym rate-limitingiem — logujemy 429 na poziomie INFO (nie WARNING)
+    # żeby nie zaśmiecać logów w normalnej pracy.
+    _KNOWN_RATE_LIMITED_SOURCES: ClassVar[set[str]] = {"semanticscholar", "esma", "pubmed"}
+
+    # Stan Circuit Breakera współdzielony między instancjami tego samego source_id.
+    # Klucz: source_id → {"errors": int, "paused_until": Optional[datetime]}
+    # Zapobiega sytuacji gdy nowa instancja crawlera resetuje licznik błędów.
+    _SHARED_CB: ClassVar[Dict[str, Dict[str, Any]]] = {}
+
+    # Semafory per-source-id ograniczają równoległe żądania do tego samego API.
+    # Zapobiega masowym błędom 429 gdy wiele query angles odpytuje ten sam endpoint.
+    _SEMAPHORES: ClassVar[Dict[str, asyncio.Semaphore]] = {}
+    _MAX_CONCURRENT: ClassVar[int] = 2  # max równoległych żądań per source
 
     # Domyślne nagłówki Anti-Ban
     _USER_AGENTS = [
@@ -94,16 +107,38 @@ class CrawlerBase(ABC):
     def __init__(self) -> None:
         self.poll_interval: int = self.default_poll_interval
         self.last_seen_id: str = ""          # Znak wodny deduplikacji (aktualizowany przez .crawl())
-        
-        self._consecutive_errors: int = 0
         self._no_new_count: int = 0          # Licznik pustych odpytań (dla Adaptive Polling)
-        self._paused_until: Optional[datetime] = None
-        
+
+        # Inicjalizacja współdzielonego stanu CB dla tego source_id
+        if self.source_id not in self._SHARED_CB:
+            self._SHARED_CB[self.source_id] = {"errors": 0, "paused_until": None}
+
+        # Inicjalizacja semafora dla tego source_id
+        if self.source_id not in self._SEMAPHORES:
+            self._SEMAPHORES[self.source_id] = asyncio.Semaphore(self._MAX_CONCURRENT)
+
         self._etag: str = ""
         self._last_modified: str = ""
-        
+
         # Pobieramy podpięcie pod globalną pulę
         self._http = _get_global_http_client()
+
+    # Właściwości delegujące do współdzielonego stanu CB
+    @property
+    def _consecutive_errors(self) -> int:
+        return self._SHARED_CB[self.source_id]["errors"]
+
+    @_consecutive_errors.setter
+    def _consecutive_errors(self, value: int) -> None:
+        self._SHARED_CB[self.source_id]["errors"] = value
+
+    @property
+    def _paused_until(self) -> Optional[datetime]:
+        return self._SHARED_CB[self.source_id]["paused_until"]
+
+    @_paused_until.setter
+    def _paused_until(self, value: Optional[datetime]) -> None:
+        self._SHARED_CB[self.source_id]["paused_until"] = value
 
     # ------------------------------------------------------------------
     # Interfejs Abstrakcyjny
@@ -186,20 +221,22 @@ class CrawlerBase(ABC):
             resp.raise_for_status()
             return resp
 
-        if _HAS_TENACITY:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(3),
-                # Jitter: Dodanie max 2s odchyłu zapobiega potężnym pętlom wielu crawlerów na raz
-                wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random(0, 2),
-                retry=retry_if_exception_type(
-                    (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException, httpx.ReadError)
-                ),
-                reraise=True,
-            ):
-                with attempt:
-                    resp = await _do()
-        else:
-            resp = await _do()
+        sem = self._SEMAPHORES.get(self.source_id)
+        async with (sem if sem else asyncio.Semaphore(1)):
+            if _HAS_TENACITY:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(3),
+                    # Jitter: Dodanie max 2s odchyłu zapobiega potężnym pętlom wielu crawlerów na raz
+                    wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random(0, 2),
+                    retry=retry_if_exception_type(
+                        (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException, httpx.ReadError)
+                    ),
+                    reraise=True,
+                ):
+                    with attempt:
+                        resp = await _do()
+            else:
+                resp = await _do()
 
         if use_cache_headers:
             self._update_cache(resp.headers)
@@ -233,7 +270,9 @@ class CrawlerBase(ABC):
         if remaining:
             try:
                 if int(remaining) < 5:
-                    logger.warning(
+                    # Znane API z agresywnym RL — DEBUG zamiast WARNING (nie zaśmiecamy logów)
+                    log_fn = logger.debug if self.source_id in self._KNOWN_RATE_LIMITED_SOURCES else logger.warning
+                    log_fn(
                         "[%s] PROVIDER_RATE_LIMITED (low remaining): Pozostało %s zapytań.",
                         self.source_id, remaining,
                         extra={"crawler": self.source_id, "rl_remaining": remaining, "error_code": "PROVIDER_RATE_LIMITED"},
@@ -331,7 +370,9 @@ class CrawlerBase(ABC):
             if status in (403, 404) and self.source_id in self._KNOWN_BOT_BLOCKED_SOURCES:
                 return "PROVIDER_BOT_BLOCKED", "info", f"known-hostile source status={status}"
             if status == 429:
-                return "PROVIDER_RATE_LIMITED", "warning", "HTTP 429 Too Many Requests"
+                # Znane rate-limited API — logujemy na INFO, nie WARNING, by nie zaśmiecać logów
+                severity = "info" if self.source_id in self._KNOWN_RATE_LIMITED_SOURCES else "warning"
+                return "PROVIDER_RATE_LIMITED", severity, "HTTP 429 Too Many Requests"
             if status == 503:
                 return "PROVIDER_RATE_LIMITED", "warning", "HTTP 503 Service Unavailable"
             return "PROVIDER_HTTP_ERROR", "warning", f"HTTP status={status}"

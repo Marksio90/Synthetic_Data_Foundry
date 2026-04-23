@@ -135,6 +135,8 @@ services:
     image: pgvector/pgvector:pg16
     container_name: esg_postgres
     restart: unless-stopped
+    # 30s na checkpoint przed SIGKILL — zapobiega "database was not properly shut down"
+    stop_grace_period: 30s
     environment:
       POSTGRES_DB: esg_foundry
       POSTGRES_USER: ${POSTGRES_USER:-esg_user}

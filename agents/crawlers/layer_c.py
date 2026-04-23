@@ -640,14 +640,16 @@ class OurWorldInDataCrawler(CrawlerBase):
     async def crawl(self, query: str) -> list[ScoutSource]:
         sources: list[ScoutSource] = []
 
-        # OWID posts/articles via their public Algolia API
+        # OWID posts/articles via their public Algolia API.
+        # Algolia DNS może być niedostępne w środowiskach bez pełnego dostępu do sieci —
+        # łapiemy błąd i przechodzimy do GitHub fallback zamiast propagować wyjątek.
         algolia_url = (
             "https://yh72u0qfh9-dsn.algolia.net/1/indexes/owid_prod"
             f"/query?query={quote_plus(query)}&hitsPerPage=8"
         )
-        resp = await self._fetch(algolia_url, use_cache_headers=False)
-        if resp.status_code == 200:
-            try:
+        try:
+            resp = await self._fetch(algolia_url, use_cache_headers=False)
+            if resp.status_code == 200:
                 data = resp.json()
                 hits = data.get("hits", [])
                 for hit in hits[:8]:
@@ -666,8 +668,9 @@ class OurWorldInDataCrawler(CrawlerBase):
                     ))
                 if sources:
                     return sources
-            except Exception:
-                pass
+        except Exception:
+            # Algolia niedostępne — próbujemy GitHub fallback
+            pass
 
         # Fallback: OWID GitHub data catalog (curated datasets index)
         gh_url = (
@@ -675,13 +678,13 @@ class OurWorldInDataCrawler(CrawlerBase):
             f"?q={quote_plus(query)}+repo:owid/owid-datasets+extension:csv"
             "&sort=indexed&order=desc&per_page=8"
         )
-        resp2 = await self._fetch(
-            gh_url,
-            headers={"Accept": "application/vnd.github.v3+json"},
-            use_cache_headers=False,
-        )
-        if resp2.status_code == 200:
-            try:
+        try:
+            resp2 = await self._fetch(
+                gh_url,
+                headers={"Accept": "application/vnd.github.v3+json"},
+                use_cache_headers=False,
+            )
+            if resp2.status_code == 200:
                 data = resp2.json()
                 for item in data.get("items", [])[:8]:
                     link = item.get("html_url", "")
@@ -694,8 +697,8 @@ class OurWorldInDataCrawler(CrawlerBase):
                         verified="github.com/owid" in link,
                         source_tier="A",
                     ))
-            except Exception:
-                pass
+        except Exception:
+            pass
         return sources[:8]
 
 
