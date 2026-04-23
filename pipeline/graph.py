@@ -338,6 +338,24 @@ def _run_async(coro) -> None:
         asyncio.run(coro)
 
 
+def _run_async_capturing(coro):
+    """Run an async coroutine from a sync context and return the result.
+
+    Uses a ThreadPoolExecutor so we never block the event loop when one is running.
+    Falls back to asyncio.run() when there is no event loop.
+    """
+    import asyncio
+    import concurrent.futures
+    try:
+        asyncio.get_running_loop()
+        # We're inside an event loop — run in a fresh thread to avoid nesting.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result(timeout=15.0)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
 @with_telemetry("self_improving_loop")
 def self_improving_loop_node(state: FoundryState) -> dict:
     """After each written sample, nudge calibration parameters from quality signals."""
@@ -352,10 +370,9 @@ def self_improving_loop_node(state: FoundryState) -> dict:
     }
     workflow_id = state.get("batch_id") or state.get("chunk", {}).get("id", "unknown")
     try:
-        loop = get_self_improving_loop(db_url=getattr(settings, "async_database_url", None))
-        import asyncio
-        _run_async(
-            loop.run_cycle(
+        sil = get_self_improving_loop(db_url=getattr(settings, "async_database_url", None))
+        adapted = _run_async_capturing(
+            sil.run_cycle(
                 workflow_id=workflow_id,
                 weakness_report=weakness_report,
                 current_quality_threshold=float(settings.quality_threshold),
@@ -363,9 +380,53 @@ def self_improving_loop_node(state: FoundryState) -> dict:
                 current_max_turns=int(settings.max_turns),
             )
         )
+        if adapted is not None:
+            # Apply scalar calibration immediately so the next chunk uses updated params.
+            settings.quality_threshold = adapted.quality_threshold
+            settings.adversarial_ratio = adapted.adversarial_ratio
+            settings.max_turns = adapted.max_turns
+            logger.info(
+                "[SIL] Calibration updated: qt=%.3f ar=%.3f turns=%d (cycle=%s)",
+                adapted.quality_threshold, adapted.adversarial_ratio,
+                adapted.max_turns, adapted.cycle_id,
+            )
     except Exception as exc:
         logger.warning("[SelfImprovingLoop] Skipped for workflow=%s: %s", workflow_id, exc)
     return {}
+
+
+_SIL_KEY_TO_PERSPECTIVE: Dict[str, str] = {
+    "regulatory": "regulator",
+    "financial": "cfo",
+    "risk": "audytor",
+    "esg_data": "analityk",
+    "cross_reference": "akademik",
+    "practical": "dziennikarz",
+    "critical": "prawnik",
+    "forward_looking": "inwestor",
+}
+
+
+def get_weighted_perspectives(base_perspectives: list) -> list:
+    """Return perspectives sorted by training priority using SIL's last_perspective_weights.
+
+    Perspectives with lower SIL weight have weaker dataset coverage and are sorted to the
+    front so they receive more training samples in the next batch.
+    Call this before distributing work across perspective workers.
+    """
+    try:
+        sil = get_self_improving_loop()
+        pw = sil.last_perspective_weights
+        if not pw:
+            return list(base_perspectives)
+        # Reverse-map SIL keys to simulator perspective names, lower weight = higher priority
+        perspective_priority: Dict[str, float] = {}
+        for sil_key, pname in _SIL_KEY_TO_PERSPECTIVE.items():
+            perspective_priority[pname] = pw.get(sil_key, 1.0)
+        return sorted(base_perspectives, key=lambda p: perspective_priority.get(p, 1.0))
+    except Exception as exc:
+        logger.debug("[get_weighted_perspectives] Fallback to default order: %s", exc)
+        return list(base_perspectives)
 
 
 def make_unresolvable_node(session: Session) -> Callable:

@@ -134,6 +134,79 @@ def _extract_snippet(text: str, start: int, end: int, window: int = 100) -> str:
     return text[s:e].replace("\n", " ").strip()
 
 
+# Alias map: surface form (lowercase) → canonical name.
+# Ensures that spelling variants map to a single graph node.
+_ENTITY_ALIASES: dict[str, str] = {
+    # CSRD
+    "corporate sustainability reporting directive": "CSRD",
+    "csrd": "CSRD",
+    # SFDR
+    "sustainable finance disclosure regulation": "SFDR",
+    "sfdr": "SFDR",
+    # CSDDD
+    "corporate sustainability due diligence directive": "CSDDD",
+    "cs3d": "CSDDD",
+    "csddd": "CSDDD",
+    # EU Taxonomy
+    "taxonomy regulation": "EU Taxonomy",
+    "eu taxonomy regulation": "EU Taxonomy",
+    "taxonomy": "EU Taxonomy",
+    # NFRD
+    "non-financial reporting directive": "NFRD",
+    "nfrd": "NFRD",
+    # TCFD
+    "task force on climate-related financial disclosures": "TCFD",
+    "tcfd": "TCFD",
+    # GRI
+    "global reporting initiative": "GRI",
+    "gri": "GRI",
+    # SASB
+    "sustainability accounting standards board": "SASB",
+    "sasb": "SASB",
+    # ESRS
+    "european sustainability reporting standards": "ESRS",
+    "esrs": "ESRS",
+    # TNFD
+    "taskforce on nature-related financial disclosures": "TNFD",
+    "tnfd": "TNFD",
+    # CDP
+    "carbon disclosure project": "CDP",
+    "cdp": "CDP",
+    # SDG
+    "sustainable development goals": "SDG",
+    "sdg": "SDG",
+    "un global compact": "UNGC",
+    "united nations global compact": "UNGC",
+    "ungc": "UNGC",
+    # EU AI Act
+    "eu ai act": "EU AI Act",
+    "artificial intelligence act": "EU AI Act",
+    # MiFID
+    "markets in financial instruments directive": "MiFID II",
+    "mifid ii": "MiFID II",
+    "mifid": "MiFID II",
+    # Solvency
+    "solvency ii": "Solvency II",
+}
+
+
+def _canonicalize(name: str) -> str:
+    """Map a surface entity name to its canonical form.
+
+    Lookup order:
+    1. Exact lowercase match in _ENTITY_ALIASES.
+    2. If ≤ 6 alpha chars → uppercase acronym (e.g. 'esrs' → 'ESRS').
+    3. Otherwise → title-case.
+    """
+    stripped = name.strip()
+    lower = stripped.lower()
+    if lower in _ENTITY_ALIASES:
+        return _ENTITY_ALIASES[lower]
+    if len(stripped) <= 6 and stripped.replace("-", "").isalpha():
+        return stripped.upper()
+    return stripped
+
+
 class KnowledgeGraph:
     """
     Cross-document entity–relationship graph.
@@ -193,7 +266,7 @@ class KnowledgeGraph:
         seen: set = set()
 
         def _add(name: str, etype: str, start: int = 0, end: int = 0) -> None:
-            norm = name.strip()
+            norm = _canonicalize(name)
             if not norm or len(norm) < 2:
                 return
             key = f"{norm.upper()}|{etype}"
@@ -386,11 +459,12 @@ class KnowledgeGraph:
         return data
 
     def find_cross_document_links(self, entity_name: str) -> List[dict]:
-        """Find all documents that mention a given entity."""
+        """Find all documents that mention a given entity (matches canonical and surface forms)."""
+        canon = _canonicalize(entity_name)
         results = []
         seen_docs: set = set()
         for eid, ent in self._entities.items():
-            if ent.name.lower() == entity_name.lower() and ent.source_doc not in seen_docs:
+            if (ent.name.lower() == entity_name.lower() or ent.name == canon) and ent.source_doc not in seen_docs:
                 seen_docs.add(ent.source_doc)
                 results.append({
                     "doc_id": ent.source_doc,

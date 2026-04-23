@@ -184,6 +184,18 @@ def constitutional_revision(state: FoundryState) -> Dict[str, Any]:
     if is_adversarial or not answer or len(answer.strip()) < 30:
         return {}
 
+    # Adaptacyjny trigger: pomiń rewizję jeśli poprzedni quality_score przekracza próg.
+    # Na pierwszym przebiegu quality_score = 0.0 → zawsze rewizuj.
+    # Na kolejnych turnach multi-turn: rewizja pomijana dla już-dobrych odpowiedzi.
+    prior_score = state.get("quality_score", 0.0)
+    skip_above = getattr(settings, "constitutional_ai_skip_above", 1.01)
+    if 0.0 < prior_score >= skip_above:
+        logger.debug(
+            "[Constitutional:%s] Pominięto rewizję: prior_score=%.2f >= skip_above=%.2f",
+            chunk_id_short, prior_score, skip_above,
+        )
+        return {}
+
     # Ochrona Okna Kontekstowego
     context_parts = state.get("retrieved_context", [state.get("chunk", {}).get("content", "")])
     raw_context = "\n---\n".join(context_parts)
