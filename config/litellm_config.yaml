@@ -19,7 +19,8 @@ model_list:
       timeout: 180
       stream: false
     model_info:
-      tier: local
+      mode: chat
+      tier: free
       cost_per_1M_input: 0.0
       cost_per_1M_output: 0.0
       max_tokens: 8192
@@ -30,7 +31,8 @@ model_list:
       api_base: "${OLLAMA_URL}/v1"
       timeout: 30
     model_info:
-      tier: local
+      mode: embedding
+      tier: free
       cost_per_1M_input: 0.0
 
   # ── MID TIER (Claude Haiku) ───────────────────────────────────────────────
@@ -40,7 +42,8 @@ model_list:
       api_key: "${ANTHROPIC_API_KEY}"
       timeout: 60
     model_info:
-      tier: mid
+      mode: chat
+      tier: paid
       cost_per_1M_input: 0.8
       cost_per_1M_output: 4.0
       max_tokens: 8192
@@ -52,7 +55,8 @@ model_list:
       api_key: "${OPENAI_API_KEY}"
       timeout: 60
     model_info:
-      tier: quality
+      mode: chat
+      tier: paid
       cost_per_1M_input: 0.15
       cost_per_1M_output: 0.60
       max_tokens: 16384
@@ -64,7 +68,8 @@ model_list:
       api_key: "${ANTHROPIC_API_KEY}"
       timeout: 90
     model_info:
-      tier: judge
+      mode: chat
+      tier: paid
       cost_per_1M_input: 3.0
       cost_per_1M_output: 15.0
       max_tokens: 8192
@@ -76,7 +81,8 @@ model_list:
       api_key: "${OPENAI_API_KEY}"
       timeout: 120
     model_info:
-      tier: vision
+      mode: chat
+      tier: paid
       cost_per_1M_input: 5.0
       cost_per_1M_output: 15.0
 
@@ -87,7 +93,8 @@ model_list:
       api_key: "${OPENAI_API_KEY}"
       dimensions: 1536
     model_info:
-      tier: quality
+      mode: embedding
+      tier: paid
       cost_per_1M_input: 0.02
 
 router_settings:
