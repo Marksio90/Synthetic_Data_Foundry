@@ -119,17 +119,25 @@ async def _completion_via_proxy(
         )
         r.raise_for_status()
         data = r.json()
+        # LiteLLM proxy injects cost (USD) into this response header.
+        header_cost = r.headers.get("x-litellm-response-cost")
 
     text = data["choices"][0]["message"]["content"]
-    usage = data.get("usage", {})
-    # Proxy returns x-litellm-response-cost header
-    cost_cents = float(data.get("_response_ms", 0)) * 0.0  # placeholder
-    # More precise: use usage tokens × known cost
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
-    # Cost from proxy metadata if available
-    cost_usd = data.get("usage", {}).get("_cost", 0.0) or 0.0
-    cost_cents = cost_usd * 100
+
+    if header_cost is not None:
+        cost_cents = float(header_cost) * 100
+    else:
+        usage = data.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        if model in _FALLBACK_COSTS:
+            c_in, c_out = _FALLBACK_COSTS[model]
+            cost_cents = (
+                (prompt_tokens / 1_000_000) * c_in * 100
+                + (completion_tokens / 1_000_000) * c_out * 100
+            )
+        else:
+            cost_cents = 0.0
 
     return text, cost_cents
 
