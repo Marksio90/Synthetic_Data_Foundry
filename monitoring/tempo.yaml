@@ -24,10 +24,6 @@ compactor:
     block_retention: 168h  # 7 dni
     compacted_block_retention: 10m
 
-querier:
-  frontend_worker:
-    frontend_address: localhost:9095
-
 storage:
   trace:
     backend: local

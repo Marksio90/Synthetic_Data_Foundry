@@ -132,9 +132,9 @@ services:
     environment:
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-foundry-neo4j}"
       NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_dbms_memory_heap_initial__size: "512m"
-      NEO4J_dbms_memory_heap_max__size: "1g"
-      NEO4J_dbms_memory_pagecache_size: "512m"
+      NEO4J_server_memory_heap_initial__size: "512m"
+      NEO4J_server_memory_heap_max__size: "1g"
+      NEO4J_server_memory_pagecache_size: "512m"
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -159,8 +159,6 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OLLAMA_URL: "${OLLAMA_URL:-http://ollama:11434}"
       REDIS_HOST: redis
-      # Prisma wymaga formatu postgresql:// (nie postgresql+psycopg2://)
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-esg_user}:${POSTGRES_PASSWORD}@postgres:5432/esg_foundry"
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-foundry-dev-key}"
     ports:
       - "4000:4000"
@@ -168,7 +166,6 @@ services:
       - foundry_net
     depends_on:
       - redis
-      - postgres
     restart: unless-stopped
 
 volumes:
