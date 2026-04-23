@@ -101,16 +101,33 @@ Zwróć JSON:
 class CriticAgent:
     """
     Selective critique agent. Operates on completed pipeline outputs.
-    Thread-safe via stateless design (no shared mutable state).
+    The base selective rate adapts dynamically based on observed rejection rate —
+    when quality drops, more samples are critiqued to surface weaknesses faster.
     """
+
+    def __init__(self) -> None:
+        self._total_seen: int = 0
+        self._total_below_threshold: int = 0
+
+    @property
+    def effective_selective_rate(self) -> float:
+        """Current critique rate for above-threshold samples, scaled by rejection rate."""
+        if self._total_seen < 10:
+            return _SELECTIVE_RATE
+        rejection_rate = self._total_below_threshold / self._total_seen
+        # Scale linearly: rejection_rate=0 → 0.5× base, rejection_rate=0.3 → 2× base
+        return min(_SELECTIVE_RATE * (1.0 + 2.0 * rejection_rate), 0.80)
 
     def should_critique(self, quality_score: float) -> bool:
         """
-        Decision rule: always critique low-quality, selectively critique good quality.
+        Decision rule: always critique low-quality, adaptively sample high-quality.
+        Rate increases automatically as rejection rate rises.
         """
+        self._total_seen += 1
         if quality_score < _SELECTIVE_MIN_SCORE:
+            self._total_below_threshold += 1
             return True  # always critique borderline/poor quality
-        return random.random() < _SELECTIVE_RATE  # 20% of high-quality samples
+        return random.random() < self.effective_selective_rate
 
     def critique_sample(
         self,

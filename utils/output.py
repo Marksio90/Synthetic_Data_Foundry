@@ -122,6 +122,23 @@ class JSONLWriter:
             
         return False
 
+    @staticmethod
+    def _validate_messages(messages: list[dict]) -> Optional[str]:
+        """Return an error description if messages violate the ChatML schema, else None."""
+        _VALID_ROLES = frozenset({"system", "user", "assistant"})
+        if not messages:
+            return "pusta lista messages"
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                return f"messages[{i}] nie jest słownikiem: {type(msg)}"
+            role = msg.get("role")
+            if role not in _VALID_ROLES:
+                return f"messages[{i}] ma nieprawidłową rolę: {role!r}"
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                return f"messages[{i}] ma pustą lub brakującą treść (role={role!r})"
+        return None
+
     def write_conversation(
         self, messages: list[dict], metadata: Optional[dict] = None
     ) -> tuple[int, Optional[str]]:
@@ -129,6 +146,11 @@ class JSONLWriter:
         Zapisuje wieloturową rozmowę jako rekord JSONL.
         Zwraca: (indeks_rekordu, watermark_hash) lub (-1, None) w przypadku pominięcia.
         """
+        schema_error = self._validate_messages(messages)
+        if schema_error:
+            logger.warning("SFT Writer: pominięto rekord — błąd schematu: %s", schema_error)
+            return -1, None
+
         with self._lock:
             if self._is_refusal_capped(messages):
                 logger.debug("Refusal cap reached — skipping record")

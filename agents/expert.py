@@ -12,9 +12,10 @@ Rozszerzenia PRO:
 
 from __future__ import annotations
 
+import html
 import logging
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import openai
 import tiktoken
@@ -361,6 +362,48 @@ def _call_vllm(system: str, user: str) -> str:
     ])
 
 
+# ---------------------------------------------------------------------------
+# Cross-Encoder Re-ranking (optional, gated by settings.cross_encoder_model)
+# ---------------------------------------------------------------------------
+_cross_encoder: Optional[object] = None
+_cross_encoder_loaded: bool = False
+
+
+def _get_cross_encoder() -> Optional[object]:
+    """Lazy-load cross-encoder model. Returns None when unavailable or not configured."""
+    global _cross_encoder, _cross_encoder_loaded
+    if _cross_encoder_loaded:
+        return _cross_encoder
+    _cross_encoder_loaded = True
+    model_name = getattr(settings, "cross_encoder_model", "")
+    if not model_name:
+        return None
+    try:
+        from sentence_transformers import CrossEncoder  # type: ignore
+        _cross_encoder = CrossEncoder(model_name)
+        logger.info("Cross-encoder reranker załadowany: %s", model_name)
+    except Exception as exc:
+        logger.warning("CrossEncoder niedostępny (%s) — re-ranking wyłączony", exc)
+    return _cross_encoder
+
+
+def _rerank_chunks(question: str, chunks: list, top_k: int) -> list:
+    """Re-rank candidate chunks using cross-encoder, fall back to original order."""
+    ce = _get_cross_encoder()
+    if ce is None or not chunks:
+        return chunks[:top_k]
+    try:
+        pairs = [(question, c.content[:512]) for c in chunks]
+        scores = ce.predict(pairs)
+        ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
+        reranked = [c for _, c in ranked[:top_k]]
+        logger.debug("[RAG] Re-ranking: %d → %d chunków", len(chunks), len(reranked))
+        return reranked
+    except Exception as exc:
+        logger.warning("[RAG] Re-ranking failed (%s) — używam oryginalnej kolejności", exc)
+        return chunks[:top_k]
+
+
 # =============================================================================
 # WĘZEŁ 1: RETRIEVAL (Hybrydowy RAG z Adaptacyjnym Rozmiarem)
 # =============================================================================
@@ -402,22 +445,28 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
                 bm25_weight = bm25_weight / weight_sum
 
         query_embedding, emb_cost = _embed_query(question)
+        # Fetch more candidates when re-ranking is active so cross-encoder has a richer pool
+        fetch_k = top_k * 3 if getattr(settings, "cross_encoder_model", "") else top_k
         chunks = repo.hybrid_search(
             session,
             query_embedding=query_embedding,
             query_text=question,
-            top_k=top_k,
+            top_k=fetch_k,
             diversify_by_section=is_retry,
             vector_weight=vector_weight,
             bm25_weight=bm25_weight,
         )
-        
-        # Wprowadzenie XML Tagging dla silniejszego trzymania kontekstu
+
+        # Optional cross-encoder re-ranking (shrinks candidate pool back to top_k)
+        chunks = _rerank_chunks(question, chunks, top_k)
+
+        # XML Tagging — escape special chars so document tags stay well-formed
         context_texts = []
         for idx, c in enumerate(chunks, 1):
             source_id = str(c.id)[:8]
-            context_texts.append(f"<document index=\"{idx}\" ref=\"{source_id}\">\n{c.content.strip()}\n</document>")
-            
+            safe_content = html.escape(c.content.strip(), quote=False)
+            context_texts.append(f"<document index=\"{idx}\" ref=\"{source_id}\">\n{safe_content}\n</document>")
+
         context_ids = [str(c.id) for c in chunks]
         logger.debug(
             "[RAG] Pobrano %d fragmentów. typ=%s vec_w=%.2f bm25_w=%.2f koszt_embed=%.4f¢",
@@ -427,11 +476,12 @@ def retrieve_context(state: FoundryState, session: Session) -> dict:
             bm25_weight,
             emb_cost,
         )
-        
+
     except Exception as exc:
         logger.error(f"RAG retrieval failed: {exc}", exc_info=True)
         # Fallback do bazowego chunka
-        context_texts = [f"<document index=\"0\" ref=\"base\">\n{state['chunk']['content']}\n</document>"]
+        safe_fallback = html.escape(state['chunk']['content'], quote=False)
+        context_texts = [f"<document index=\"0\" ref=\"base\">\n{safe_fallback}\n</document>"]
         context_ids = [state["chunk"]["id"]]
 
     return {"retrieved_context": context_texts, "retrieved_ids": context_ids}
@@ -457,8 +507,9 @@ def generate_answer(state: FoundryState) -> dict:
         perspective, _EXPERT_SYSTEM_BY_PERSPECTIVE["cfo"]
     )
 
-    # Złożenie bloków w formacie XML
-    context_parts = [f"<document index=\"0\" ref=\"główny_wątek\">\n{chunk['content']}\n</document>"]
+    # Złożenie bloków w formacie XML — escape special chars in base chunk content
+    safe_chunk_content = html.escape(chunk['content'], quote=False)
+    context_parts = [f"<document index=\"0\" ref=\"główny_wątek\">\n{safe_chunk_content}\n</document>"]
     # Zwiększony limit referencji (6) dzięki lepszemu parsowaniu XML
     for ctx in retrieved[:6]:   
         if ctx not in context_parts:

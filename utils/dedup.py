@@ -168,3 +168,69 @@ class MinHashDeduplicator:
     def size(self) -> int:
         """Liczba sygnatur w indeksie."""
         return len(self._signatures)
+
+
+class SemanticDeduplicator:
+    """
+    Embedding-based semantic duplicate detector (Stage 4 of the dedup pipeline).
+
+    Catches paraphrases that share similar meaning but differ in surface form —
+    not caught by MinHash LSH. Uses cosine similarity on dense text embeddings.
+
+    Controlled by settings.semantic_dedup_enabled and settings.semantic_dedup_threshold.
+
+    Usage (inject embed_fn to avoid circular imports):
+        from agents.expert import embed_batch
+
+        def _embed(texts):
+            vecs, _ = embed_batch(texts)
+            return vecs
+
+        dedup = SemanticDeduplicator(embed_fn=_embed)
+        if dedup.is_duplicate("Co CSRD nakłada na spółki?"):
+            skip ...
+    """
+
+    def __init__(
+        self,
+        threshold: float = 0.88,
+        embed_fn=None,
+        max_history: int = 5000,
+    ) -> None:
+        self._threshold = threshold
+        self._embed_fn = embed_fn
+        self._embeddings: list[list[float]] = []
+        self._max_history = max_history
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def is_duplicate(self, text: str) -> bool:
+        """Return True if a semantically similar text was seen before; register otherwise."""
+        if self._embed_fn is None:
+            return False
+        try:
+            vec = self._embed_fn([text])[0]
+        except Exception as exc:
+            logger.debug("SemanticDeduplicator: embed failed (%s)", exc)
+            return False
+        with self._lock:
+            for existing in self._embeddings:
+                if self._cosine(vec, existing) >= self._threshold:
+                    return True
+            # Not a duplicate — register
+            self._embeddings.append(vec)
+            if len(self._embeddings) > self._max_history:
+                self._embeddings.pop(0)
+        return False
+
+    @property
+    def size(self) -> int:
+        return len(self._embeddings)

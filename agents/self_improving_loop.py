@@ -42,10 +42,10 @@ _ADVERSARIAL_MAX = 0.35
 _MAX_TURNS_MIN = 1
 _MAX_TURNS_MAX = 8
 
-# EMA smoothing factor (0 = no update, 1 = full step)
+# EMA smoothing factor — overridden at runtime by settings.sil_ema_alpha
 _EMA_ALPHA = 0.3
 
-# Consecutive regression cycles before hard reset
+# Consecutive regression cycles before hard reset — overridden by settings.sil_regression_limit
 _REGRESSION_LIMIT = 3
 
 
@@ -112,6 +112,7 @@ class SelfImprovingLoop:
         self._history: List[ImprovementRecord] = []
         self._regression_streak = 0
         self._prev_avg_quality: Optional[float] = None
+        self.last_perspective_weights: Dict[str, float] = {}
         self._db_available = False
         self._pool = None
 
@@ -198,16 +199,20 @@ class SelfImprovingLoop:
     # ── Core adjustment logic ──────────────────────────────────────────────────
 
     def _ema(self, old: float, new_target: float) -> float:
-        return old + _EMA_ALPHA * (new_target - old)
+        from config.settings import settings as _s
+        alpha = getattr(_s, "sil_ema_alpha", _EMA_ALPHA)
+        return old + alpha * (new_target - old)
 
     def _detect_regression(self, avg_quality: float) -> bool:
-        """Returns True if quality has been declining for _REGRESSION_LIMIT cycles."""
+        """Returns True if quality has been declining for sil_regression_limit cycles."""
+        from config.settings import settings as _s
+        limit = getattr(_s, "sil_regression_limit", _REGRESSION_LIMIT)
         if self._prev_avg_quality is not None and avg_quality < self._prev_avg_quality - 0.02:
             self._regression_streak += 1
         else:
             self._regression_streak = 0
         self._prev_avg_quality = avg_quality
-        return self._regression_streak >= _REGRESSION_LIMIT
+        return self._regression_streak >= limit
 
     def _safe_defaults(self) -> AdaptedCalibration:
         self._regression_streak = 0
@@ -394,6 +399,9 @@ class SelfImprovingLoop:
             reasoning=adapted.reasoning,
         )
         await self._persist_record(record)
+
+        # Cache perspective_weights so graph.py can consume them without re-running the loop
+        self.last_perspective_weights = adapted.perspective_weights or {}
 
         return adapted
 

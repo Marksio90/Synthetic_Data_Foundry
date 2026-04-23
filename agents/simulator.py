@@ -386,6 +386,18 @@ def simulate_question(state: FoundryState) -> Dict[str, Any]:
     perspective = state.get("perspective", "cfo")
     is_adversarial = random.random() < getattr(settings, "adversarial_ratio", 0.1)
 
+    # Log SIL perspective weight for observability (weights shift over time as weaknesses are detected)
+    try:
+        from agents.self_improving_loop import get_self_improving_loop
+        from pipeline.graph import _SIL_KEY_TO_PERSPECTIVE
+        _inv = {v: k for k, v in _SIL_KEY_TO_PERSPECTIVE.items()}
+        sil_key = _inv.get(perspective, perspective)
+        _pw = get_self_improving_loop().last_perspective_weights
+        if _pw:
+            logger.debug("[Simulator] perspective=%s sil_weight=%.2f", perspective, _pw.get(sil_key, 1.0))
+    except Exception:
+        pass
+
     prompts = _ADVERSARIAL_PROMPTS if is_adversarial else _NORMAL_PROMPTS
     base_system = prompts.get(perspective, prompts["cfo"])
 

@@ -81,9 +81,10 @@ class JudgeDetails(BaseModel):
         )
         
         if self.has_hallucination:
-            # Bezwzględna kara za halucynację
-            self.overall_score = min(calculated_score - 0.3, 0.3)
-            logger.debug(f"Pydantic Validator: Aplikacja kary za halucynację. Score obniżony do {self.overall_score:.2f}")
+            # Bezwzględna kara za halucynację (konfigurowana przez settings.hallucination_penalty)
+            _penalty = settings.hallucination_penalty
+            self.overall_score = max(0.0, min(calculated_score - _penalty, 1.0 - _penalty))
+            logger.debug(f"Pydantic Validator: Aplikacja kary za halucynację (penalty={_penalty}). Score obniżony do {self.overall_score:.2f}")
         else:
             # Wygładzenie ewentualnych błędów zaokrągleń modelu
             self.overall_score = min(max(calculated_score, 0.0), 1.0)

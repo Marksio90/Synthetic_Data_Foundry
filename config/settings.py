@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     # Pipeline behaviour
     # ------------------------------------------------------------------
     adversarial_ratio: float = Field(0.10, ge=0.0, le=1.0)
-    quality_threshold: float = Field(0.75, ge=0.0, le=1.0)
+    quality_threshold: float = Field(0.82, ge=0.0, le=1.0)
     max_retries_per_chunk: int = Field(3, ge=1)
     max_turns: int = Field(3, ge=1, le=5)
     max_refusal_ratio: float = Field(0.10, ge=0.0, le=1.0)
@@ -173,6 +173,77 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Próg pewności sędziego → eskalacja na model fallback. Różny od quality_threshold.",
+    )
+    hallucination_penalty: float = Field(
+        0.30,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "Kara odejmowana od score gdy wykryto halucynację (judge.py). "
+            "Domyślnie 0.30 — wynik z halucynacją nie może przekroczyć 1.0 - penalty."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Self-improving loop tuning
+    # ------------------------------------------------------------------
+    sil_ema_alpha: float = Field(
+        0.30,
+        ge=0.01,
+        le=0.99,
+        description="Współczynnik EMA dla wygładzania zmian kalibracji (self_improving_loop). 0.30 = 30% nowej wartości.",
+    )
+    sil_regression_limit: int = Field(
+        3,
+        ge=1,
+        le=10,
+        description="Liczba kolejnych regresji jakości przed hard-resetem kalibracji.",
+    )
+
+    # ------------------------------------------------------------------
+    # Semantic dedup (Stage 4 w MinHashDeduplicator)
+    # ------------------------------------------------------------------
+    semantic_dedup_enabled: bool = Field(
+        False,
+        description="Włącz warstwę semantycznego dedup pytań (embedding cosine) ponad MinHash LSH. Opt-in — wymaga embed API.",
+    )
+    semantic_dedup_threshold: float = Field(
+        0.88,
+        ge=0.70,
+        le=1.0,
+        description="Próg cosine similarity do wykrywania parafraz. 0.88 ≈ podobny sens, różna forma zdania.",
+    )
+
+    # ------------------------------------------------------------------
+    # RAG cross-encoder re-ranking
+    # ------------------------------------------------------------------
+    cross_encoder_model: str = Field(
+        "",
+        description=(
+            "Model sentence-transformers do re-rankingu chunków RAG po hybrid search. "
+            "Np. 'cross-encoder/ms-marco-MiniLM-L-6-v2'. Puste = wyłączony."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Constitutional AI adaptive trigger
+    # ------------------------------------------------------------------
+    constitutional_ai_skip_above: float = Field(
+        1.01,
+        ge=0.0,
+        le=1.01,
+        description=(
+            "Pomiń rewizję constitutional AI gdy poprzedni quality_score >= tego progu. "
+            "1.01 = zawsze rewiduj (domyślnie). 0.92 = pomiń dla odpowiedzi z score >= 0.92."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Parquet export
+    # ------------------------------------------------------------------
+    export_parquet: bool = Field(
+        False,
+        description="Automatycznie eksportuj pliki JSONL do formatu Parquet po zakończeniu rundy.",
     )
 
     # ------------------------------------------------------------------
