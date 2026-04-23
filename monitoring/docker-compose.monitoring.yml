@@ -80,6 +80,9 @@ services:
   tempo:
     image: grafana/tempo:2.5.0
     container_name: foundry-tempo
+    # Tempo domyślnie uruchamia się jako uid 10001; wolumeny Docker są root-owned
+    # co powoduje "permission denied" przy tworzeniu podkatalogów. Root wymagany w dev.
+    user: root
     volumes:
       - tempo_data:/tmp/tempo
       - ./tempo.yaml:/etc/tempo.yaml:ro
