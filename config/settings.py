@@ -402,6 +402,14 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     batch_id: str = Field("esg-production-v1")
 
+    # ------------------------------------------------------------------
+    # Service role — determines which subsystems start (api | worker | all)
+    # ------------------------------------------------------------------
+    service_role: str = Field(
+        "all",
+        description="Which runtime role this process fulfils: 'api', 'worker', or 'all'.",
+    )
+
     @field_validator(
         # All optional API key / secret fields — guard against .env.example comment
         # text being read as actual values (e.g. "CORE_API_KEY=  # CORE.ac.uk...").
