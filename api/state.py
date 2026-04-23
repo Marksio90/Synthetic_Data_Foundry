@@ -74,6 +74,9 @@ class RunManager:
         try:
             self._db_engine = create_engine(settings.database_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
             with self._db_engine.begin() as conn:
+                # Advisory lock (key: sha256("foundry_run_state") % 2^63) serializuje
+                # równoległe starty API i workera; zapobiega "duplicate type" na IF NOT EXISTS.
+                conn.execute(text("SELECT pg_advisory_xact_lock(5432100001)"))
                 conn.execute(
                     text(
                         """
@@ -511,6 +514,8 @@ class ScoutManager:
         try:
             self._db_engine = create_engine(settings.database_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
             with self._db_engine.begin() as conn:
+                # Advisory lock serializuje równoległe starty (API + worker).
+                conn.execute(text("SELECT pg_advisory_xact_lock(5432100002)"))
                 conn.execute(
                     text(
                         """
