@@ -27,9 +27,13 @@ from typing import Optional
 
 logger = logging.getLogger("foundry.telemetry")
 
-_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")
+_OTLP_ENDPOINT_RAW = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+_OTLP_ENDPOINT = _OTLP_ENDPOINT_RAW or "http://tempo:4317"
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "foundry")
 _ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+# OTLP włączone tylko gdy endpoint jest jawnie ustawiony w env LUB środowisko != development.
+# Zapobiega spamowi "Failed to export traces" gdy monitoring nie jest uruchomiony.
+_OTLP_ENABLED = bool(_OTLP_ENDPOINT_RAW) or _ENVIRONMENT != "development"
 _tracer_provider = None
 
 
@@ -60,21 +64,20 @@ def setup_tracing(service_name: str = _SERVICE_NAME) -> None:
 
     provider = TracerProvider(resource=resource)
 
-    # Try OTLP exporter (Grafana Tempo)
-    try:
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
-        otlp_exporter = OTLPSpanExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
-        provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-        logger.info("OTel OTLP exporter configured → %s", _OTLP_ENDPOINT)
-    except Exception as exc:
-        logger.warning("OTLP exporter unavailable (%s) — using stdout exporter.", exc)
+    # OTLP exporter (Grafana Tempo) — tylko gdy jawnie skonfigurowany
+    if _OTLP_ENABLED:
         try:
-            from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter  # type: ignore
-            from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter  # type: ignore
-            if _ENVIRONMENT == "development":
-                provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
-        except ImportError:
-            pass
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
+            otlp_exporter = OTLPSpanExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
+            provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+            logger.info("OTel OTLP exporter configured → %s", _OTLP_ENDPOINT)
+        except Exception as exc:
+            logger.warning("OTLP exporter unavailable (%s) — tracing wyłączone.", exc)
+    else:
+        logger.debug(
+            "OTel OTLP pominięty (OTEL_EXPORTER_OTLP_ENDPOINT nie ustawiony, env=development). "
+            "Ustaw OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317 aby włączyć."
+        )
 
     trace.set_tracer_provider(provider)
     _tracer_provider = provider
