@@ -135,5 +135,4 @@ litellm_settings:
 general_settings:
   completion_model: foundry/auto
   master_key: "${LITELLM_MASTER_KEY:-foundry-dev-key}"
-  database_url: "${DATABASE_URL}"
-  store_model_in_db: true
+  store_model_in_db: false
