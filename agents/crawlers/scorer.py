@@ -318,6 +318,11 @@ async def _w4_citation_velocity(ctx: ScorerContext) -> float:
             ctx.http_client.get(quarter_url, timeout=8.0),
         )
 
+        # SS rate-limited → don't penalise gap_score for external outage
+        if w_resp.status_code == 429 or q_resp.status_code == 429:
+            logger.debug("[scorer/w4] Semantic Scholar rate-limited (429) — returning neutral 0.5")
+            return 0.5
+
         weekly = w_resp.json().get("total", 0) if w_resp.status_code == 200 else 0
         quarterly = q_resp.json().get("total", 0) if q_resp.status_code == 200 else 0
 
